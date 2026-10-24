@@ -1056,10 +1056,10 @@ index 000000000..a78ccc0ea
 +                         int dst_w, int dst_h, int work_w, int work_h);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 000000000..09b27d0c1
+index 000000000..7b943dd6d
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1640 @@
+@@ -0,0 +1,1728 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -1145,6 +1145,7 @@ index 000000000..09b27d0c1
 +#include <errno.h>
 +#include <fcntl.h>
 +#include <math.h>
++#include <spawn.h>
 +#include <stdbool.h>
 +#include <stdint.h>
 +#include <stdio.h>
@@ -1433,7 +1434,7 @@ index 000000000..09b27d0c1
 +    uint32_t  shm_seq;
 +    bool      shm_warned;
 +    bool      helper_spawned;
-+    bool      helper_dead;
++    bool      helper_dead;         // 3 failed frames -> inert until reset
 +
 +    // resolved configuration, and the bytes currently in the header
 +    struct dlssnr_pass pass[DLSSNR_MAX_PASSES];
@@ -1623,7 +1624,10 @@ index 000000000..09b27d0c1
 +            snprintf(path, sizeof(path), "/tmp/dlssnr-%u/shm.bin", (unsigned)getuid());
 +    }
 +
-+    p->shm_fd = open(path, O_RDWR | O_CREAT, 0600);
++    // The default path lives under /tmp, a world-writable directory: refuse a
++    // symlink, then verify the file is a regular file we own before mapping
++    // (and possibly ftruncate-ing) it.
++    p->shm_fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
 +    if (p->shm_fd < 0) {
 +        if (!p->shm_warned)
 +            MP_ERR(f, "dlssnr: cannot open %s: %s (NR stays off)\n",
@@ -1634,7 +1638,15 @@ index 000000000..09b27d0c1
 +
 +    size_t total = shm_total();
 +    struct stat st;
-+    if (fstat(p->shm_fd, &st) != 0 || (size_t)st.st_size < total) {
++    if (fstat(p->shm_fd, &st) != 0 || !S_ISREG(st.st_mode) ||
++        st.st_uid != getuid()) {
++        MP_ERR(f, "dlssnr: %s is not a regular file owned by uid %u "
++                  "(NR stays off)\n", path, (unsigned)getuid());
++        close(p->shm_fd);
++        p->shm_fd = -1;
++        return false;
++    }
++    if ((size_t)st.st_size < total) {
 +        if (ftruncate(p->shm_fd, (off_t)total) != 0) {
 +            MP_ERR(f, "dlssnr: ftruncate(%s) failed: %s\n", path, strerror(errno));
 +            close(p->shm_fd);
@@ -1753,21 +1765,38 @@ index 000000000..09b27d0c1
 +
 +    const char *env = getenv("DLSSNR_HELPER");
 +    const char *home = getenv("HOME");
-+    char cmd[1024];
++    char path[1024];
 +    if (env && *env) {
-+        snprintf(cmd, sizeof(cmd), "%s start >/dev/null 2>&1", env);
++        snprintf(path, sizeof(path), "%s", env);
 +    } else if (home && *home) {
-+        snprintf(cmd, sizeof(cmd), "%s/.local/bin/dlssnr-helper start >/dev/null 2>&1",
-+                 home);
++        snprintf(path, sizeof(path), "%s/.local/bin/dlssnr-helper", home);
 +    } else {
 +        return;
 +    }
 +
-+    MP_INFO(f, "dlssnr: starting helper\n");
-+    int rc = system(cmd);
-+    if (rc != 0)
-+        MP_WARN(f, "dlssnr: helper start returned %d (NR will stay off "
-+                   "until one is running)\n", rc);
++    // posix_spawn, not system(): system() waits for the shell, and
++    // "<helper> start" launches a Python helper plus a Proton container,
++    // which can take seconds. Waiting there blocks filter creation and the
++    // first frame. Fire and forget -- liveness is reported through
++    // SHM_HELPER_STATE, and the filter fails open if the helper never comes
++    // up (see shm_roundtrip and the fail path in f_process).
++    posix_spawn_file_actions_t fa;
++    posix_spawn_file_actions_init(&fa);
++    posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null",
++                                     O_WRONLY, 0);
++    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null",
++                                     O_WRONLY, 0);
++    char *argv[] = {path, "start", NULL};
++    pid_t pid = 0;
++    int rc = posix_spawn(&pid, path, &fa, NULL, argv, environ);
++    posix_spawn_file_actions_destroy(&fa);
++
++    if (rc != 0) {
++        MP_WARN(f, "dlssnr: cannot start %s: %s (NR will stay off until a "
++                   "helper is running)\n", path, strerror(rc));
++        return;
++    }
++    MP_INFO(f, "dlssnr: helper start launched (pid %d)\n", (int)pid);
 +}
 +
 +// ── CUDA context ──────────────────────────────────────────────────────────
@@ -2029,6 +2058,11 @@ index 000000000..09b27d0c1
 +    uint8_t *in = (uint8_t *)base + DLSSNR_SHM_HEADER;
 +    uint8_t *out = in + DLSSNR_SHM_MAX_FRAME;
 +
++    // The helper is gone: nothing will ever answer, and the wait below is a
++    // spin on a shared counter. Stay inert instead of stalling every frame.
++    if (p->helper_dead)
++        return false;
++
 +    shm_put(base, SHM_WIDTH, (uint32_t)w);
 +    shm_put(base, SHM_HEIGHT, (uint32_t)h);
 +
@@ -2054,14 +2088,26 @@ index 000000000..09b27d0c1
 +                     __ATOMIC_RELEASE);
 +
 +    double deadline = now_ms() + timeout_ms;
++    double last_check = now_ms();
 +    uint32_t resp = 0;
 +    for (;;) {
 +        resp = __atomic_load_n((uint32_t *)((char *)base + SHM_SEQ_RESP),
 +                               __ATOMIC_ACQUIRE);
 +        if ((int32_t)(resp - req) >= 0)
 +            break;
-+        if (now_ms() >= deadline)
++        double now = now_ms();
++        if (now >= deadline)
 +            return false;
++        // Once this file has failed at least one frame, the helper state
++        // field is trustworthy evidence: if it does not say "running", no
++        // answer is coming and there is no point burning the whole timeout
++        // (4 s by default) on this frame. A helper that is merely slow still
++        // reports running, so it is unaffected.
++        if (p->fail_count > 0 && now - last_check >= 100.0) {
++            last_check = now;
++            if (shm_get(base, SHM_HELPER_STATE) != HELPER_RUNNING)
++                return false;
++        }
 +        struct timespec ts = {0, 200000};    // 200 us
 +        nanosleep(&ts, NULL);
 +    }
@@ -2193,6 +2239,13 @@ index 000000000..09b27d0c1
 +        return;
 +    }
 +
++    // The helper stopped answering (see the fail path below): run as a plain
++    // passthrough for the rest of the file rather than stalling each frame.
++    if (p->helper_dead) {
++        mp_pin_in_write(f->ppins[1], frame);
++        return;
++    }
++
 +    // Profile 5 is IPT, not YCbCr. Pass it through untouched rather than
 +    // mis-decoding it; one warning, then silence.
 +    if (mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
@@ -2285,9 +2338,7 @@ index 000000000..09b27d0c1
 +        struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(mpi->params.hw_subfmt);
 +        int bd = desc.bpp[0];
 +        in_bits = bd > 8 ? 10 : 8;
-+        enum yuv_matrix mx = (mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION)
-+                             ? YUV_MATRIX_BT2020
-+                             : matrix_from_repr(&mpi->params);
++        enum yuv_matrix mx = matrix_from_repr(&mpi->params);
 +        enum yuv_range rn = range_from_levels(mpi->params.repr.levels);
 +        if (mpi->num_planes < 2 || !mpi->planes[0] || !mpi->planes[1]) {
 +            MP_ERR(f, "dlssnr: unexpected planar layout (fmt=%d)\n",
@@ -2431,6 +2482,13 @@ index 000000000..09b27d0c1
 +        if (p->fail_count == 1 || p->opts->verbose)
 +            MP_WARN(f, "dlssnr: frame %lld not denoised (falling back to the "
 +                       "source frame)\n", (long long)p->frame_count);
++        if (p->fail_count >= 3 && !p->helper_dead) {
++            p->helper_dead = true;
++            MP_ERR(f, "dlssnr: %lld failed frames in a row -- NR disabled for "
++                      "this file. Start the helper again (dlssnr-helper "
++                      "start) and seek or reopen to retry.\n",
++                   (long long)p->fail_count);
++        }
 +        cuCtxPopCurrent(NULL);
 +        mp_pin_in_write(f->ppins[1], frame);
 +        return;
@@ -2538,6 +2596,25 @@ index 000000000..09b27d0c1
 +
 +// ── vf-command: live tuning without rebuilding the chain ──────────────────
 +
++// "vf-command dlssnr profile cinematic" is what the docs show; only the
++// numeric form used to work because the argument was parsed as a double
++// before the command name was looked at.
++static int profile_from_name(const char *s)
++{
++    static const char *const names[] = {
++        [PROFILE_FAITHFUL]  = "faithful",
++        [PROFILE_NATURAL]   = "natural",
++        [PROFILE_CINEMATIC] = "cinematic",
++        [PROFILE_EXTREME]   = "extreme",
++        [PROFILE_CUSTOM]    = "custom",
++    };
++    for (int i = 0; i < MP_ARRAY_SIZE(names); i++) {
++        if (names[i] && !strcmp(s, names[i]))
++            return i;
++    }
++    return -1;
++}
++
 +static bool dlssnr_command(struct mp_filter *f, struct mp_filter_command *cmd)
 +{
 +    struct priv *p = f->priv;
@@ -2545,12 +2622,22 @@ index 000000000..09b27d0c1
 +    if (!cmd->arg)
 +        return false;
 +
++    const char *c = cmd->cmd;
++
 +    char *end = NULL;
 +    double v = strtod(cmd->arg, &end);
-+    if (end == cmd->arg)
++    if (end == cmd->arg || *end) {
++        if (!strcmp(c, "profile")) {
++            int pr = profile_from_name(cmd->arg);
++            if (pr < 0)
++                return false;
++            p->opts->profile = pr;
++            MP_INFO(f, "dlssnr: profile = %s\n", cmd->arg);
++            return true;
++        }
 +        return false;
++    }
 +
-+    const char *c = cmd->cmd;
 +    if (!strcmp(c, "passes"))
 +        p->opts->passes = v < 0 ? 0 : (v > DLSSNR_MAX_PASSES ? DLSSNR_MAX_PASSES : (int)v);
 +    else if (!strcmp(c, "intensity"))
@@ -2571,7 +2658,7 @@ index 000000000..09b27d0c1
 +        p->opts->preset = v < 0 ? 0 : (int)v;
 +    else if (!strcmp(c, "profile"))
 +        p->opts->profile = v < 0 ? 0 : (v > PROFILE_EXTREME ? PROFILE_EXTREME : (int)v);
-+    else if (!strcmp(c, "work-scale"))
++    else if (!strcmp(c, "work-scale") || !strcmp(c, "work_scale"))
 +        p->opts->work_scale = clampf(v, 0.25f, 1.0f);
 +    else if (!strcmp(c, "detail"))
 +        p->opts->detail = clampf(v, 0.0f, 4.0f);
@@ -2597,6 +2684,7 @@ index 000000000..09b27d0c1
 +    // state; a seek must not cost a helper restart or a recompile.
 +    p->frame_count = 0;
 +    p->fail_count = 0;
++    p->helper_dead = false;     // a seek is the retry point for a dead helper
 +    p->status_t0 = 0;
 +    p->status_frames = 0;
 +    p->status_cost_ms = 0;
@@ -2702,10 +2790,10 @@ index 000000000..09b27d0c1
 +};
 diff --git a/video/filter/vf_hwup.c b/video/filter/vf_hwup.c
 new file mode 100644
-index 000000000..47c3ad545
+index 000000000..75c35b251
 --- /dev/null
 +++ b/video/filter/vf_hwup.c
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,554 @@
 +// vf_hwup.c — SW→HW unification pre-filter
 +//
 +// Pipeline: decode → [vf_hwup] → [vf_rife] → [vf_vsr] → VO
@@ -3130,6 +3218,23 @@ index 000000000..47c3ad545
 +    out->params.repr  = mpi->params.repr;    // source levels preserved — NV12
 +                                             // range was not converted,
 +                                             // downstream converts by levels
++    // repr.dovi points *into* mpi->dovi (it is set from the AVFrame side data
++    // in mp_image.c), so the struct copy above leaves the output borrowing
++    // another frame's RPU. Ref it and repoint at our own buffer: libplacebo
++    // dereferences repr.dovi unconditionally for PL_COLOR_SYSTEM_DOLBYVISION
++    // (libplacebo colorspace.c, pl_color_repr_decode).
++    out->dovi = av_buffer_ref(mpi->dovi);
++    if (mpi->dovi && !out->dovi) {
++        // talloc_free runs mp_image_dtor, which unrefs bufs[0] and frees
++        // p->out_buf through free_cuda_buf.
++        talloc_free(out);
++        p->out_buf = 0; p->out_buf_size = 0;
++        cuCtxPopCurrent(NULL);
++        mp_frame_unref(&frame);
++        mp_filter_internal_mark_failed(f);
++        return;
++    }
++    out->params.repr.dovi = out->dovi ? (void *)out->dovi->data : NULL;
 +    out->params.p_w = mpi->params.p_w;
 +    out->params.p_h = mpi->params.p_h;
 +    out->w = mpi->w; out->h = mpi->h;
@@ -4286,10 +4391,10 @@ index 000000000..588b2e23a
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 000000000..cfc475e38
+index 000000000..13c7c4565
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1264 @@
+@@ -0,0 +1,1271 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -4941,6 +5046,13 @@ index 000000000..cfc475e38
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, vfx_imgfmt_from_bits(out_bits));
 +    mp_image_params_guess_csp(&out->params);
 +    out->params.color = src->params.color;   // HDR metadata (same as vf_vsr)
++    // Same reason as vf_vsr: generated frames are RGB, and el_pair would
++    // re-attach the source RPU to them (f_enhancement_pair.c:102) unless
++    // no_dovi is set.
++    if (src->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION || src->dovi) {
++        out->params.no_dovi = true;
++        out->params.no_enhancement_layer = true;
++    }
 +    out->params.p_w = src->params.p_w;       // pixel aspect ratio (aspect override)
 +    out->params.p_h = src->params.p_h;
 +    out->w = p->out_w;
@@ -5556,10 +5668,10 @@ index 000000000..cfc475e38
 +};
 diff --git a/video/filter/vf_vsr.c b/video/filter/vf_vsr.c
 new file mode 100644
-index 000000000..6d5f9c134
+index 000000000..3fc6dfbe5
 --- /dev/null
 +++ b/video/filter/vf_vsr.c
-@@ -0,0 +1,1320 @@
+@@ -0,0 +1,1330 @@
 +/*
 + * vf_vsr.c -- Video Super Resolution filter via NVIDIA VFX SDK
 + *
@@ -6513,6 +6625,16 @@ index 000000000..6d5f9c134
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, vfx_imgfmt_from_bits(bits));
 +    mp_image_params_guess_csp(&out->params);
 +    out->params.color = mpi->params.color; // preserve HDR metadata
++    // A rebuilt frame is RGB, so it is no longer Dolby Vision: the RPU
++    // describes a reshape of the coded YCbCr signal and resampling in RGB
++    // destroys that mapping. Clearing the flags is not enough — el_pair
++    // re-attaches the RPU from the EL track onto whatever frame leaves the
++    // user chain (filters/f_enhancement_pair.c:102) unless no_dovi is set,
++    // which would then make libplacebo reshape RGB pixels.
++    if (mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION || mpi->dovi) {
++        out->params.no_dovi = true;
++        out->params.no_enhancement_layer = true;
++    }
 +    out->w = vsr_out_w; out->h = vsr_out_h;
 +    out->params.w = vsr_out_w; out->params.h = vsr_out_h;
 +    out->planes[0] = (uint8_t*)p->out_buf;
@@ -8273,10 +8395,10 @@ index 000000000..8e1873760
 +}
 diff --git a/video/filter/yuv_to_rgba.h b/video/filter/yuv_to_rgba.h
 new file mode 100644
-index 000000000..9aa3d4161
+index 000000000..0bdd430ab
 --- /dev/null
 +++ b/video/filter/yuv_to_rgba.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,126 @@
 +// src/mpv/video/filter/yuv_to_rgba.h
 +#pragma once
 +
@@ -8315,6 +8437,12 @@ index 000000000..9aa3d4161
 +    case PL_COLOR_SYSTEM_BT_2020_C:
 +    case PL_COLOR_SYSTEM_BT_2100_PQ:
 +    case PL_COLOR_SYSTEM_BT_2100_HLG: return YUV_MATRIX_BT2020;
++    // Profile 7/8 carry an HDR10-compatible base layer: BT.2020 YCbCr, PQ.
++    // Without this case the default below hands them BT.601 coefficients
++    // (Kr=0.299 instead of 0.2624) and every DV frame comes out red-shifted.
++    // Profile 5 is ICtCp and no YCbCr matrix is right for it — the P5
++    // profiles in ai.conf keep such files out of this converter entirely.
++    case PL_COLOR_SYSTEM_DOLBYVISION: return YUV_MATRIX_BT2020;
 +    default:                          return YUV_MATRIX_BT601;
 +    }
 +}

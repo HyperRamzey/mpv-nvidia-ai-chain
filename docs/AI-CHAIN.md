@@ -15,15 +15,15 @@ traps.
 
 | Thing | Path |
 | --- | --- |
-| Package | `mpv-dovi-vfx-git 0.41.0_1275_g488fec0789-4` (`/usr/bin/mpv`, `/usr/lib/libmpv.so.2.6.0`) |
-| Built artefact | `~/ai-video/build/arch/mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-4-x86_64.pkg.tar.zst` |
+| Package | `mpv-dovi-vfx-git 0.41.0_1275_g488fec0789-5` (`/usr/bin/mpv`, `/usr/lib/libmpv.so.2.6.0`) |
+| Built artefact | `~/ai-video/build/arch/mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-5-x86_64.pkg.tar.zst` |
 | PKGBUILD + sources | `~/ai-video/build/arch/` (`PKGBUILD`, `vfx-filters.patch`, `find-deps.py`, `mpv.install`) |
 | AI chain config | `~/.config/mpv/ai.conf` (six auto profiles + `[ai]`) |
 | NR (VSR denoiser) config | `~/.config/mpv/nr.conf` |
 | Wrappers | `~/.local/bin/mpv-ai`, `~/.local/bin/mpv-nr` |
 | NR helper | `~/.local/bin/dlssnr-helper` — **must be running** for `dlssnr` |
 | Old player backup | `~/ai-video/build/backup-mpv-dovi-git/` (binary + libmpv + headers) |
-| Patch (22 files) | `~/ai-video/build/arch/vfx-filters.patch`, sha256 `becec373…33ef61f` |
+| Patch (22 files, 8527 lines) | `~/ai-video/build/arch/vfx-filters.patch`, sha256 `9d755ffb…f33788` |
 
 Pins: mpv `488fec0789e5026804ac8dd03fb749570416d48a`, libplacebo
 `13d0b79827ea1671f991ca57700e5356af9731a5` (PL_API_VER 377, libdovi), FFmpeg static
@@ -45,7 +45,9 @@ Pins: mpv `488fec0789e5026804ac8dd03fb749570416d48a`, libplacebo
 Both wrappers accept every normal mpv argument (`mpv-ai --fullscreen --start=10:00 f.mkv`).
 Tuning is a config edit; a command-line `--vf=` cannot win, because the profile
 replaces it. Live changes without a restart: `vf-command dlssnr passes 1`,
-`vf-command vfg fps 4`.
+`vf-command vfg fps 4`. The chains carry explicit `@dlssnr:` / `@vfg:` labels for
+exactly this reason — without a `@label:`, mpv generates `dlssnr.00` / `vfg.00`
+and the unlabelled command fails with `error running command` (trap 13).
 
 The NR helper is not a service and does not survive a reboot:
 
@@ -68,8 +70,8 @@ vfg:fps=auto:max-fps=110`.
 | 1280×720 SDR | full | `vsr: init 1280x720 -> 1707x960` |
 | 3840×2160 P7 48 fps | `ai-big` | no VSR; `truehdr-status: mode=passthrough` (PQ); NR at `work=1280x720`; `vfg k=2 out=96` |
 | 3840×2160 HDR10 48 fps | `ai-big` | same, `truehdr-status: mode=passthrough` |
-| 3840×2160 P5 | `ai-big-p5` | `dlssnr: Dolby Vision input -- passing it through untouched`; VFG still runs |
-| any 2160p | — | downscale to the render target is left to `dscale=mitchell` before the filter runs |
+| 3840×2160 P5 | `ai-big-p5` | no filters at all: native libplacebo DoVi path (see §6) |
+| any 2160p | — | `dlssnr`'s `size=panel` shrinks to the panel with its own Mitchell kernel; the VO's `dscale` has nothing left to do |
 
 `Unsupported format` errors: **0** in every case. VFG output rate measured with
 `${estimated-vf-fps}`: **96** on 24 and 48 fps sources, **24** with the chain off.
@@ -153,6 +155,23 @@ outputs the input's own format and `params.color` is copied through.
     `pkgver()` runs in `$startdir` and aborts with `cd: …/arch/src/mpv: No such file`.
 12. Cosmetic: the package embeds `$srcdir` strings (FFmpeg's `CONFIGURATION` and
     `libav_internal.h` assert text) — pacman warns, no RUNPATH, harmless.
+13. **`vf-command dlssnr …` needs an explicit `@dlssnr:` label.** mpv does not use the
+    filter name as its label; it generates `dlssnr.00`, `vfg.00`, … and
+    `find_by_label()` (`filters/f_output_chain.c:493`) compares against that. Every
+    AI profile therefore writes `@dlssnr:dlssnr:…` / `@vfg:vfg:…`. Without it the
+    command returns `error running command` and the filter is never reached — this is
+    how the first shipped profiles were wrong.
+14. **`PL_COLOR_SYSTEM_DOLBYVISION` is not a YCbCr system.** `matrix_from_repr()` used
+    to fall through to `YUV_MATRIX_BT601` for it, so every DV frame decoded with
+    Kr=0.299 instead of BT.2020's 0.2624 — a hard red shift in vsr, vfg and truehdr.
+    P7/P8 base layers are BT.2020 PQ, so that is now an explicit case in
+    `yuv_to_rgba.h`. P5 is ICtCp and no YCbCr matrix is right for it — see §6.
+15. **`el_pair` runs after the user chain and re-attaches the RPU.** In
+    `filters/f_enhancement_pair.c:102` a BL frame whose `params.no_dovi` is false
+    inherits `dovi` from the EL track and is retagged `DOLBYVISION`. Any filter that
+    rebuilds a frame in RGB (`vsr`, `vfg`) must set `no_dovi` +
+    `no_enhancement_layer`, or libplacebo applies a DoVi reshape to RGB pixels.
+    `dlssnr` already did; `vsr` and `vfg` did not.
 
 ## 6. Known limits / open items
 
@@ -162,11 +181,24 @@ outputs the input's own format and `params.color` is copied through.
   `dlssnr` and not fixed.
 - **FEL is knowingly lost when NR runs on P7.** `dlssnr` marks its output `no_dovi`
   + `no_enhancement_layer` so `el_pair` drops the EL rather than pairing it with a
-  moved base layer. Keep plain `mpv` (no AI) when FEL detail matters; `dovi=skip`
+  moved base layer. `vsr` and `vfg` set the same flags, so a rebuilt frame is never
+  given the RPU back. Keep plain `mpv` (no AI) when FEL detail matters; `dovi=skip`
   keeps FEL and drops NR.
-- **P5 skips NR by policy** (`dovi=skip` in `ai-big-p5` / `ai-mid-p5` / `ai-vsr-p5`).
-  IPTPQc2 reshaping is not ported into the filter, so a delta computed on the
-  reshaped frame would be re-shaped on the way out. VFG and HDR still run.
+- **P5 is left to libplacebo, with no AI filters** (`ai-*-p5` set no `vf`). P5 is
+  ICtCp, not YCbCr: every filter here converts to RGB with a YCbCr matrix, and the
+  polynomial/MMR reshape exists only in libplacebo's shader. The earlier policy
+  ("only NR is unsafe on P5") was wrong — VSR and VFG corrupted it just as badly.
+  P5 now plays exactly as plain `mpv` does. Verified by construction; no P5 sample
+  exists in the local corpus.
+- **A dead helper now fails over in ~1 frame, not 4 s per frame.** First failure
+  still costs the full `timeout` (4000 ms) because that is the only probe available;
+  after that `SHM_HELPER_STATE` short-circuits the wait, and three failed frames in a
+  row latch `helper_dead` — the filter becomes a passthrough until a seek or reopen.
+  Measured: 4 s clip, helper stopped, `spawn=0` → 10 s wall instead of ~6 minutes.
+- **`dlssnr` no longer blocks file open on helper launch.** `helper_spawn()` uses
+  `posix_spawn` without `waitpid` instead of `system()`; `dlssnr-helper start` brings
+  up Python plus a Proton container and used to stall the first frame for seconds.
+
 - **KWin HDR must be ON** for TrueHDR output to reach the panel as HDR. With HDR off,
   the PQ frames get tone-mapped straight back to SDR — use plain `mpv` instead (same
   caveat the `[sdr-to-hdr-itm]` comment in `mpv.conf` already makes).
@@ -204,7 +236,7 @@ outputs the input's own format and `params.color` is copied through.
 ```sh
 cd ~/ai-video/build/arch
 BUILDDIR=~/ai-video/build/makepkg makepkg -f -e --noprepare --check
-sudo pacman -U mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-4-x86_64.pkg.tar.zst
+sudo pacman -U mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-5-x86_64.pkg.tar.zst
 ```
 
 `-e` reuses `$srcdir` (keeps the FFmpeg/nasm objects); delete

@@ -47,6 +47,9 @@ filter and not a Vulkan layer.
   ```
 
   Without it, `dlssnr` fails open — it logs and stays inert, playback continues.
+  From `pkgrel 5` that costs about one frame, not one timeout per frame: the
+  filter short-circuits on the shared-memory helper state and latches to
+  passthrough after three consecutive failures.
 
 ## Build and install
 
@@ -77,6 +80,14 @@ mpv-nr movie.mkv        # VSR denoiser at 1:1 only
 mpv movie.mkv           # untouched player, Dolby Vision as before
 ```
 
+Live tuning needs the filter's label; a bare `vf-command dlssnr …` fails because
+mpv generates `dlssnr.00`, not `dlssnr`:
+
+```sh
+vf-command @dlssnr: passes 1
+vf-command @vfg: fps 3
+```
+
 `mpv-ai` is one line:
 
 ```sh
@@ -102,8 +113,12 @@ to the display size and only ever shrinks; the model itself sees
 | input | NR | note |
 | --- | --- | --- |
 | P7 (FEL/MEL), P8.1 | runs | EL is knowingly dropped (`no_dovi` + `no_enhancement_layer`) |
-| P5 (IPTPQc2) | skipped | `dovi=skip`; VFG and HDR still run |
-| 2160p DV | runs | no VSR, and `truehdr` self-guards to passthrough on PQ |
+| P5 (IPTPQc2) | never runs | no filters at all — native libplacebo DoVi path |
+| 2160p DV | runs | no VSR; the downscale to panel happens inside the AI filters |
+
+P5 is ICtCp, not YCbCr, so *any* filter that round-trips through RGB corrupts it —
+`vsr` and `vfg` as much as `dlssnr`. The three `*-p5` profiles therefore set no
+`vf` and play exactly like plain `mpv`.
 
 **Frame generation:** `vfg:fps=auto:max-fps=110`. VFG only does integer
 multipliers, and the right K is a function of source fps *and* panel refresh, so
@@ -134,10 +149,26 @@ The anchor is never replaced, so text and edges keep full resolution.
    `dlssnr`.
 2. **FEL detail is lost when NR runs** on P7 — by design. Use plain `mpv` when
    FEL matters, or `dlssnr:dovi=skip` to keep FEL and drop NR.
-3. **P5 skips NR.** IPTPQc2 reshaping is not ported into the filter, so a delta
-   computed on the reshaped frame would be re-shaped on the way out.
+3. **P5 gets no AI at all.** ICtCp has no correct YCbCr matrix in this chain, so
+   the `*-p5` profiles hand the file to libplacebo untouched. Verified by
+   construction; no P5 sample exists in the local corpus.
 4. **1080p48 with VSR is the stress case** (~310–340 dropped frames / 18 s).
    `dlssnr:passes=1` there restores 144 fps.
+5. **The NR answer buffer is allocated per frame** (14.7 MB `cuMemAlloc`, freed
+   on the VO thread). Within budget, but a persistent buffer is the obvious next
+   optimisation.
+
+## Correctness fixes in this revision
+
+`pkgrel 5` (patch sha256 `9d755ffb…`) closes four defects found by reading the
+whole chain, not just the new filter:
+
+| defect | fix | measured |
+| --- | --- | --- |
+| DV base layers decoded with BT.601 — `matrix_from_repr()` had no DoVi case, so Kr was 0.299 instead of 0.2624 (red shift) | explicit `PL_COLOR_SYSTEM_DOLBYVISION` → BT.2020 | full chain at `passes=0` vs native `mpv`, 2160p P7: mean 0.017 codes, p99 1, max 7 |
+| `vsr` / `vfg` emitted RGB frames that `el_pair` re-tagged as DoVi, applying a reshape to RGB | set `no_dovi` + `no_enhancement_layer`; `hwup` keeps the `dovi` reference across SW→HW | full chain mean Δ 3.55 codes, matching the measured cinematic preset (4.63) with no channel bias |
+| a stopped helper cost one 4 s timeout per frame forever | fail-fast on `SHM_HELPER_STATE`, latch to passthrough after 3 failures | 4 s clip: 10 s wall instead of ~6 min |
+| helper launch blocked file open (`system()`) | `posix_spawn` without `waitpid` | first frame no longer stalls |
 
 ## License
 

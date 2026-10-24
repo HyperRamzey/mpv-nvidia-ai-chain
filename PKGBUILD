@@ -28,7 +28,7 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.41.0_1275_g488fec0789
-pkgrel=4
+pkgrel=5
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-build'
@@ -109,7 +109,7 @@ sha256sums=(
   'SKIP'
   'SKIP'
   '7dbf0282eb1f5a46b8d4935daba5566d18b7ec7ad9d487430a78f992c99a8e63'
-  'becec373a3c3b57d9eb3de5212c74aba453197288c8899b8adbefbcb933ef61f'
+  '9d755ffba67a3be91ed9203e129b5327dd741ac3501b3a93af089883dcf33788'
 )
 
 pkgver() {
