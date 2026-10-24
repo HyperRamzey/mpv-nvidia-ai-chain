@@ -1,0 +1,37 @@
+pre_install() {
+  cat <<'EOF'
+NOTE: mpv-dovi-vfx-git carries four extra filters that are dlopen()-based,
+      not linked into the binary:
+
+        hwup     upload CUDA/NVDEC frames to a CUDA device buffer
+        vsr      NVIDIA NGX VideoSuperRes (AI upscale)
+        truehdr  NVIDIA NGX TrueHDR (SDR -> HDR10)
+        vfg      NVIDIA VideoFrameGeneration (frame interpolation)
+
+      They need the NVIDIA VFX SDK runtime. The loader looks for it in
+      $HOME/.local/lib/vsr-player and enables the filters when it is present;
+      when it is missing, mpv still runs normally and the filters just error
+      out on first use.
+
+      Required runtime pieces, none of which are hard package dependencies:
+        - the proprietary NVIDIA driver (libcuda.so.1)
+        - the 'cuda' package (libnvrtc.so.13, used to JIT the YUV->RGBA kernel)
+        - an RTX GPU with the NGX models for VSR / TrueHDR / VFG
+
+      The AI chain must decode through NVDEC (--hwdec=nvdec). With
+      --hwdec=vulkan the frames cannot be uploaded to CUDA and hwup disables
+      the whole chain.
+
+      The Dolby Vision P7 FEL path is unaffected and needs no extra runtime.
+EOF
+}
+
+pre_upgrade() {
+  if pacman -Q mpv-dovi-git >/dev/null 2>&1; then
+    cat <<'EOF'
+NOTE: this package replaces mpv-dovi-git. It is the same mpv commit
+      (488fec0789) with the same static libplacebo/FFmpeg DoVi stack, plus the
+      NVIDIA VFX filters. Your ~/.config/mpv/mpv.conf keeps working unchanged.
+EOF
+  fi
+}
