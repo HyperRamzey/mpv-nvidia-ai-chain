@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mpv AI chain — options</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    padding: 18px 20px 24px;
+    font: 13px/1.5 system-ui, sans-serif;
+    background: #17181c;
+    color: #e6e6e9;
+    min-width: 380px;
+  }
+  h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+  p.sub { margin: 0 0 18px; color: #8b8d96; font-size: 12px; }
+  fieldset { border: 1px solid #2b2d33; border-radius: 8px; margin: 0 0 14px; padding: 12px 14px 14px; }
+  legend { padding: 0 6px; color: #8b8d96; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  label.row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  label.block { display: block; margin: 10px 0 4px; color: #b9bbc4; }
+  select, input[type=text] {
+    width: 100%;
+    box-sizing: border-box;
+    background: #212228;
+    color: #e6e6e9;
+    border: 1px solid #34363d;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: inherit;
+  }
+  input[type=text]:focus, select:focus { outline: 1px solid #76b900; border-color: #76b900; }
+  .hint { color: #767881; font-size: 11.5px; margin: 4px 0 0; }
+  .actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  button {
+    background: #76b900; color: #10130a; border: 0; border-radius: 6px;
+    padding: 7px 14px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: #2b2d33; color: #e6e6e9; font-weight: 500; }
+  button:hover { filter: brightness(1.08); }
+  #status { color: #8b8d96; font-size: 12px; }
+  #status.ok { color: #76b900; }
+  #status.err { color: #ff6b6b; }
+  pre#ping {
+    margin: 10px 0 0; padding: 8px 10px; background: #101114; border-radius: 6px;
+    font: 11.5px/1.45 ui-monospace, monospace; color: #b9bbc4;
+    white-space: pre-wrap; word-break: break-all; display: none;
+  }
+</style>
+</head>
+<body>
+<h1>mpv AI chain</h1>
+<p class="sub">Every click hands one URL to the local native host, which starts mpv detached.</p>
+
+<fieldset>
+  <legend>Playback</legend>
+  <label class="block" for="profile">Default profile</label>
+  <select id="profile">
+    <option value="ai">AI chain — VSR + TrueHDR + DLSS 5 NR + VFG (mpv-ai)</option>
+    <option value="nr">Noise reduction only (mpv-nr)</option>
+    <option value="plain">Plain mpv — no AI filters</option>
+  </select>
+  <p class="hint">The right-click menu can override this per launch.</p>
+
+  <label class="row">
+    <input type="checkbox" id="fullscreen">
+    <span>Open fullscreen</span>
+  </label>
+</fieldset>
+
+<fieldset>
+  <legend>Arguments</legend>
+  <label class="block" for="extraArgs">Extra mpv arguments</label>
+  <input type="text" id="extraArgs" spellcheck="false" placeholder="--start=10 --sub-auto=fuzzy">
+  <p class="hint">Split on shell quoting rules. Applied to every launch, before the URL.</p>
+
+  <label class="block" for="format">yt-dlp format (site URLs only)</label>
+  <input type="text" id="format" spellcheck="false" placeholder="bv*+ba/b">
+  <p class="hint">Empty means mpv's default. <code>bv*+ba/b</code> prefers the best video and audio streams.</p>
+</fieldset>
+
+<div class="actions">
+  <button id="save">Save</button>
+  <button id="test" class="secondary">Test native host</button>
+  <span id="status"></span>
+</div>
+<pre id="ping"></pre>
+
+<script src="options.js"></script>
+</body>
+</html>

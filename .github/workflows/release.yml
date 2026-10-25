@@ -1,0 +1,229 @@
+# ============================================================================
+# release.yml — build the Arch package and publish a GitHub release.
+#
+# Local equivalent:
+#   cd ~/ai-video/build/arch
+#   BUILDDIR=~/ai-video/build/makepkg makepkg -f -e --noprepare --check
+#   sudo pacman -U mpv-dovi-vfx-git-*.pkg.tar.zst
+#
+# CI does a *cold* build from scratch in an Arch container:
+#   validate -> patch hash + patch dry-run against the pinned mpv commit
+#   build    -> pacman deps (incl. cuda/nvidia-utils) + makepkg --check
+#   release  -> attach package + patch + config + SHA256SUMS
+#
+# Triggers:
+#   * push a v* tag            -> release named after the tag
+#   * workflow_dispatch        -> release named v<pkgver>-<pkgrel>-<UTC>
+#
+# The build does not need a GPU: nvidia-utils only provides libcuda.so to link
+# against, and cuda provides cuda.h/nvrtc.h/libnvrtc.so.13. Nothing executes
+# CUDA at build time; `makepkg --check` runs mpv's own unit tests.
+# ============================================================================
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pinned upstream commit the patch was written against (also in PKGBUILD).
+  MPV_COMMIT: 488fec0789e5026804ac8dd03fb749570416d48a
+
+jobs:
+  # --------------------------------------------------------------------------
+  # validate: cheap integrity gates. Fails before a 40-minute build if the
+  # patch does not apply cleanly or PKGBUILD does not pin this exact patch.
+  # --------------------------------------------------------------------------
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch sha256 matches PKGBUILD
+        run: |
+          set -euo pipefail
+          sha="$(sha256sum vfx-filters.patch | cut -d' ' -f1)"
+          echo "patch sha256: $sha"
+          grep -q "$sha" PKGBUILD \
+            || { echo "::error::PKGBUILD does not pin the current patch sha256"; exit 1; }
+
+      - name: Patch applies to the pinned mpv commit
+        run: |
+          set -euo pipefail
+          git init -q /tmp/mpv
+          cd /tmp/mpv
+          git remote add origin https://github.com/mpv-player/mpv.git
+          git fetch -q --depth=1 origin "$MPV_COMMIT"
+          git checkout -q FETCH_HEAD
+          patch -Np1 --dry-run -i "$GITHUB_WORKSPACE/vfx-filters.patch"
+          echo "22 files apply cleanly to $(git rev-parse --short HEAD)"
+
+      - name: Python helpers compile
+        run: |
+          set -euo pipefail
+          python3 -m py_compile find-deps.py tools/*.py native/*.py
+
+      - name: Shell scripts parse
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -x native/*.sh
+
+      - name: ai.conf is a valid mpv config
+        run: |
+          set -euo pipefail
+          # Every non-comment line must be key=value; catches a broken profile
+          # before it reaches a release.
+          awk 'NF && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*\[.*\][[:space:]]*$/ && $0 !~ /=/ {print; bad=1} END{exit bad}' ai.conf
+          echo "ai.conf: $(grep -c '^\[' ai.conf) sections"
+
+  # --------------------------------------------------------------------------
+  # build: cold makepkg in an Arch container.
+  # --------------------------------------------------------------------------
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare builder user and ccache
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed git sudo ccache
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          sed -i 's/^!ccache/ccache/' /etc/makepkg.conf
+          su builder -c "CCACHE_DIR='$GITHUB_WORKSPACE/.ccache' ccache -M 400M"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ env.MPV_COMMIT }}-${{ hashFiles('vfx-filters.patch', 'PKGBUILD') }}
+          restore-keys: |
+            ccache-${{ env.MPV_COMMIT }}-
+
+      - name: Install makedepends
+        run: |
+          set -euo pipefail
+          # Source the PKGBUILD only for its arrays; nothing executes.
+          source ./PKGBUILD
+          pacman -S --noconfirm --needed "${makedepends[@]}" nvidia-utils
+          # The package download cache doubles the disk footprint at the worst
+          # moment (cuda alone is 2.4 GiB compressed / 5.2 GiB installed).
+          pacman -Scc --noconfirm
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+          su builder -c "cd '$GITHUB_WORKSPACE' && \
+            CCACHE_DIR='$GITHUB_WORKSPACE/.ccache' \
+            makepkg -f --nodeps --check --noconfirm"
+
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          source ./PKGBUILD
+          ver="${pkgver}-${pkgrel}"
+          mkdir -p dist
+          cp mpv-dovi-vfx-git-*.pkg.tar.zst dist/
+          cp vfx-filters.patch PKGBUILD mpv.install find-deps.py ai.conf dist/
+          ( cd dist && sha256sum * > SHA256SUMS )
+          cat > dist/RELEASE_NOTES.md <<EOF
+          ## mpv-dovi-vfx-git ${ver}
+
+          Cold build from $(git rev-parse --short HEAD) on Arch Linux
+          (\`archlinux:base-devel\`, CUDA 13.4).
+
+          | Component | Pin |
+          | --- | --- |
+          | mpv | \`${MPV_COMMIT}\` |
+          | libplacebo | \`13d0b79827ea1671f991ca57700e5356af9731a5\` (PL_API_VER 377, libdovi) |
+          | FFmpeg | 9.0.2, static |
+          | VFX patch | \`$(sha256sum vfx-filters.patch | cut -d' ' -f1)\` |
+
+          ### Install
+
+          \`\`\`sh
+          sudo pacman -U mpv-dovi-vfx-git-*.pkg.tar.zst
+          \`\`\`
+
+          The package pins the exact mpv commit, the patch, and static
+          libplacebo + FFmpeg; nothing in the system is replaced. The VFX SDK
+          libraries are \`dlopen\`ed at runtime and are not part of this
+          package; without them mpv still plays normally.
+
+          ### Verify
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          mpv --version | head -1
+          \`\`\`
+          EOF
+          sed -i 's/^          //' dist/RELEASE_NOTES.md
+          ls -lh dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # release: publish. Tag pushes use the tag; manual runs get a dated tag.
+  # --------------------------------------------------------------------------
+  release:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            source ./PKGBUILD
+            tag="v${pkgver}-${pkgrel}-$(date -u +%Y%m%d%H%M)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "releasing $tag"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag='${{ steps.tag.outputs.tag }}'
+          # A tag push already created the tag; a manual run needs one.
+          if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" \
+              --notes-file dist/RELEASE_NOTES.md dist/*
+          else
+            gh release create "$tag" --title "$tag" \
+              --notes-file dist/RELEASE_NOTES.md dist/*
+          fi

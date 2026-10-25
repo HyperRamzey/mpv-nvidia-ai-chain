@@ -1,0 +1,73 @@
+# ============================================================================
+# ci.yml — fast checks on every push/PR. No package build; that is release.yml.
+# The release workflow re-runs all of this as its `validate` job, so a green
+# CI run here means the release gates will pass too.
+# ============================================================================
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MPV_COMMIT: 488fec0789e5026804ac8dd03fb749570416d48a
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch sha256 matches PKGBUILD
+        run: |
+          set -euo pipefail
+          sha="$(sha256sum vfx-filters.patch | cut -d' ' -f1)"
+          grep -q "$sha" PKGBUILD \
+            || { echo "::error::PKGBUILD does not pin the current patch sha256"; exit 1; }
+          echo "patch sha256: $sha"
+
+      - name: Patch applies to the pinned mpv commit
+        run: |
+          set -euo pipefail
+          git init -q /tmp/mpv
+          cd /tmp/mpv
+          git remote add origin https://github.com/mpv-player/mpv.git
+          git fetch -q --depth=1 origin "$MPV_COMMIT"
+          git checkout -q FETCH_HEAD
+          patch -Np1 --dry-run -i "$GITHUB_WORKSPACE/vfx-filters.patch"
+
+      - name: Python helpers compile
+        run: |
+          set -euo pipefail
+          python3 -m py_compile find-deps.py tools/*.py native/*.py
+
+      - name: Shell scripts parse
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -x native/*.sh
+
+      - name: JSON manifests are valid
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, glob
+          for f in glob.glob('extension/**/*.json', recursive=True) + \
+                   glob.glob('native/*.json*'):
+              if f.endswith('.json.in'):
+                  continue
+              json.load(open(f))
+              print('ok', f)
+          PY
+
+      - name: ai.conf is a valid mpv config
+        run: |
+          set -euo pipefail
+          awk 'NF && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*\[.*\][[:space:]]*$/ && $0 !~ /=/ {print; bad=1} END{exit bad}' ai.conf

@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "mpv AI chain",
+  "version": "1.0.0",
+  "description": "Send a video, link or the current page to the local mpv NVIDIA AI chain (VSR, TrueHDR, DLSS 5 NR, VFG).",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtJ6R3b2UhS5Pvsy3tDljBnGql4ApP1ONpfG4t8BizwcCpUwCJSz8DQaSS4LsAFU6x8FtkOr8kRFlSN7F2CXpoHhuSIFOhZBgIvGXeKm6X+8V3oxyGXpcgKqdgK0dbDP4WBrpZtnR+3DnyWYJP6+L7Fytw9s4PgE9dG56qXoY4LGHttXdPQVsQsU1AZYfPQ9a7Xg1kMHkV0fJtPn8qi8swQguziBeOzBNdi7o3lAC8Aun/989n68jNmt2w6BgvGqDtkxycHmuj4fFOUrOTJJYjSNyDqn5G8WXLPApm2YrYuPTYvo0gI15BNzr+pYd/pINTmIIPlaz9jooDI2TOnzlHwIDAQAB",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "nativeMessaging",
+    "contextMenus",
+    "storage",
+    "tabs"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Send this video to mpv (Alt+Shift+M)",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "commands": {
+    "send-to-mpv": {
+      "suggested_key": {
+        "default": "Alt+Shift+M"
+      },
+      "description": "Send the current tab to mpv"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -25,6 +25,9 @@ filter and not a Vulkan layer.
 | `vfx-filters.patch` | The whole change: 22 files against mpv `488fec0789e5026804ac8dd03fb749570416d48a` |
 | `PKGBUILD`, `mpv.install`, `find-deps.py` | Arch package that builds mpv + static libplacebo + static FFmpeg + the filters |
 | `ai.conf` | Six auto profiles (resolution band × Dolby Vision P5 state) + `[ai]` |
+| `extension/` | Chromium MV3 extension: send a page, link or video to the chain |
+| `native/` | Native messaging host (Python, stdlib only) + installer |
+| `.github/workflows/` | `ci.yml` (fast gates) and `release.yml` (cold makepkg → GitHub release) |
 | `docs/AI-CHAIN.md` | Operation manual: resolution/DoVi policy, trap list, rebuild |
 | `docs/DLSS5-NR-PLAN.md` | Design of record for the NR filter: constraints, composite, every measured number |
 | `tools/verify_comments_only.py` | Proves a source edit changed only comments/strings (used for the English pass) |
@@ -72,6 +75,24 @@ patch -Np1 --dry-run -i ../vfx-filters.patch
 leak in as shared libraries, if libmpv exports static-library symbols, or if the
 Dolby Vision enhancement-layer option disappears.
 
+### Prebuilt package (GitHub Actions)
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it verifies that
+`vfx-filters.patch` still hashes to what `PKGBUILD` pins and still applies to the
+pinned mpv commit, then does a cold `makepkg --check` in an
+`archlinux:base-devel` container, then publishes the package with the patch,
+`PKGBUILD`, `ai.conf` and `SHA256SUMS`. No GPU is needed at build time —
+`nvidia-utils` only supplies `libcuda.so` to link against.
+
+```sh
+git tag v0.41.0-r6 && git push origin v0.41.0-r6
+gh run watch
+```
+
+`ci.yml` runs the cheap gates (patch hash, patch dry-run, `py_compile`,
+`shellcheck`, JSON validity, `ai.conf` syntax) on every push, so a release is
+never the first time a broken patch is noticed.
+
 ## Use
 
 ```sh
@@ -93,6 +114,45 @@ vf-command @vfg: fps 3
 ```sh
 exec mpv --include="$HOME/.config/mpv/ai.conf" --profile=ai "$@"
 ```
+
+## Browser extension (Chromium / Helium)
+
+Click the toolbar icon, press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd>, or
+right-click a page / link / video and pick **Send to mpv**. The browser hands the
+URL to a native host, the host starts `mpv-ai` (or `mpv-nr`, or plain `mpv`)
+detached in its own session, and the AI chain does the rest — YouTube URLs go
+through yt-dlp, which mpv's own `ytdl_hook` already drives.
+
+Install once:
+
+```sh
+# 1. register the host (copies it to ~/.local/share/mpv-ai-extension)
+./native/install_native_host.sh
+
+# 2. load the extension
+#    helium-browser chrome://extensions -> Developer mode -> Load unpacked
+#    -> select the extension/ directory
+```
+
+The manifest embeds an RSA public key, so the extension ID is
+`laaljncfmpifjkegkcolkmifmbdpkece` for everyone — that is what the installer
+writes into `allowed_origins`, and it does not change when the checkout moves.
+Re-run the installer after editing `native/mpv_ai_host.py`; it copies the file
+and then round-trips a `ping` through the installed host to prove it works.
+
+Options (right-click the icon → Options) set the default profile, whether to
+start fullscreen, extra mpv arguments, and a `--ytdl-format`. The right-click
+menu overrides the profile per launch. Feedback is the toolbar badge: `OK` on a
+successful spawn, `!` on failure, with the reason in the service-worker console
+and in `~/.local/state/mpv-ai-extension/launch.log`.
+
+Three things worth knowing:
+
+- The host only accepts `http(s)` URLs and only ever starts one of three fixed
+  programs; there is no shell in the path.
+- Playback is detached: closing the browser or the tab does not stop mpv.
+- `mpv-ai` needs a GPU video output. `--vo=null` with the chain segfaults (the
+  filters require the VO's CUDA context); plain `mpv --vo=null` is fine.
 
 ## Policy the profile set encodes
 
