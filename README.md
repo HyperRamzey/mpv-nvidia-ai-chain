@@ -25,6 +25,7 @@ filter and not a Vulkan layer.
 | `vfx-filters.patch` | The whole change: 22 files against mpv `488fec0789e5026804ac8dd03fb749570416d48a` |
 | `PKGBUILD`, `mpv.install`, `find-deps.py` | Arch package that builds mpv + static libplacebo + static FFmpeg + the filters |
 | `ai.conf` | Six auto profiles (resolution band × Dolby Vision P5 state) + `[ai]` |
+| `scripts/vfg-sync.lua` | Keeps VFG's output cap equal to the current display refresh |
 | `extension/` | Chromium MV3 extension: send a page, link or video to the chain |
 | `native/` | Native messaging host (Python, stdlib only) + installer |
 | `.github/workflows/` | `ci.yml` (fast gates) and `release.yml` (cold makepkg → GitHub release) |
@@ -43,7 +44,9 @@ filter and not a Vulkan layer.
   filters.
 - **`dlssnr-helper`** from [bmitch87/DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer)
   (0.3.1-2, Windows runtime under Proton). It is a shared-memory server; the
-  Linux filter is the client. It must be running before playback:
+  Linux filter is the client. It is only needed when noise reduction is enabled
+  (`passes>=1`); the shipped config runs NR off (`passes=0`), which is a true
+  passthrough and never talks to the helper:
 
   ```
   ~/.local/bin/dlssnr-helper start | status | stop
@@ -101,12 +104,36 @@ mpv-nr movie.mkv        # VSR denoiser at 1:1 only
 mpv movie.mkv           # untouched player, Dolby Vision as before
 ```
 
-Live tuning needs the filter's label; a bare `vf-command dlssnr …` fails because
-mpv generates `dlssnr.00`, not `dlssnr`:
+Install the config and the refresh script once:
 
 ```sh
-vf-command @dlssnr: passes 1
-vf-command @vfg: fps 3
+install -Dm644 ai.conf               ~/.config/mpv/ai.conf
+install -Dm644 scripts/vfg-sync.lua  ~/.config/mpv/scripts/vfg-sync.lua
+```
+
+Noise reduction is **off by default** (`dlssnr:passes=0`, a true passthrough —
+the filter returns before any CUDA work, so it costs nothing). Enable it by
+changing `passes=0` to `passes=2` in the three `vf=` lines, or for one run:
+
+```sh
+vf-command dlssnr passes 2
+```
+
+Frame generation follows the panel: `scripts/vfg-sync.lua` watches `display-fps`
+and issues `vf-command vfg max-fps <refresh>`, so `fps=auto` picks the largest
+integer multiplier (2..4) that fits the current mode. On the 165 Hz mode that is
+96 fps for 24 fps sources, 120 for 60 fps, 144 for 48 fps; switch the panel to
+120 Hz for 60 fps material if the 165 Hz pacing shows. Measured with NR off,
+10 s each, drop = `frame-drop-count`: 1080p60+VSR → 120 fps / 1 drop, 2160p60 →
+120 fps / 0 drops, 1080p48 → 144 fps / 4 drops, 2160p24 → 96 fps / 0 drops.
+
+Live tuning addresses a filter by its chain label, written without the `@` that
+marks it in `vf=` (`@dlssnr:dlssnr:…` is addressed as `dlssnr`):
+
+```sh
+vf-command dlssnr passes 1
+vf-command vfg fps 3
+vf-command vfg max-fps 120
 ```
 
 `mpv-ai` is one line:

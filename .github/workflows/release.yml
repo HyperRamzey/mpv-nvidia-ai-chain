@@ -160,6 +160,8 @@ jobs:
           mkdir -p dist
           cp mpv-dovi-vfx-git-*.pkg.tar.zst dist/
           cp vfx-filters.patch PKGBUILD mpv.install find-deps.py ai.conf dist/
+          mkdir -p dist/scripts
+          cp scripts/vfg-sync.lua dist/scripts/
           cat > dist/RELEASE_NOTES.md <<EOF
           ## mpv-dovi-vfx-git ${ver}
 
