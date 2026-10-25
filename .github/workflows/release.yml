@@ -131,6 +131,16 @@ jobs:
           # Source the PKGBUILD only for its arrays; nothing executes.
           source ./PKGBUILD
           pacman -S --noconfirm --needed "${makedepends[@]}" nvidia-utils
+          # makedepends covers what FFmpeg and the filters need, not every
+          # library mpv's meson probes for. The distro mpv package pulls
+          # exactly the set the official build is configured against
+          # (libxkbcommon, libxpresent, libsixel, libdisplay-info, ...), which
+          # is cheaper and more complete than chasing meson's requirements one
+          # failed cold build at a time. It does not change what gets linked:
+          # build() puts $srcdir/pcshadow and its own prefix ahead of the system
+          # pkg-config path, and check() asserts the result has no dynamic
+          # libav*/libplacebo.
+          pacman -S --noconfirm --needed mpv
           # The package download cache doubles the disk footprint at the worst
           # moment (cuda alone is 2.4 GiB compressed / 5.2 GiB installed).
           pacman -Scc --noconfirm
