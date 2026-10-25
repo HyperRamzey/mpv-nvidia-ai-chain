@@ -1056,10 +1056,10 @@ index 000000000..a78ccc0ea
 +                         int dst_w, int dst_h, int work_w, int work_h);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 000000000..7b943dd6d
+index 000000000..af5a404cd
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1728 @@
+@@ -0,0 +1,1748 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -1126,9 +1126,10 @@ index 000000000..7b943dd6d
 + *              fields (vdr_rpu_profile, bl_video_full_range_flag) that
 + *              ffmpeg's own profile guess uses. So the decision is left to
 + *              the player, which does know the profile (mpv exposes
-+ *              `current-tracks/video/dolby-vision-profile`); ai.conf selects
-+ *              `dovi=skip` for profile 5. Getting it wrong is not silent:
-+ *              P5 run as PQ YCbCr looks obviously wrong, not subtly wrong.
++ *              `current-tracks/video/dolby-vision-profile`); ai.conf keeps
++ *              profile 5 out of the chain entirely (its `-p5` profiles set no
++ *              vf at all, because ICtCp is not YCbCr at any stage). Getting it
++ *              wrong is not silent: P5 run as PQ YCbCr looks obviously wrong.
 + */
 +
 +#include "filters/filter.h"
@@ -1417,7 +1418,9 @@ index 000000000..7b943dd6d
 +    // packed YUV → RGB fallback (NR is first in the chain for DoVi streams)
 +    struct yuv_to_rgba yuv_conv;
 +    bool      yuv_conv_ready;
-+    int       yuv_conv_bits, yuv_conv_matrix, yuv_conv_range;
++    int       yuv_conv_bits;      // output depth the kernel was built for
++    int       yuv_conv_in_bits;   // input depth (P010 vs P016 both look "10-bit")
++    int       yuv_conv_matrix, yuv_conv_range;
 +    CUdeviceptr yuv_rgb;
 +    size_t    yuv_rgb_cap;
 +    int       yuv_rgb_pitch;
@@ -1940,7 +1943,11 @@ index 000000000..7b943dd6d
 +                            int bit_depth, int out_bits,
 +                            enum yuv_matrix matrix, enum yuv_range range)
 +{
++    // The cache key must include the *input* depth: P010 and P016 both count
++    // as "10-bit" for out_bits purposes but unpack differently, so a format
++    // switch that keeps in_bits would reuse the wrong kernel.
 +    if (p->yuv_conv_ready && p->yuv_conv_bits == out_bits &&
++        p->yuv_conv_in_bits == bit_depth &&
 +        p->yuv_conv_matrix == matrix && p->yuv_conv_range == range)
 +        return true;
 +
@@ -1957,6 +1964,7 @@ index 000000000..7b943dd6d
 +    MP_VERBOSE(f, "dlssnr: yuv->rgb bd=%d out=%d matrix=%d range=%d\n",
 +               bit_depth, out_bits, (int)matrix, (int)range);
 +    p->yuv_conv_bits = out_bits;
++    p->yuv_conv_in_bits = bit_depth;
 +    p->yuv_conv_matrix = matrix;
 +    p->yuv_conv_range = range;
 +    p->yuv_conv_ready = true;
@@ -2500,6 +2508,12 @@ index 000000000..7b943dd6d
 +        return;
 +    }
 +
++    // The latch is documented as "3 failed frames in a row", so a frame that
++    // came back from the engine has to clear the streak. Without this a
++    // handful of unrelated transient failures spread over a long file would
++    // disable NR permanently.
++    p->fail_count = 0;
++
 +    if (dumping) {
 +        dump_dev_rows(p->dump_dir, "delta", work_w, work_h,
 +                      p->proc.delta, (size_t)work_w * 16,
@@ -2567,12 +2581,18 @@ index 000000000..7b943dd6d
 +            MP_INFO(f, "dlssnr: Dolby Vision base layer only -- NR rescales "
 +                       "the frame out of the DoVi domain, so the FEL "
 +                       "enhancement layer cannot be combined. Use dovi=skip "
-+                       "to keep FEL and give up NR.\\n");
++                       "to keep FEL and give up NR.");
 +            p->fel_warned = true;
 +        }
 +    }
 +    out->params.p_w = mpi->params.p_w;
 +    out->params.p_h = mpi->params.p_h;
++    // Orientation/timing metadata is invariant under the rebuild.
++    out->params.rotate   = mpi->params.rotate;
++    out->params.vflip    = mpi->params.vflip;
++    out->params.stereo3d = mpi->params.stereo3d;
++    out->fields          = mpi->fields;
++    out->pkt_duration    = mpi->pkt_duration;
 +    out->w = tgt_w;
 +    out->h = tgt_h;
 +    out->planes[0] = (uint8_t *)dev;
@@ -2790,10 +2810,10 @@ index 000000000..7b943dd6d
 +};
 diff --git a/video/filter/vf_hwup.c b/video/filter/vf_hwup.c
 new file mode 100644
-index 000000000..75c35b251
+index 000000000..688511aac
 --- /dev/null
 +++ b/video/filter/vf_hwup.c
-@@ -0,0 +1,554 @@
+@@ -0,0 +1,564 @@
 +// vf_hwup.c — SW→HW unification pre-filter
 +//
 +// Pipeline: decode → [vf_hwup] → [vf_rife] → [vf_vsr] → VO
@@ -3133,7 +3153,9 @@ index 000000000..75c35b251
 +    // Output buffer: Y + UV two segments (single buf, same layout as an hwdec
 +    // NV12 frame)
 +    size_t y_bytes  = (size_t)mpi->w * mpi->h * bpp;
-+    size_t uv_bytes = (size_t)mpi->w * mpi->h / 2 * bpp;
++    // NV12 chroma is ceil(h/2) rows; the floor left the last row of an
++    // odd-height source uninitialized in a buffer the VO then maps.
++    size_t uv_bytes = (size_t)mpi->w * ((mpi->h + 1) / 2) * bpp;
 +    int pitch_y  = mpi->w * bpp;
 +    int pitch_uv = mpi->w * bpp;
 +
@@ -3174,7 +3196,7 @@ index 000000000..75c35b251
 +        copy.dstDevice = p->out_buf + y_bytes;
 +        copy.dstPitch = (size_t)pitch_uv;
 +        copy.WidthInBytes = (size_t)mpi->w * bpp;
-+        copy.Height       = (size_t)mpi->h / 2;
++        copy.Height       = (size_t)(mpi->h + 1) / 2;
 +        cr = cuMemcpy2DAsync(&copy, p->cuda_stream);
 +        if (cr != CUDA_SUCCESS) {
 +            MP_ERR(f, "hwup: UV upload failed (%d)\n", cr);
@@ -3237,6 +3259,14 @@ index 000000000..75c35b251
 +    out->params.repr.dovi = out->dovi ? (void *)out->dovi->data : NULL;
 +    out->params.p_w = mpi->params.p_w;
 +    out->params.p_h = mpi->params.p_h;
++    // Orientation and timing metadata survive a rebuild unchanged; dropping
++    // them made rotated sources render unrotated (vo_gpu_next reads
++    // params.rotate per frame) and zeroed the frame duration.
++    out->params.rotate   = mpi->params.rotate;
++    out->params.vflip    = mpi->params.vflip;
++    out->params.stereo3d = mpi->params.stereo3d;
++    out->fields          = mpi->fields;
++    out->pkt_duration    = mpi->pkt_duration;
 +    out->w = mpi->w; out->h = mpi->h;
 +    out->params.w = mpi->w; out->params.h = mpi->h;
 +    out->planes[0] = (uint8_t *)p->out_buf;
@@ -3350,10 +3380,10 @@ index 000000000..75c35b251
 +};
 diff --git a/video/filter/vf_truehdr.c b/video/filter/vf_truehdr.c
 new file mode 100644
-index 000000000..588b2e23a
+index 000000000..85d691f3c
 --- /dev/null
 +++ b/video/filter/vf_truehdr.c
-@@ -0,0 +1,1035 @@
+@@ -0,0 +1,1046 @@
 +// src/mpv/video/filter/vf_truehdr.c
 +// VFX TrueHDR (SDR → HDR10 up-conversion) — the VFX SDK's AI up-conversion
 +// effect, attached **after** `vf_vsr` (approach in
@@ -3862,6 +3892,12 @@ index 000000000..588b2e23a
 +    out->params.color.hdr.max_luma = p->e_luminance;
 +    out->params.p_w = src->params.p_w;
 +    out->params.p_h = src->params.p_h;
++    // Orientation/timing metadata is invariant under the rebuild.
++    out->params.rotate   = src->params.rotate;
++    out->params.vflip    = src->params.vflip;
++    out->params.stereo3d = src->params.stereo3d;
++    out->fields          = src->fields;
++    out->pkt_duration    = src->pkt_duration;
 +    out->w = w;
 +    out->h = h;
 +    out->params.w = w;
@@ -4307,6 +4343,11 @@ index 000000000..588b2e23a
 +        cuCtxPopCurrent(NULL);
 +    }
 +    p->frame_count = 0;
++    // A seek/reopen after a failed Load is the natural retry point (the
++    // failure is usually transient driver pressure), so do not keep the
++    // permanent-passthrough latch across it.
++    p->failed = false;
++    p->failed_warned = false;
 +}
 +
 +static void f_destroy(struct mp_filter *f)
@@ -4391,10 +4432,10 @@ index 000000000..588b2e23a
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 000000000..13c7c4565
+index 000000000..54246d1a0
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1271 @@
+@@ -0,0 +1,1278 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -5055,6 +5096,13 @@ index 000000000..13c7c4565
 +    }
 +    out->params.p_w = src->params.p_w;       // pixel aspect ratio (aspect override)
 +    out->params.p_h = src->params.p_h;
++    // Orientation is invariant under frame generation. pkt_duration is *not*
++    // copied: generated frames run at out_fps, so the synthetic value below
++    // is the correct one.
++    out->params.rotate   = src->params.rotate;
++    out->params.vflip    = src->params.vflip;
++    out->params.stereo3d = src->params.stereo3d;
++    out->fields          = src->fields;
 +    out->w = p->out_w;
 +    out->h = p->out_h;
 +    out->params.w = p->out_w;
@@ -5668,10 +5716,10 @@ index 000000000..13c7c4565
 +};
 diff --git a/video/filter/vf_vsr.c b/video/filter/vf_vsr.c
 new file mode 100644
-index 000000000..3fc6dfbe5
+index 000000000..f377ee250
 --- /dev/null
 +++ b/video/filter/vf_vsr.c
-@@ -0,0 +1,1330 @@
+@@ -0,0 +1,1338 @@
 +/*
 + * vf_vsr.c -- Video Super Resolution filter via NVIDIA VFX SDK
 + *
@@ -6652,6 +6700,14 @@ index 000000000..3fc6dfbe5
 +    // upscaling)
 +    out->params.p_w = mpi->params.p_w;
 +    out->params.p_h = mpi->params.p_h;
++    // Orientation/timing metadata is invariant under scaling. Without this a
++    // rotated source rendered unrotated through VSR (vo_gpu_next reads
++    // params.rotate per frame) and the frame duration was zeroed.
++    out->params.rotate   = mpi->params.rotate;
++    out->params.vflip    = mpi->params.vflip;
++    out->params.stereo3d = mpi->params.stereo3d;
++    out->fields          = mpi->fields;
++    out->pkt_duration    = mpi->pkt_duration;
 +
 +    out->pts         = mpi->pts;
 +    out->dts         = mpi->dts;
@@ -7004,10 +7060,10 @@ index 000000000..3fc6dfbe5
 +};
 diff --git a/video/filter/vfg_proc.c b/video/filter/vfg_proc.c
 new file mode 100644
-index 000000000..56f7b6f66
+index 000000000..d27d3b9d9
 --- /dev/null
 +++ b/video/filter/vfg_proc.c
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,258 @@
 +// src/mpv/video/filter/vfg_proc.c
 +// VFG (VideoFrameGeneration) engine wrapper implementation (interface in
 +// vfg_proc.h).
@@ -7240,7 +7296,6 @@ index 000000000..56f7b6f66
 +{
 +    if (c->stream)
 +        cuStreamSynchronize(c->stream);
-+    cuStreamSynchronize(0);
 +    if (c->handle) {
 +        pfn_NvVFX_DestroyEffect(c->handle);
 +        c->handle = NULL;
@@ -7757,10 +7812,10 @@ index 000000000..c69d35307
 +void vsr_destroy(struct vsr_context *c);
 diff --git a/video/filter/vsr_proc.c b/video/filter/vsr_proc.c
 new file mode 100644
-index 000000000..3dc022b49
+index 000000000..776ef74d6
 --- /dev/null
 +++ b/video/filter/vsr_proc.c
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,364 @@
 +#include "vsr_internal.h"
 +#include "vfx_loader.h"
 +
@@ -8101,7 +8156,6 @@ index 000000000..3dc022b49
 +void vsr_destroy(struct vsr_context *c) {
 +    if (c->stream)
 +        cuStreamSynchronize(c->stream);
-+    cuStreamSynchronize(0);
 +    if (c->handle) {
 +        pfn_NvVFX_DestroyEffect(c->handle);
 +        c->handle = NULL;

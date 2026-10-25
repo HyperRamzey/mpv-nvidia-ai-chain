@@ -15,15 +15,15 @@ traps.
 
 | Thing | Path |
 | --- | --- |
-| Package | `mpv-dovi-vfx-git 0.41.0_1275_g488fec0789-5` (`/usr/bin/mpv`, `/usr/lib/libmpv.so.2.6.0`) |
-| Built artefact | `~/ai-video/build/arch/mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-5-x86_64.pkg.tar.zst` |
+| Package | `mpv-dovi-vfx-git 0.41.0_1275_g488fec0789-6` (`/usr/bin/mpv`, `/usr/lib/libmpv.so.2.6.0`) |
+| Built artefact | `~/ai-video/build/arch/mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-6-x86_64.pkg.tar.zst` |
 | PKGBUILD + sources | `~/ai-video/build/arch/` (`PKGBUILD`, `vfx-filters.patch`, `find-deps.py`, `mpv.install`) |
 | AI chain config | `~/.config/mpv/ai.conf` (six auto profiles + `[ai]`) |
 | NR (VSR denoiser) config | `~/.config/mpv/nr.conf` |
 | Wrappers | `~/.local/bin/mpv-ai`, `~/.local/bin/mpv-nr` |
 | NR helper | `~/.local/bin/dlssnr-helper` — **must be running** for `dlssnr` |
 | Old player backup | `~/ai-video/build/backup-mpv-dovi-git/` (binary + libmpv + headers) |
-| Patch (22 files, 8527 lines) | `~/ai-video/build/arch/vfx-filters.patch`, sha256 `9d755ffb…f33788` |
+| Patch (22 files, 8581 lines) | `~/ai-video/build/arch/vfx-filters.patch`, sha256 `8e487d9f…b7a2` |
 
 Pins: mpv `488fec0789e5026804ac8dd03fb749570416d48a`, libplacebo
 `13d0b79827ea1671f991ca57700e5356af9731a5` (PL_API_VER 377, libdovi), FFmpeg static
@@ -172,6 +172,27 @@ outputs the input's own format and `params.color` is copied through.
     rebuilds a frame in RGB (`vsr`, `vfg`) must set `no_dovi` +
     `no_enhancement_layer`, or libplacebo applies a DoVi reshape to RGB pixels.
     `dlssnr` already did; `vsr` and `vfg` did not.
+16. **Every filter must re-emit `params.rotate` (and `vflip`, `stereo3d`, `fields`,
+    `pkt_duration`) on rebuilt frames.** They are not implied by `w/h`: vo_gpu_next
+    reads `params.rotate` *per frame* (`vo_gpu_next.c:1992`) to pick the swapchain
+    orientation. Measured: a 1920x1080 clip with a 90° display matrix through
+    `ai-vsr` came out **2560x1440 on -5 and 1440x2560 on -6** (native `mpv`: 1080x1920).
+    Dropping `pkt_duration` also zeroed the frame duration the player uses for
+    display-sync pacing.
+17. **A failure latch documented as "in a row" must be reset by a success.**
+    `dlssnr`'s `fail_count` was only cleared on seek, so three unrelated transient
+    failures spread over a long file disabled NR for the rest of it.
+18. **Never sync stream 0 during teardown.** `cuStreamSynchronize(0)` waits on the
+    shared context's legacy stream, which carries libplacebo's map/unmap copies from
+    the render thread; when the core is blocked, those copies never complete and
+    teardown deadlocks (the Xid 109 case). Sync the engine's own stream only —
+    `vsr_proc.c` / `vfg_proc.c` carried the extra call under a comment that banned it.
+    Removing it is safe because each frame is already drained by the filter's own
+    per-frame sync before the next one starts.
+19. **`yuv_to_rgba` kernel caches must key on the *input* depth too.** P010 and P016
+    both look like "10-bit" to the output-side key but unpack differently (MSB-aligned
+    vs low-bit), so a format switch that keeps the output depth reused the wrong
+    kernel. `dlssnr`'s cache was missing that field; `vsr`/`truehdr`/`vfg` were not.
 
 ## 6. Known limits / open items
 
@@ -198,6 +219,13 @@ outputs the input's own format and `params.color` is copied through.
 - **`dlssnr` no longer blocks file open on helper launch.** `helper_spawn()` uses
   `posix_spawn` without `waitpid` instead of `system()`; `dlssnr-helper start` brings
   up Python plus a Proton container and used to stall the first frame for seconds.
+- **Second audit pass (pkgrel 6) also fixed:** rotation/duration metadata lost by all
+  five filters (trap 16), the non-consecutive NR failure latch (trap 17), the banned
+  stream-0 sync in both engine teardowns (trap 18), `truehdr`'s permanent-passthrough
+  latch surviving a seek, the `dlssnr` YUV-conversion cache key (trap 19), an
+  uninitialised NV12 chroma row for odd heights in `hwup`, and a literal `\n` in the
+  FEL log line. Playback evidence unchanged: 1080p48 SDR `vsr 1.33` + `dlssnr 2x`
+  ~12.6 ms + `vfg k=2`, exit 0; 2160p48 DV P7 96 fps, drop unchanged.
 
 - **KWin HDR must be ON** for TrueHDR output to reach the panel as HDR. With HDR off,
   the PQ frames get tone-mapped straight back to SDR — use plain `mpv` instead (same
@@ -236,7 +264,7 @@ outputs the input's own format and `params.color` is copied through.
 ```sh
 cd ~/ai-video/build/arch
 BUILDDIR=~/ai-video/build/makepkg makepkg -f -e --noprepare --check
-sudo pacman -U mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-5-x86_64.pkg.tar.zst
+sudo pacman -U mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-6-x86_64.pkg.tar.zst
 ```
 
 `-e` reuses `$srcdir` (keeps the FFmpeg/nasm objects); delete

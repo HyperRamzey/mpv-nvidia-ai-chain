@@ -47,7 +47,7 @@ filter and not a Vulkan layer.
   ```
 
   Without it, `dlssnr` fails open — it logs and stays inert, playback continues.
-  From `pkgrel 5` that costs about one frame, not one timeout per frame: the
+  From `pkgrel 5` on, that costs about one frame, not one timeout per frame: the
   filter short-circuits on the shared-memory helper state and latches to
   passthrough after three consecutive failures.
 
@@ -160,8 +160,8 @@ The anchor is never replaced, so text and edges keep full resolution.
 
 ## Correctness fixes in this revision
 
-`pkgrel 5` (patch sha256 `9d755ffb…`) closes four defects found by reading the
-whole chain, not just the new filter:
+`pkgrel 6` (patch sha256 `8e487d9f…`) closes eleven defects found by reading the
+whole chain, not just the new filter. The first four:
 
 | defect | fix | measured |
 | --- | --- | --- |
@@ -169,6 +169,17 @@ whole chain, not just the new filter:
 | `vsr` / `vfg` emitted RGB frames that `el_pair` re-tagged as DoVi, applying a reshape to RGB | set `no_dovi` + `no_enhancement_layer`; `hwup` keeps the `dovi` reference across SW→HW | full chain mean Δ 3.55 codes, matching the measured cinematic preset (4.63) with no channel bias |
 | a stopped helper cost one 4 s timeout per frame forever | fail-fast on `SHM_HELPER_STATE`, latch to passthrough after 3 failures | 4 s clip: 10 s wall instead of ~6 min |
 | helper launch blocked file open (`system()`) | `posix_spawn` without `waitpid` | first frame no longer stalls |
+
+The second pass added:
+
+| defect | fix | measured |
+| --- | --- | --- |
+| all five filters dropped `params.rotate`, `vflip`, `stereo3d`, `fields`, `pkt_duration` | copied onto every rebuilt frame (VFG keeps its synthetic duration) | 90° display matrix through `ai-vsr`: **2560×1440 before, 1440×2560 after**, native `mpv` 1080×1920 |
+| NR's "3 failed frames in a row" latch was never reset by a success — three failures anywhere disabled it | reset `fail_count` after a good frame | dead-helper test unchanged: 4 s clip → 9.5 s wall |
+| engine teardown synced stream 0, the exact call its own comment bans (Xid 109 deadlock) | removed; only the engine stream is synced | quit during playback and at EOF still clean |
+| `truehdr` kept its permanent-passthrough latch across a seek | `f_reset` clears it | code path |
+| `dlssnr`'s YUV kernel cache ignored the input depth (P010 vs P016) | added to the cache key | — |
+| `hwup` wrote `h/2` chroma rows, leaving one uninitialised for odd heights | `ceil(h/2)` | — |
 
 ## License
 

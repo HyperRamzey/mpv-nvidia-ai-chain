@@ -1,7 +1,7 @@
 # DLSS 5 NR (NGX feature 18) for mpv — design of record
 
 Status: **implemented, packaged and installed.** `vf_dlssnr` ships in
-`mpv-dovi-vfx-git 0.41.0_1275_g488fec0789-5` alongside `vf_vsr`, `vf_truehdr`,
+`mpv-dovi-vfx-git 0.41.0_1275_g488fec0789-6` alongside `vf_vsr`, `vf_truehdr`,
 `vf_vfg` and `vf_hwup`; `~/.config/mpv/ai.conf` is the shipped profile set.
 Sections 1–3 are the design as researched; §4–§7 are what actually got built and
 what it measured. Every number below is measured on this machine unless marked
@@ -217,7 +217,7 @@ offline comparison — that is how every delta number in §6 was obtained.
 `video/filter/vf_dlssnr.c` (filter shell, options, SHM client, helper spawn,
 status line) + `video/filter/dlssnr_proc.{c,h}` (NVRTC kernels run on the CUDA
 context that `vf_hwup` establishes). `vfx-filters.patch` is the deliverable of
-record: 8527 lines, 22 files, applies to a pristine
+record: 8581 lines, 22 files, applies to a pristine
 `488fec0789e5026804ac8dd03fb749570416d48a` with zero rejects.
 
 Frame path inside the filter:
@@ -358,7 +358,7 @@ flip.
 ### Fixes from the chain audit (pkgrel 5)
 
 Everything above was shipped in `-4`; `-5` closes the defects a full read of the
-chain turned up. Patch size 8399 → 8527 lines, sha256 `9d755ffb…`.
+chain turned up. Patch size 8399 → 8527 lines.
 
 | defect | fix | evidence |
 |---|---|---|
@@ -367,6 +367,21 @@ chain turned up. Patch size 8399 → 8527 lines, sha256 `9d755ffb…`.
 | dead helper cost one `timeout` per frame forever (≈6 min for a 4 s clip) | first failure still costs the timeout; afterwards `SHM_HELPER_STATE` short-circuits the wait; 3 consecutive failures latch `helper_dead` → passthrough until seek/reopen | helper stopped + `spawn=0`, 4 s clip → **10 s wall**, `3 failed frames in a row -- NR disabled for this file`, exit 0 |
 | `helper_spawn()` used `system()`, blocking file open on a Python + Proton launch | `posix_spawn` without `waitpid` | first frame no longer stalls |
 | SHM file opened without checks | `O_NOFOLLOW` + `O_CLOEXEC`, owner and regular-file check | — |
+
+### Second audit pass (pkgrel 6)
+
+A read-only review of the fixed tree found seven more defects; all are closed.
+Patch 8527 → 8581 lines, sha256 `8e487d9f…`.
+
+| defect | fix | evidence |
+|---|---|---|
+| all five filters dropped `params.rotate`, `vflip`, `stereo3d`, `fields` and `pkt_duration` | each rebuilt frame now carries them (VFG keeps its synthetic duration) | 1920×1080 with a 90° display matrix through `ai-vsr`: **-5 → 2560×1440, -6 → 1440×2560**, native `mpv` 1080×1920 |
+| `fail_count` was never cleared on success, so "3 in a row" was really "3 ever" | reset after a frame returns from the engine | dead-helper test unchanged: 4 s clip → 9.5 s wall, latch fires, exit 0 |
+| `vsr_destroy`/`vfg_destroy` called `cuStreamSynchronize(0)` directly under a comment banning it (the Xid 109 deadlock) | removed; the engine stream is synced and idle | quit during playback and at EOF both still terminate; no hang |
+| `truehdr`'s `failed` latch survived `f_reset`, so one transient Load failure disabled it for the whole file | `f_reset` clears `failed`/`failed_warned` | code path only; needs a real transient failure to observe |
+| `dlssnr`'s YUV-conversion cache key omitted the input depth (P010 vs P016 both "10-bit") | `yuv_conv_in_bits` in the key | matches the key in vsr/truehdr/vfg |
+| `hwup` computed NV12 chroma as `h/2` rows, leaving the last row of an odd-height source uninitialised | `ceil(h/2)` for both the allocation and the copy | no odd-height sample; arithmetic fix |
+| literal `\n` in the FEL log line | removed | — |
 
 ## 7. Known defects
 
@@ -398,11 +413,11 @@ chain turned up. Patch size 8399 → 8527 lines, sha256 `9d755ffb…`.
 ```
 cd ~/ai-video/build/arch
 BUILDDIR=$HOME/ai-video/build/makepkg makepkg -f -e --noprepare --check
-sudo pacman -U mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-5-x86_64.pkg.tar.zst
+sudo pacman -U mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-6-x86_64.pkg.tar.zst
 ```
 
 `PKGBUILD` pins the patch by sha256
-`9d755ffba67a3be91ed9203e129b5327dd741ac3501b3a93af089883dcf33788`. `-e`
+`8e487d9f85692d3837900526e055721d99aa69e7078c07b46996845008a3b7a2`. `-e`
 reuses the existing `$srcdir`; delete `src/libplacebo/build-lp` and `src/mpv/build`
 first for a genuinely clean configure. `check()` builds and runs mpv's own tests.
 
