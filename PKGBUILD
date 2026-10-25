@@ -28,7 +28,7 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.41.0_1275_g488fec0789
-pkgrel=9
+pkgrel=10
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
@@ -43,7 +43,7 @@ depends=(
   # whatever the artifact was actually built against.
   'cuda' 'nvidia-utils'
   'hicolor-icon-theme'
-  'dav1d' 'jack' 'lcms2' 'libarchive' 'libass' 'libbluray' 'libcaca'
+  'dav1d' 'libjack.so=0-64' 'lcms2' 'libarchive' 'libass' 'libbluray' 'libcaca'
   'libcdio-paranoia' 'libdisplay-info' 'libdovi' 'libdvdnav' 'libpipewire'
   'libpulse' 'libsixel' 'libva' 'libvdpau' 'libvpx' 'libxkbcommon'
   'libxpresent' 'libxss' 'libxv' 'luajit' 'rubberband' 'shaderc' 'sndio'
