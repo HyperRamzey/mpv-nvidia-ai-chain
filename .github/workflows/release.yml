@@ -137,9 +137,8 @@ jobs:
           # (libxkbcommon, libxpresent, libsixel, libdisplay-info, ...), which
           # is cheaper and more complete than chasing meson's requirements one
           # failed cold build at a time. It does not change what gets linked:
-          # build() puts $srcdir/pcshadow and its own prefix ahead of the system
-          # pkg-config path, and check() asserts the result has no dynamic
-          # libav*/libplacebo.
+          # build() puts its own prefix ahead of the system pkg-config path, and
+          # check() asserts the result has no dynamic libav*/libplacebo.
           pacman -S --noconfirm --needed mpv
           # The package download cache doubles the disk footprint at the worst
           # moment (cuda alone is 2.4 GiB compressed / 5.2 GiB installed).
@@ -165,7 +164,7 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           ## mpv-dovi-vfx-git ${ver}
 
-          Cold build from $(git rev-parse --short HEAD) on Arch Linux
+          Cold build from $(printf '%s' "$GITHUB_SHA" | cut -c1-7) on Arch Linux
           (\`archlinux:base-devel\`, CUDA 13.4).
 
           | Component | Pin |
@@ -179,7 +178,13 @@ jobs:
 
           \`\`\`sh
           sudo pacman -U mpv-dovi-vfx-git-*.pkg.tar.zst
+          install -Dm644 ai.conf              ~/.config/mpv/ai.conf
+          install -Dm644 scripts/vfg-sync.lua ~/.config/mpv/scripts/vfg-sync.lua
           \`\`\`
+
+          Noise reduction is off by default (\`dlssnr:passes=0\` is a true
+          passthrough); frame generation follows the display refresh through
+          \`scripts/vfg-sync.lua\`.
 
           The package pins the exact mpv commit, the patch, and static
           libplacebo + FFmpeg; nothing in the system is replaced. The VFX SDK
@@ -193,7 +198,8 @@ jobs:
           mpv --version | head -1
           \`\`\`
           EOF
-          ( cd dist && sha256sum * > SHA256SUMS )
+          ( cd dist && find . -type f ! -name SHA256SUMS -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS )
           ls -lh dist
           df -h / | tail -1
 
