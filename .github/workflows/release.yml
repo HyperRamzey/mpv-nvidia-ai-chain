@@ -245,11 +245,16 @@ jobs:
         run: |
           set -euo pipefail
           tag='${{ steps.tag.outputs.tag }}'
+          # Every file in dist/ is an asset, including scripts/vfg-sync.lua;
+          # dist/scripts itself must not be passed (gh tries to upload the
+          # directory and fails). SHA256SUMS goes last so the list stays sorted.
+          mapfile -t assets < <(find dist -type f ! -name SHA256SUMS | sort)
+          assets+=("dist/SHA256SUMS")
           # A tag push already created the tag; a manual run needs one.
           if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" \
-              --notes-file dist/RELEASE_NOTES.md dist/*
+              --notes-file dist/RELEASE_NOTES.md "${assets[@]}"
           else
             gh release create "$tag" --title "$tag" \
-              --notes-file dist/RELEASE_NOTES.md dist/*
+              --notes-file dist/RELEASE_NOTES.md "${assets[@]}"
           fi
