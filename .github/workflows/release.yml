@@ -99,15 +99,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare builder user and ccache
+      - name: Prepare container
         run: |
           set -euo pipefail
           pacman -Syu --noconfirm --needed git sudo ccache
-          useradd -m builder
-          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
-          chown -R builder:builder "$GITHUB_WORKSPACE"
           sed -i 's/^!ccache/ccache/' /etc/makepkg.conf
-          su builder -c "CCACHE_DIR='$GITHUB_WORKSPACE/.ccache' ccache -M 400M"
+          df -h / | tail -1
 
       - name: Restore ccache
         uses: actions/cache@v4
@@ -116,6 +113,17 @@ jobs:
           key: ccache-${{ env.MPV_COMMIT }}-${{ hashFiles('vfx-filters.patch', 'PKGBUILD') }}
           restore-keys: |
             ccache-${{ env.MPV_COMMIT }}-
+
+      - name: Create builder
+        run: |
+          set -euo pipefail
+          # After the cache restore: the restored directory is owned by root,
+          # and ccache has to be able to write into it as the builder user.
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          mkdir -p .ccache
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "CCACHE_DIR='$GITHUB_WORKSPACE/.ccache' ccache -M 1G"
 
       - name: Install makedepends
         run: |
@@ -142,7 +150,6 @@ jobs:
           mkdir -p dist
           cp mpv-dovi-vfx-git-*.pkg.tar.zst dist/
           cp vfx-filters.patch PKGBUILD mpv.install find-deps.py ai.conf dist/
-          ( cd dist && sha256sum * > SHA256SUMS )
           cat > dist/RELEASE_NOTES.md <<EOF
           ## mpv-dovi-vfx-git ${ver}
 
@@ -174,8 +181,9 @@ jobs:
           mpv --version | head -1
           \`\`\`
           EOF
-          sed -i 's/^          //' dist/RELEASE_NOTES.md
+          ( cd dist && sha256sum * > SHA256SUMS )
           ls -lh dist
+          df -h / | tail -1
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
