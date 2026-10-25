@@ -28,12 +28,27 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.41.0_1275_g488fec0789
-pkgrel=8
+pkgrel=9
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
 license=('GPL-2.0-or-later')
-depends=('hicolor-icon-theme')
+depends=(
+  # Real DT_NEEDED entries of the built binaries.  The list is the union of a
+  # minimal host and the CI container, because meson enables optional features
+  # based on what happens to be installed: a local build links dav1d/lcms2/
+  # libcaca/zlib-ng-compat, the CI build (which installs the distro mpv to get
+  # meson's full dependency set) also links uchardet/libsixel/libxpresent and
+  # libpipewire.  Over-declaring is the safe direction: pacman -U then pulls
+  # whatever the artifact was actually built against.
+  'cuda' 'nvidia-utils'
+  'hicolor-icon-theme'
+  'dav1d' 'jack' 'lcms2' 'libarchive' 'libass' 'libbluray' 'libcaca'
+  'libcdio-paranoia' 'libdisplay-info' 'libdovi' 'libdvdnav' 'libpipewire'
+  'libpulse' 'libsixel' 'libva' 'libvdpau' 'libvpx' 'libxkbcommon'
+  'libxpresent' 'libxss' 'libxv' 'luajit' 'rubberband' 'shaderc' 'sndio'
+  'uchardet' 'vulkan-icd-loader' 'zimg' 'zlib-ng-compat'
+)
 makedepends=(
   'git'
   'meson'
