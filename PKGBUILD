@@ -28,7 +28,7 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.41.0_1275_g488fec0789
-pkgrel=7
+pkgrel=8
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
@@ -142,42 +142,24 @@ build() {
 
   jobs=$(nproc)
 
-  # Arch's libpulse.pc advertises its private implementation library in
-  # Libs.private.  meson passes pkg-config --static (-Dprefer_static=true), so
-  # that entry would put libpulsecommon-17.0.so into mpv's DT_NEEDED even
-  # though it lives in /usr/lib/pulseaudio, outside the loader path.  libpulse
-  # already resolves it through its own RUNPATH; hide the private entry from
-  # static dependency resolution instead of adding a private rpath.
-  local pulse_pc
-  pulse_pc="$(pkg-config --variable=pcfiledir libpulse)/libpulse.pc"
-  [[ -f "$pulse_pc" ]] || { error "libpulse.pc not found"; return 1; }
-  mkdir -p "$srcdir/pcshadow"
-  sed '/^Libs\.private:/d' "$pulse_pc" > "$srcdir/pcshadow/libpulse.pc"
-
-  # harfbuzz's static closure drags in libglib-2.0.a, while every other glib
-  # consumer on the system (harfbuzz.so, libass.so, libpulse.so) links the
-  # shared libglib-2.0.  Adding a second, static copy to mpv makes binutils
-  # 2.45+ reject the final link:
+  # No -Dprefer_static=true for the system libraries.  It made meson resolve
+  # every dependency with `pkg-config --static`, so each library's
+  # Requires.private/Libs.private closure landed on mpv's link line.  That put
+  # /usr/lib/libglib-2.0.a (via harfbuzz, via libass) next to the shared
+  # libglib-2.0.so.0 that harfbuzz.so, libass.so and libpulse.so already load,
+  # and binutils 2.45+ rejects the result:
   #   hidden symbol `g_get_current_time' in /usr/lib/libglib-2.0.a(gmain.c.o)
   #   is referenced by DSO
-  # Keep harfbuzz's compile flags -- its Cflags inherit glib's include paths --
-  # and drop glib from its static link closure; harfbuzz.so already carries
-  # libglib-2.0.so.0 in DT_NEEDED.
-  local hb_pc glib_cflags
-  hb_pc="$(pkg-config --variable=pcfiledir harfbuzz)/harfbuzz.pc"
-  [[ -f "$hb_pc" ]] || { error "harfbuzz.pc not found"; return 1; }
-  glib_cflags="$(pkg-config --cflags glib-2.0)"
-  awk -v extra="$glib_cflags" '
-    /^Requires\.private:/ {
-      gsub(/glib-2\.0[^,]*,?[[:space:]]*/, "")
-      sub(/,[[:space:]]*$/, "")
-      print; next
-    }
-    /^Cflags:/ { print $0 " " extra; next }
-    { print }
-  ' "$hb_pc" > "$srcdir/pcshadow/harfbuzz.pc"
-
-  export PKG_CONFIG_PATH="$srcdir/pcshadow:$prefix/lib/pkgconfig"
+  # It also pulled libpulsecommon-17.0.so (outside the loader path) in through
+  # libpulse's Libs.private.  Shadowing those .pc files one at a time only
+  # moved the problem: any future library with a static-only private
+  # dependency reintroduces it.
+  #
+  # libplacebo and FFmpeg are built in-tree with --disable-shared, so they are
+  # still linked statically and still come from $prefix/lib/pkgconfig, which is
+  # first on PKG_CONFIG_PATH.  check() asserts that no dynamic libav*/libplacebo
+  # slipped in.
+  export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
   export PATH="$tools/bin:$PATH"
 
   # nasm is required for FFmpeg's x86 SIMD; not installed on the target box.
@@ -266,7 +248,6 @@ build() {
     --buildtype=plain \
     --wrap-mode=nodownload \
     -Dlibmpv=true \
-    -Dprefer_static=true \
     -Dvulkan=enabled \
     -Dwayland=enabled \
     -Dvaapi=auto \
