@@ -28,19 +28,21 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.41.0_1275_g488fec0789
-pkgrel=10
+pkgrel=11
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
 license=('GPL-2.0-or-later')
 depends=(
-  # Real DT_NEEDED entries of the built binaries.  The list is the union of a
-  # minimal host and the CI container, because meson enables optional features
-  # based on what happens to be installed: a local build links dav1d/lcms2/
-  # libcaca/zlib-ng-compat, the CI build (which installs the distro mpv to get
-  # meson's full dependency set) also links uchardet/libsixel/libxpresent and
-  # libpipewire.  Over-declaring is the safe direction: pacman -U then pulls
-  # whatever the artifact was actually built against.
+  # Build-time gate only: makepkg refuses to start until these resolve.
+  # package() replaces this array with what find-deps.py detects in the built
+  # binaries, so the package metadata describes the artifact, not this list.
+  # The list is the union of a minimal host and the CI container, because
+  # meson enables optional features based on what happens to be installed: a
+  # local build links libcaca/zlib-ng-compat, the CI build (which installs the
+  # distro mpv to get meson's full dependency set) also links
+  # uchardet/libsixel/libxpresent and libpipewire.  Over-declaring is the safe
+  # direction: pacman -U then pulls whatever the artifact was built against.
   'cuda' 'nvidia-utils'
   'hicolor-icon-theme'
   'dav1d' 'libjack.so=0-64' 'lcms2' 'libarchive' 'libass' 'libbluray' 'libcaca'
@@ -354,6 +356,25 @@ package() {
   local detected
   detected=$(python3 "$srcdir/find-deps.py" \
     "$pkgdir/usr/bin/mpv" "$pkgdir"/usr/lib/libmpv.so.2)
-  depends=($detected 'hicolor-icon-theme')
+
+  # `jack` is a virtual provided by both jack2 and pipewire-jack, and those
+  # two conflict with each other.  find-deps.py reports whichever one owns
+  # libjack.so.0 on the build host, so the same source produced a package
+  # depending on pipewire-jack here and on jack2 in the CI container (which
+  # installs the distro mpv).  Installing the jack2 flavour fails on a system
+  # running pipewire-jack:
+  #   jack2-1.9.22-2.1 and pipewire-jack-1:1.6.10-1 are in conflict (jack)
+  # Depend on the soname instead: it names what the binary actually links and
+  # either provider satisfies it.
+  local dep
+  local -a resolved=()
+  for dep in $detected; do
+    case "$dep" in
+      jack|jack2|pipewire-jack) dep='libjack.so=0-64' ;;
+    esac
+    resolved+=("$dep")
+  done
+
+  depends=("${resolved[@]}" 'hicolor-icon-theme')
   msg "Auto-detected runtime dependencies: ${depends[*]}"
 }
