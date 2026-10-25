@@ -28,7 +28,7 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.41.0_1275_g488fec0789
-pkgrel=6
+pkgrel=7
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
@@ -153,6 +153,29 @@ build() {
   [[ -f "$pulse_pc" ]] || { error "libpulse.pc not found"; return 1; }
   mkdir -p "$srcdir/pcshadow"
   sed '/^Libs\.private:/d' "$pulse_pc" > "$srcdir/pcshadow/libpulse.pc"
+
+  # harfbuzz's static closure drags in libglib-2.0.a, while every other glib
+  # consumer on the system (harfbuzz.so, libass.so, libpulse.so) links the
+  # shared libglib-2.0.  Adding a second, static copy to mpv makes binutils
+  # 2.45+ reject the final link:
+  #   hidden symbol `g_get_current_time' in /usr/lib/libglib-2.0.a(gmain.c.o)
+  #   is referenced by DSO
+  # Keep harfbuzz's compile flags -- its Cflags inherit glib's include paths --
+  # and drop glib from its static link closure; harfbuzz.so already carries
+  # libglib-2.0.so.0 in DT_NEEDED.
+  local hb_pc glib_cflags
+  hb_pc="$(pkg-config --variable=pcfiledir harfbuzz)/harfbuzz.pc"
+  [[ -f "$hb_pc" ]] || { error "harfbuzz.pc not found"; return 1; }
+  glib_cflags="$(pkg-config --cflags glib-2.0)"
+  awk -v extra="$glib_cflags" '
+    /^Requires\.private:/ {
+      gsub(/glib-2\.0[^,]*,?[[:space:]]*/, "")
+      sub(/,[[:space:]]*$/, "")
+      print; next
+    }
+    /^Cflags:/ { print $0 " " extra; next }
+    { print }
+  ' "$hb_pc" > "$srcdir/pcshadow/harfbuzz.pc"
 
   export PKG_CONFIG_PATH="$srcdir/pcshadow:$prefix/lib/pkgconfig"
   export PATH="$tools/bin:$PATH"
