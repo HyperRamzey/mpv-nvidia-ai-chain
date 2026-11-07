@@ -1,6 +1,6 @@
 # NVIDIA AI video chain for mpv (Linux)
 
-Four NVIDIA NGX filters compiled into mpv, plus **DLSS 5 noise reduction** as an
+Four NVIDIA NGX filters compiled into mpv, plus **DLSS 5 NeuralRender** as an
 in-chain filter, driven by a profile set that picks the right chain per source.
 
 Built for an Arch / KDE Wayland desktop with an RTX 5070 and a 2560×1440 165 Hz
