@@ -6,7 +6,7 @@
 #   VSR   (AI upscale)          : vf_vsr    via NVIDIA NGX VideoSuperRes
 #   TrueHDR (SDR -> HDR10)      : vf_truehdr via NVIDIA NGX TrueHDR
 #   VFG   (frame generation)    : vf_vfg    via NVIDIA VideoFrameGeneration
-#   DLSS5 NR (noise reduction)  : vf_dlssnr via NGX feature 18, through
+#   DLSS 5 Neural Render  : vf_dlssnr via NGX feature 18, through
 #                                 the dlssnr helper (shared memory)
 #
 # libplacebo and FFmpeg are built STATIC and linked into mpv/libmpv on purpose:
@@ -27,8 +27,8 @@
 # libnvrtc.so.13 from the 'cuda' package (auto-detected into depends below).
 
 pkgname=mpv-dovi-vfx-git
-pkgver=0.41.0_1275_g488fec0789
-pkgrel=11
+pkgver=0.42.0_39_gfe753a7824
+pkgrel=1
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
@@ -103,8 +103,8 @@ install=mpv.install
 
 _ffmpegver=9.0.2
 _nasmver=2.16.03
-_mpvcommit=488fec0789e5026804ac8dd03fb749570416d48a
-_lpcommit=13d0b79827ea1671f991ca57700e5356af9731a5
+_mpvcommit=fe753a78246151a2489b472dabcb04f2edd61d50
+_lpcommit=58dfee73db8139d825306b638c844f6908517164
 
 source=(
   "git+https://github.com/mpv-player/mpv#commit=${_mpvcommit}"
@@ -126,7 +126,7 @@ sha256sums=(
   'SKIP'
   'SKIP'
   '7dbf0282eb1f5a46b8d4935daba5566d18b7ec7ad9d487430a78f992c99a8e63'
-  '8e487d9f85692d3837900526e055721d99aa69e7078c07b46996845008a3b7a2'
+  'ce5d4aa1773a077d66a11683c6dca67e6a583fae8608f2bc821f2ceebae9eb07'
 )
 
 pkgver() {
@@ -223,8 +223,8 @@ build() {
   # without it.
   local pl_api
   pl_api=$(sed -n 's/^#define PL_API_VER \([0-9]*\)$/\1/p' "$prefix/include/libplacebo/config.h")
-  [[ -n "$pl_api" && "$pl_api" -ge 370 ]] \
-    || { error "libplacebo PL_API_VER=$pl_api, need >= 370 for DoVi P7 FEL"; return 1; }
+  [[ -n "$pl_api" && "$pl_api" -ge 387 ]] \
+    || { error "libplacebo PL_API_VER=$pl_api, need >= 387 for the DoVi CUDA decoder"; return 1; }
   grep -q '^#define PL_HAVE_LIBDOVI 1$' "$prefix/include/libplacebo/config.h" \
     || { error "libplacebo built without libdovi"; return 1; }
   msg "libplacebo PL_API_VER=$pl_api (FEL: yes)"

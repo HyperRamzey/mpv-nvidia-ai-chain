@@ -37,7 +37,7 @@ concurrency:
 
 env:
   # Pinned upstream commit the patch was written against (also in PKGBUILD).
-  MPV_COMMIT: 488fec0789e5026804ac8dd03fb749570416d48a
+  MPV_COMMIT: fe753a78246151a2489b472dabcb04f2edd61d50
 
 jobs:
   # --------------------------------------------------------------------------
@@ -170,7 +170,7 @@ jobs:
           | Component | Pin |
           | --- | --- |
           | mpv | \`${MPV_COMMIT}\` |
-          | libplacebo | \`13d0b79827ea1671f991ca57700e5356af9731a5\` (PL_API_VER 377, libdovi) |
+          | libplacebo | \`58dfee73db8139d825306b638c844f6908517164\` (PL_API_VER 392, libdovi) |
           | FFmpeg | 9.0.2, static |
           | VFX patch | \`$(sha256sum vfx-filters.patch | cut -d' ' -f1)\` |
 

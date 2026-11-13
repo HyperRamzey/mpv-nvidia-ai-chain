@@ -1,8 +1,53 @@
 diff --git a/filters/f_output_chain.c b/filters/f_output_chain.c
-index 892d38e9a..22c3a4ac0 100644
+index e42c7a112a..90c0efa693 100644
 --- a/filters/f_output_chain.c
 +++ b/filters/f_output_chain.c
-@@ -701,6 +701,7 @@ static void create_video_things(struct chain *p)
+@@ -269,6 +269,22 @@ static struct mp_user_filter *create_wrapper_filter(struct chain *p)
+     return wrapper;
+ }
+ 
++// The NVIDIA VFX filters rebuild frames as RGB. Dolby Vision therefore has to
++// be complete on the frame -- base layer, RPU and enhancement layer -- before
++// the first of them runs (it is decoded there, video/filter/dovi_to_rgb.c);
++// pairing the EL after the user chain would be too late. Without one of these
++// filters the pairing stays where it was, at the tail.
++static bool want_early_el_pair(struct chain *p)
++{
++    for (int n = 0; n < p->num_user_filters; n++) {
++        const char *name = p->user_filters[n]->name;
++        if (name && (!strcmp(name, "vsr") || !strcmp(name, "dlssnr") ||
++                     !strcmp(name, "vfg")))
++            return true;
++    }
++    return false;
++}
++
+ // Rebuild p->all_filters and relink the filters. Non-destructive if no change.
+ static void relink_filter_list(struct chain *p)
+ {
+@@ -276,12 +292,20 @@ static void relink_filter_list(struct chain *p)
+         {p->pre_filters, p->user_filters, p->post_filters};
+     int all_filters_num[3] =
+         {p->num_pre_filters, p->num_user_filters, p->num_post_filters};
++    // el_pair is stored in post_filters; this only changes where it is linked.
++    // Evaluated on every relink, so toggling the filters at runtime moves it.
++    bool el_early = p->el_pair && want_early_el_pair(p);
+     p->num_all_filters = 0;
+     for (int n = 0; n < 3; n++) {
+         struct mp_user_filter **filters = all_filters[n];
+         int filters_num = all_filters_num[n];
+-        for (int i = 0; i < filters_num; i++)
++        if (n == 1 && el_early)
++            MP_TARRAY_APPEND(p, p->all_filters, p->num_all_filters, p->el_pair);
++        for (int i = 0; i < filters_num; i++) {
++            if (el_early && filters[i] == p->el_pair)
++                continue;
+             MP_TARRAY_APPEND(p, p->all_filters, p->num_all_filters, filters[i]);
++        }
+     }
+ 
+     mp_assert(p->num_all_filters > 0);
+@@ -701,6 +725,7 @@ static void create_video_things(struct chain *p)
      p->stream_info.priv = p;
      p->stream_info.get_display_fps = get_display_fps;
      p->stream_info.get_display_res = get_display_res;
@@ -11,7 +56,7 @@ index 892d38e9a..22c3a4ac0 100644
      p->f->stream_info = &p->stream_info;
  
 diff --git a/filters/filter.h b/filters/filter.h
-index 5bf1e48a8..7ca8b6675 100644
+index 5bf1e48a84..7ca8b6675f 100644
 --- a/filters/filter.h
 +++ b/filters/filter.h
 @@ -402,6 +402,7 @@ struct mp_stream_info {
@@ -23,7 +68,7 @@ index 5bf1e48a8..7ca8b6675 100644
      struct mp_hwdec_devices *hwdec_devs;
      struct osd_state *osd;
 diff --git a/filters/user_filters.c b/filters/user_filters.c
-index ea7b69c99..aae6d17b0 100644
+index ea7b69c990..aae6d17b0b 100644
 --- a/filters/user_filters.c
 +++ b/filters/user_filters.c
 @@ -107,6 +107,13 @@ const struct mp_user_filter_entry *vf_list[] = {
@@ -41,7 +86,7 @@ index ea7b69c99..aae6d17b0 100644
  
  static bool get_vf_desc(struct m_obj_desc *dst, int index)
 diff --git a/filters/user_filters.h b/filters/user_filters.h
-index f2c31ef66..5c61c138b 100644
+index f2c31ef66b..5c61c138bf 100644
 --- a/filters/user_filters.h
 +++ b/filters/user_filters.h
 @@ -29,6 +29,13 @@ extern const struct mp_user_filter_entry af_lavcac3enc;
@@ -59,10 +104,10 @@ index f2c31ef66..5c61c138b 100644
  extern const struct mp_user_filter_entry vf_sub;
  extern const struct mp_user_filter_entry vf_vapoursynth;
 diff --git a/meson.build b/meson.build
-index 45742345a..c5b53fc00 100644
+index 2567e069d6..a635682531 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -418,6 +418,42 @@ if get_option('fuzzers')
+@@ -418,6 +418,43 @@ if get_option('fuzzers')
      link_flags += ['-fsanitize=address,undefined,fuzzer', '-fno-omit-frame-pointer']
  endif
  
@@ -82,6 +127,7 @@ index 45742345a..c5b53fc00 100644
 +    dependencies += [cuda_lib, nvrtc_lib]
 +    sources += files(
 +        'video/filter/yuv_to_rgba.c',
++        'video/filter/dovi_to_rgb.c',
 +        'video/filter/vsr_proc.c',
 +        'video/filter/vfx_loader.c',
 +        'video/filter/vf_hwup.c',
@@ -106,7 +152,7 @@ index 45742345a..c5b53fc00 100644
  add_project_arguments(flags_c, language: ['c', 'objc'])
  add_project_link_arguments(link_flags, language: ['c', 'cpp', 'objc'])
 diff --git a/meson.options b/meson.options
-index 32110828f..54c6701f7 100644
+index 32110828fe..54c6701f7c 100644
 --- a/meson.options
 +++ b/meson.options
 @@ -128,3 +128,6 @@ option('win32-subsystem', type : 'string', value: 'windows', description : 'Wind
@@ -118,7 +164,7 @@ index 32110828f..54c6701f7 100644
 +       description: 'RPATH for the NVIDIA VFX runtime (empty = rely on system search path)')
 diff --git a/video/filter/cuda_shared.h b/video/filter/cuda_shared.h
 new file mode 100644
-index 000000000..501625793
+index 0000000000..5016257938
 --- /dev/null
 +++ b/video/filter/cuda_shared.h
 @@ -0,0 +1,192 @@
@@ -316,10 +362,10 @@ index 000000000..501625793
 +}
 diff --git a/video/filter/dlssnr_proc.c b/video/filter/dlssnr_proc.c
 new file mode 100644
-index 000000000..1581ae523
+index 0000000000..969341667e
 --- /dev/null
 +++ b/video/filter/dlssnr_proc.c
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,611 @@
 +// dlssnr_proc.c — NVRTC kernels for vf_dlssnr. See dlssnr_proc.h.
 +
 +#include "dlssnr_proc.h"
@@ -362,12 +408,12 @@ index 000000000..1581ae523
 +"    // pq_eotf1: 1.0 == 10000 nits. HLG 1.0 is 1000 nits, so the whole curve\n"
 +"    // is divided by ten -- without that, `white` (203 nits) and `guard`\n"
 +"    // would mean something different on HLG than on PQ.\n"
-+"    return 0.01f * powf(fmaxf(s, 0.0f), 1.2f);\n"
++"    return 0.1f * powf(fmaxf(s, 0.0f), 1.2f);\n"
 +"}\n"
 +"__device__ __forceinline__ float hlg_oetf1(float l)\n"
 +"{\n"
 +"    const float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;\n"
-+"    float s = powf(fmaxf(l / 0.01f, 0.0f), 1.0f / 1.2f);\n"
++"    float s = powf(fmaxf(l / 0.1f, 0.0f), 1.0f / 1.2f);\n"
 +"    return (s <= 1.0f / 12.0f) ? (sqrtf(3.0f * s)) : (a * logf(12.0f * s - b) + c);\n"
 +"}\n"
 +"__device__ __forceinline__ float srgb_enc1(float v);\n"
@@ -797,6 +843,22 @@ index 000000000..1581ae523
 +    // Horizontal: src (sw x sh) → scratch (dw x sh), then vertical:
 +    // scratch → dst (dw x dh). Two passes, so the filter is separable and the
 +    // cost stays linear in taps instead of quadratic.
++    if (sw == dw && sh == dh) {
++        // Same size: copy. Mitchell (the default) is not interpolating -- at
++        // ratio 1 its taps are 1/18, 16/18, 1/18 -- so filtering here would
++        // soften the anchor, i.e. the whole picture, on every frame whose
++        // source already is the target size.
++        CUDA_MEMCPY2D cp = {0};
++        cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
++        cp.srcDevice = src;
++        cp.srcPitch = (size_t)sw * 16;
++        cp.dstMemoryType = CU_MEMORYTYPE_DEVICE;
++        cp.dstDevice = dst;
++        cp.dstPitch = (size_t)dw * 16;
++        cp.WidthInBytes = (size_t)dw * 16;
++        cp.Height = (size_t)dh;
++        return cuMemcpy2DAsync(&cp, stream) == CUDA_SUCCESS;
++    }
 +    float rx = (float)sw / (float)dw;
 +    int mode = c->filter;
 +    size_t need = (size_t)dw * sh * 16;
@@ -917,7 +979,7 @@ index 000000000..1581ae523
 +}
 diff --git a/video/filter/dlssnr_proc.h b/video/filter/dlssnr_proc.h
 new file mode 100644
-index 000000000..a78ccc0ea
+index 0000000000..a78ccc0ea4
 --- /dev/null
 +++ b/video/filter/dlssnr_proc.h
 @@ -0,0 +1,133 @@
@@ -1054,12 +1116,608 @@ index 000000000..a78ccc0ea
 +// Allocate every stage buffer for one frame geometry. Idempotent; grows only.
 +bool dlssnr_proc_reserve(struct dlssnr_proc *c, int src_w, int src_h,
 +                         int dst_w, int dst_h, int work_w, int work_h);
+diff --git a/video/filter/dovi_to_rgb.c b/video/filter/dovi_to_rgb.c
+new file mode 100644
+index 0000000000..207024820f
+--- /dev/null
++++ b/video/filter/dovi_to_rgb.c
+@@ -0,0 +1,531 @@
++// video/filter/dovi_to_rgb.c — Dolby Vision (P5 / P7 MEL+FEL / P8) → chunky
++// RGB on CUDA. See dovi_to_rgb.h for what it computes and why.
++
++#include "dovi_to_rgb.h"
++
++#include <cuda.h>
++#include <nvrtc.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <libavutil/buffer.h>
++#include <libavutil/hwcontext.h>
++#include <libplacebo/colorspace.h>
++#include <libplacebo/config.h>
++
++#include "common/common.h"
++#include "common/msg.h"
++#include "video/img_format.h"
++#include "yuv_to_rgba.h"
++
++// pivots and NLQ fields changed units in PL_API_VER 387; this file is written
++// against the new ones (pivots = code / 2^BL_depth, NLQ offset in EL codes).
++_Static_assert(PL_API_VER >= 387, "dovi_to_rgb needs libplacebo >= 7.387");
++
++// ── Parameter block ────────────────────────────────────────────────────
++// One float array, uploaded per frame. The indices are handed to the kernel
++// as #defines so the two sides cannot drift apart.
++enum {
++    DV_LO      = 0,                 // [3]       lower pivot of each component
++    DV_HI      = DV_LO + 3,         // [3]       upper pivot
++    DV_NPIV    = DV_HI + 3,         // [3]       pivot count (0 = no reshape)
++    DV_PIV     = DV_NPIV + 3,       // [3][7]    inner pivots, 1e9 padded
++    DV_COEF    = DV_PIV + 3 * 7,    // [3][8][4] poly c0,c1,c2,0 | mmr const,-,-,order
++    DV_MMR     = DV_COEF + 3 * 8 * 4, // [3][8][3][7]
++    DV_NLQ     = DV_MMR + 3 * 8 * 3 * 7, // [3][4] offset, slope, threshold, max
++    DV_NLQ_ON  = DV_NLQ + 3 * 4,    // [1]       0 = no enhancement layer
++    DV_OFF     = DV_NLQ_ON + 1,     // [3]       nonlinear_offset
++    DV_NONLIN  = DV_OFF + 3,        // [9]       "ycc_to_rgb", row major
++    DV_LMS2RGB = DV_NONLIN + 9,     // [9]       LMS->BT.2020 x "rgb_to_lms"
++    DV_BL_C    = DV_LMS2RGB + 9,    // [2]       BL chroma siting offset x, y
++    DV_EL_Y    = DV_BL_C + 2,       // [4]       EL luma   shift x, y, ratio x, y
++    DV_EL_C    = DV_EL_Y + 4,       // [4]       EL chroma shift x, y, ratio x, y
++    DV_EL_MUL  = DV_EL_C + 4,       // [1]       EL sample -> integer code
++    DV_COUNT   = DV_EL_MUL + 1,
++};
++
++static const char *kDoviKernelSrc =
++"__device__ __forceinline__ float dv_tap(const unsigned char *pl, int pitch,\n"
++"                                        int w, int h, int bytes, int step,\n"
++"                                        int off, int ix, int iy)\n"
++"{\n"
++"    ix = ix < 0 ? 0 : (ix > w - 1 ? w - 1 : ix);\n"
++"    iy = iy < 0 ? 0 : (iy > h - 1 ? h - 1 : iy);\n"
++"    const unsigned char *row = pl + (size_t)iy * (size_t)pitch;\n"
++"    if (bytes == 1)\n"
++"        return (float)row[ix * step + off];\n"
++"    return (float)((const unsigned short *)row)[ix * step + off];\n"
++"}\n"
++"\n"
++"// Bilinear tap at the continuous texel index (fx, fy), edges clamped.\n"
++"__device__ __forceinline__ float dv_bilin(const unsigned char *pl, int pitch,\n"
++"                                          int w, int h, int bytes, int step,\n"
++"                                          int off, float fx, float fy)\n"
++"{\n"
++"    float x0 = floorf(fx), y0 = floorf(fy);\n"
++"    float ax = fx - x0, ay = fy - y0;\n"
++"    int ix = (int)x0, iy = (int)y0;\n"
++"    float a = dv_tap(pl, pitch, w, h, bytes, step, off, ix,     iy);\n"
++"    float b = dv_tap(pl, pitch, w, h, bytes, step, off, ix + 1, iy);\n"
++"    float c = dv_tap(pl, pitch, w, h, bytes, step, off, ix,     iy + 1);\n"
++"    float d = dv_tap(pl, pitch, w, h, bytes, step, off, ix + 1, iy + 1);\n"
++"    float t = a + (b - a) * ax;\n"
++"    float u = c + (d - c) * ax;\n"
++"    return t + (u - t) * ay;\n"
++"}\n"
++"\n"
++"__device__ __forceinline__ float dv_clamp(float v, float lo, float hi)\n"
++"{\n"
++"    return fminf(fmaxf(v, lo), hi);\n"
++"}\n"
++"\n"
++"// SMPTE ST 2084, 1.0 == 10000 nits on both sides.\n"
++"__device__ __forceinline__ float dv_pq_eotf(float e)\n"
++"{\n"
++"    const float m1 = 0.1593017578125f, m2 = 78.84375f;\n"
++"    const float c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;\n"
++"    float p = powf(dv_clamp(e, 0.0f, 1.0f), 1.0f / m2);\n"
++"    return powf(fmaxf(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1);\n"
++"}\n"
++"__device__ __forceinline__ float dv_pq_oetf(float l)\n"
++"{\n"
++"    const float m1 = 0.1593017578125f, m2 = 78.84375f;\n"
++"    const float c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;\n"
++"    float p = powf(fmaxf(l, 0.0f), m1);\n"
++"    return powf((c1 + c2 * p) / (1.0f + c3 * p), m2);\n"
++"}\n"
++"\n"
++"extern \"C\" __global__ void dovi_to_rgb_kernel(\n"
++"    const unsigned char* __restrict__ bl_y,  int bl_y_pitch,\n"
++"    const unsigned char* __restrict__ bl_uv, int bl_uv_pitch,\n"
++"    const unsigned char* __restrict__ el_y,  int el_y_pitch,\n"
++"    const unsigned char* __restrict__ el_uv, int el_uv_pitch,\n"
++"    int el_w, int el_h, int el_bytes,\n"
++"    const float* __restrict__ P,\n"
++"    unsigned char* __restrict__ rgba_output, int rgba_pitch,\n"
++"    int width, int height)\n"
++"{\n"
++"    int x = blockIdx.x * blockDim.x + threadIdx.x;\n"
++"    int y = blockIdx.y * blockDim.y + threadIdx.y;\n"
++"    if (x >= width || y >= height) return;\n"
++"\n"
++"    // The reshaping maps the sample code divided by 2^BL_bit_depth. NV12 is\n"
++"    // 8 in 8; P010/P016 are MSB-aligned in 16, so code / 2^depth is the raw\n"
++"    // word / 65536 whatever the depth.\n"
++"    const int   bl_bytes = (BIT_DEPTH <= 8) ? 1 : 2;\n"
++"    const float bl_norm  = (BIT_DEPTH <= 8) ? (1.0f / 256.0f) : (1.0f / 65536.0f);\n"
++"    const int   cw = (width + 1) / 2, ch = (height + 1) / 2;\n"
++"    const float px = (float)x + 0.5f, py = (float)y + 0.5f;\n"
++"\n"
++"    float col[3], sig[3];\n"
++"    col[0] = dv_tap(bl_y, bl_y_pitch, width, height, bl_bytes, 1, 0, x, y) * bl_norm;\n"
++"    {\n"
++"        float fx = (px - P[DV_BL_C + 0]) * 0.5f - 0.5f;\n"
++"        float fy = (py - P[DV_BL_C + 1]) * 0.5f - 0.5f;\n"
++"        col[1] = dv_bilin(bl_uv, bl_uv_pitch, cw, ch, bl_bytes, 2, 0, fx, fy) * bl_norm;\n"
++"        col[2] = dv_bilin(bl_uv, bl_uv_pitch, cw, ch, bl_bytes, 2, 1, fx, fy) * bl_norm;\n"
++"    }\n"
++"\n"
++"    // ── reshape ─────────────────────────────────────────────────────────\n"
++"    // Every component is clamped to its own pivot range first, also where\n"
++"    // the MMR of another component reads it. `sig` stays the input triple.\n"
++"    for (int c = 0; c < 3; c++)\n"
++"        sig[c] = dv_clamp(col[c], P[DV_LO + c], P[DV_HI + c]);\n"
++"    const float sx0 = sig[0] * sig[1], sx1 = sig[0] * sig[2];\n"
++"    const float sx2 = sig[1] * sig[2], sx3 = sx0 * sig[2];\n"
++"\n"
++"    for (int c = 0; c < 3; c++) {\n"
++"        int np = (int)P[DV_NPIV + c];\n"
++"        if (np < 2)\n"
++"            continue;\n"
++"        float s = sig[c];\n"
++"        int seg = 0;\n"
++"        for (int i = 0; i < np - 2; i++)\n"
++"            if (s >= P[DV_PIV + c * 7 + i]) seg = i + 1;\n"
++"        const float *co = P + DV_COEF + (c * 8 + seg) * 4;\n"
++"        int order = (int)co[3];\n"
++"        if (order == 0) {\n"
++"            s = (co[2] * s + co[1]) * s + co[0];\n"
++"        } else {\n"
++"            const float *m = P + DV_MMR + (c * 8 + seg) * 21;\n"
++"            float a0 = sig[0], a1 = sig[1], a2 = sig[2];\n"
++"            float b0 = sx0, b1 = sx1, b2 = sx2, b3 = sx3;\n"
++"            s = co[0];\n"
++"            for (int j = 0; j < order; j++) {\n"
++"                const float *w = m + j * 7;\n"
++"                s += w[0] * a0 + w[1] * a1 + w[2] * a2\n"
++"                   + w[3] * b0 + w[4] * b1 + w[5] * b2 + w[6] * b3;\n"
++"                a0 *= sig[0]; a1 *= sig[1]; a2 *= sig[2];\n"
++"                b0 *= sx0; b1 *= sx1; b2 *= sx2; b3 *= sx3;\n"
++"            }\n"
++"        }\n"
++"        col[c] = dv_clamp(s, 0.0f, 1.0f);\n"
++"    }\n"
++"\n"
++"    // ── FEL composition (NLQ, LINEAR_DZ) ────────────────────────────────\n"
++"    // The EL is resampled onto the BL grid and rounded back to integer\n"
++"    // codes: rr = 0 gives no residual, otherwise\n"
++"    //   residual = sign(rr) * ((|rr| - 0.5) * slope + threshold)\n"
++"    // bounded by hdr_in_max.\n"
++"    if (P[DV_NLQ_ON] != 0.0f) {\n"
++"        const int ecw = (el_w + 1) / 2, ech = (el_h + 1) / 2;\n"
++"        float e[3];\n"
++"        {\n"
++"            float fx = (px - P[DV_EL_Y + 0]) * P[DV_EL_Y + 2] - 0.5f;\n"
++"            float fy = (py - P[DV_EL_Y + 1]) * P[DV_EL_Y + 3] - 0.5f;\n"
++"            e[0] = dv_bilin(el_y, el_y_pitch, el_w, el_h, el_bytes, 1, 0, fx, fy);\n"
++"        }\n"
++"        {\n"
++"            float fx = (px - P[DV_EL_C + 0]) * P[DV_EL_C + 2] - 0.5f;\n"
++"            float fy = (py - P[DV_EL_C + 1]) * P[DV_EL_C + 3] - 0.5f;\n"
++"            e[1] = dv_bilin(el_uv, el_uv_pitch, ecw, ech, el_bytes, 2, 0, fx, fy);\n"
++"            e[2] = dv_bilin(el_uv, el_uv_pitch, ecw, ech, el_bytes, 2, 1, fx, fy);\n"
++"        }\n"
++"        for (int c = 0; c < 3; c++) {\n"
++"            const float *q = P + DV_NLQ + c * 4;\n"
++"            // GLSL round() leaves x.5 to the implementation; ties-to-even\n"
++"            // is what the reference renderer was checked against.\n"
++"            float rr = rintf(e[c] * P[DV_EL_MUL] - q[0]);\n"
++"            float res = 0.0f;\n"
++"            if (rr != 0.0f) {\n"
++"                res = (fabsf(rr) - 0.5f) * q[1] + q[2];\n"
++"                if (rr < 0.0f) res = -res;\n"
++"                res = dv_clamp(res, -q[3], q[3]);\n"
++"            }\n"
++"            col[c] = dv_clamp(col[c] + res, 0.0f, 1.0f);\n"
++"        }\n"
++"    }\n"
++"\n"
++"    // ── composed signal -> PQ LMS -> linear LMS -> BT.2020 -> PQ ────────\n"
++"    float v0 = col[0] - P[DV_OFF + 0];\n"
++"    float v1 = col[1] - P[DV_OFF + 1];\n"
++"    float v2 = col[2] - P[DV_OFF + 2];\n"
++"    const float *N = P + DV_NONLIN;\n"
++"    float l = dv_pq_eotf(N[0] * v0 + N[1] * v1 + N[2] * v2);\n"
++"    float m = dv_pq_eotf(N[3] * v0 + N[4] * v1 + N[5] * v2);\n"
++"    float s = dv_pq_eotf(N[6] * v0 + N[7] * v1 + N[8] * v2);\n"
++"    const float *L = P + DV_LMS2RGB;\n"
++"    float r = __saturatef(dv_pq_oetf(L[0] * l + L[1] * m + L[2] * s));\n"
++"    float g = __saturatef(dv_pq_oetf(L[3] * l + L[4] * m + L[5] * s));\n"
++"    float b = __saturatef(dv_pq_oetf(L[6] * l + L[7] * m + L[8] * s));\n"
++"\n"
++"    int out_idx = y * rgba_pitch + x * 4;\n"
++"#if OUT_BITS == 10\n"
++"    // packed RGB10A2, R in the low bits (see VFX_BITS_10 in yuv_to_rgba.h)\n"
++"    unsigned int r10 = (unsigned int)(r * 1023.0f + 0.5f);\n"
++"    unsigned int g10 = (unsigned int)(g * 1023.0f + 0.5f);\n"
++"    unsigned int b10 = (unsigned int)(b * 1023.0f + 0.5f);\n"
++"    *(unsigned int *)(rgba_output + out_idx) =\n"
++"        r10 | (g10 << 10) | (b10 << 20) | (3u << 30);\n"
++"#else\n"
++"    rgba_output[out_idx + 0] = (unsigned char)(r * 255.0f + 0.5f);\n"
++"    rgba_output[out_idx + 1] = (unsigned char)(g * 255.0f + 0.5f);\n"
++"    rgba_output[out_idx + 2] = (unsigned char)(b * 255.0f + 0.5f);\n"
++"    rgba_output[out_idx + 3] = 255;\n"
++"#endif\n"
++"}\n";
++
++// ── Init ───────────────────────────────────────────────────────────────
++
++static bool dovi_init(struct dovi_to_rgb *c, int bit_depth, int out_bits)
++{
++    char defs[512];
++    snprintf(defs, sizeof(defs),
++             "#define BIT_DEPTH %d\n#define OUT_BITS %d\n"
++             "#define DV_LO %d\n#define DV_HI %d\n#define DV_NPIV %d\n"
++             "#define DV_PIV %d\n#define DV_COEF %d\n#define DV_MMR %d\n"
++             "#define DV_NLQ %d\n#define DV_NLQ_ON %d\n#define DV_OFF %d\n"
++             "#define DV_NONLIN %d\n#define DV_LMS2RGB %d\n#define DV_BL_C %d\n"
++             "#define DV_EL_Y %d\n#define DV_EL_C %d\n#define DV_EL_MUL %d\n",
++             bit_depth, out_bits == VFX_BITS_10 ? 10 : 8,
++             DV_LO, DV_HI, DV_NPIV, DV_PIV, DV_COEF, DV_MMR, DV_NLQ, DV_NLQ_ON,
++             DV_OFF, DV_NONLIN, DV_LMS2RGB, DV_BL_C, DV_EL_Y, DV_EL_C,
++             DV_EL_MUL);
++
++    size_t len = strlen(defs) + strlen(kDoviKernelSrc) + 1;
++    char *src = malloc(len);
++    if (!src)
++        return false;
++    snprintf(src, len, "%s%s", defs, kDoviKernelSrc);
++
++    nvrtcProgram prog;
++    nvrtcResult res = nvrtcCreateProgram(&prog, src, "dovi_to_rgb_kernel",
++                                         0, NULL, NULL);
++    free(src);
++    if (res != NVRTC_SUCCESS) {
++        fprintf(stderr, "dovi_to_rgb: nvrtcCreateProgram failed: %s\n",
++                nvrtcGetErrorString(res));
++        return false;
++    }
++
++    int major = 0, minor = 0;
++    CUdevice dev;
++    cuCtxGetDevice(&dev);
++    cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
++    cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
++    char arch[32];
++    snprintf(arch, sizeof(arch), "--gpu-architecture=compute_%d%d", major, minor);
++
++    // No --use_fast_math here: the PQ round trip and the pivot comparisons
++    // are meant to match libplacebo's result, not approximate it.
++    const char *opts[] = {arch};
++    res = nvrtcCompileProgram(prog, 1, opts);
++    if (res != NVRTC_SUCCESS) {
++        size_t log_size = 0;
++        nvrtcGetProgramLogSize(prog, &log_size);
++        char *log = calloc(1, log_size + 1);
++        if (log)
++            nvrtcGetProgramLog(prog, log);
++        fprintf(stderr, "dovi_to_rgb: NVRTC compile failed:\n%s\n", log ? log : "");
++        free(log);
++        nvrtcDestroyProgram(&prog);
++        return false;
++    }
++
++    size_t ptx_size = 0;
++    nvrtcGetPTXSize(prog, &ptx_size);
++    char *ptx = malloc(ptx_size ? ptx_size : 1);
++    if (!ptx) {
++        nvrtcDestroyProgram(&prog);
++        return false;
++    }
++    nvrtcGetPTX(prog, ptx);
++    nvrtcDestroyProgram(&prog);
++
++    CUresult cr = cuModuleLoadData(&c->module, ptx);
++    free(ptx);
++    if (cr != CUDA_SUCCESS) {
++        fprintf(stderr, "dovi_to_rgb: cuModuleLoadData failed (%d)\n", cr);
++        c->module = NULL;
++        return false;
++    }
++    cr = cuModuleGetFunction(&c->kernel, c->module, "dovi_to_rgb_kernel");
++    if (cr == CUDA_SUCCESS)
++        cr = cuMemAlloc(&c->params, DV_COUNT * sizeof(float));
++    if (cr != CUDA_SUCCESS) {
++        fprintf(stderr, "dovi_to_rgb: kernel setup failed (%d)\n", cr);
++        cuModuleUnload(c->module);
++        c->module = NULL;
++        c->kernel = NULL;
++        c->params = 0;
++        return false;
++    }
++
++    fprintf(stderr, "dovi_to_rgb: kernel compiled (sm_%d%d, bd=%d, out=%d-bit)\n",
++            major, minor, bit_depth, out_bits == VFX_BITS_10 ? 10 : 8);
++    c->bit_depth = bit_depth;
++    c->out_bits = out_bits;
++    c->ready = true;
++    return true;
++}
++
++// ── Per-frame parameters ───────────────────────────────────────────────
++
++// Same rounding libplacebo applies to the EL:BL size ratio (renderer.c,
++// sample_el): 1/2 for the usual 1080p EL under a 2160p BL, 1 when equal.
++static float snap_ratio(float r)
++{
++    return r >= 1 ? roundf(r) : 1.0f / roundf(1.0f / r);
++}
++
++static void pack_reshape(float *P, const struct pl_dovi_metadata *d)
++{
++    for (int c = 0; c < 3; c++) {
++        const struct pl_reshape_data *comp = &d->comp[c];
++        int np = comp->num_pivots;
++        P[DV_LO + c] = 0.0f;
++        P[DV_HI + c] = 1.0f;
++        P[DV_NPIV + c] = 0.0f;
++        for (int i = 0; i < 7; i++)
++            P[DV_PIV + c * 7 + i] = 1e9f;
++        if (np < 2 || np > 9)
++            continue;
++
++        P[DV_LO + c] = comp->pivots[0];
++        P[DV_HI + c] = comp->pivots[np - 1];
++        P[DV_NPIV + c] = (float)np;
++        for (int i = 0; i < np - 2; i++)
++            P[DV_PIV + c * 7 + i] = comp->pivots[i + 1];
++
++        for (int i = 0; i < np - 1; i++) {
++            float *co = &P[DV_COEF + (c * 8 + i) * 4];
++            if (comp->method[i] == 0) {
++                co[0] = comp->poly_coeffs[i][0];
++                co[1] = comp->poly_coeffs[i][1];
++                co[2] = comp->poly_coeffs[i][2];
++                co[3] = 0.0f;
++            } else {
++                int order = MPCLAMP(comp->mmr_order[i], 1, 3);
++                co[0] = comp->mmr_constant[i];
++                co[3] = (float)order;
++                float *m = &P[DV_MMR + (c * 8 + i) * 21];
++                for (int j = 0; j < order; j++)
++                    for (int k = 0; k < 7; k++)
++                        m[j * 7 + k] = comp->mmr_coeffs[i][j][k];
++            }
++        }
++    }
++}
++
++// Whether the EL frame can be read by the kernel next to the BL.
++static const char *el_unusable(const struct mp_image *bl,
++                               const struct mp_image *el)
++{
++    if (el->imgfmt != IMGFMT_CUDA)
++        return "it was not decoded on the GPU";
++    if (!vfx_imgfmt_is_nv420(el->params.hw_subfmt))
++        return "its pixel layout is not NV12/P010";
++    if (!bl->hwctx || !el->hwctx)
++        return "it has no hardware frame context";
++    AVHWFramesContext *a = (void *)bl->hwctx->data;
++    AVHWFramesContext *b = (void *)el->hwctx->data;
++    if (a->device_ctx != b->device_ctx)
++        return "it lives in a different CUDA context than the base layer";
++    return NULL;
++}
++
++bool dovi_to_rgb_convert(struct dovi_to_rgb *c, struct mp_log *log,
++                         struct mp_image *mpi, int width, int height,
++                         void *rgba_output, int rgba_pitch, int out_bits,
++                         CUstream stream)
++{
++    if (!dovi_frame_needs_decode(mpi) ||
++        !vfx_imgfmt_is_nv420(mpi->params.hw_subfmt))
++        return false;
++
++    struct mp_regular_imgfmt reg;
++    mp_get_regular_imgfmt(&reg, mpi->params.hw_subfmt);
++    int bit_depth = reg.component_size * 8;
++
++    if (c->ready && (c->bit_depth != bit_depth || c->out_bits != out_bits))
++        dovi_to_rgb_destroy(c);
++    if (!c->ready && !dovi_init(c, bit_depth, out_bits))
++        return false;
++
++    const struct pl_dovi_metadata *d = (void *)mpi->dovi->data;
++    float P[DV_COUNT] = {0};
++    pack_reshape(P, d);
++
++    for (int i = 0; i < 3; i++)
++        P[DV_OFF + i] = d->nonlinear_offset[i];
++    // Dolby Vision always produces BT.2020-referred HPE LMS; this is the
++    // matching LMS->RGB matrix, the same constant libplacebo uses.
++    static const float lms2rgb[3][3] = {
++        { 3.064396767855625f,   -2.165961226711146f,    0.1015574148869036f},
++        {-0.65613130540261551f,  1.7855694129834121f,  -0.12943951030147041f},
++        { 0.017360633500538487f, -0.047244531564539943f, 1.0298894699757705f},
++    };
++    for (int i = 0; i < 3; i++) {
++        for (int j = 0; j < 3; j++) {
++            P[DV_NONLIN + i * 3 + j] = d->nonlinear.m[i][j];
++            float acc = 0;
++            for (int k = 0; k < 3; k++)
++                acc += lms2rgb[i][k] * d->linear.m[k][j];
++            P[DV_LMS2RGB + i * 3 + j] = acc;
++        }
++    }
++
++    pl_chroma_location_offset(mpi->params.chroma_location,
++                              &P[DV_BL_C + 0], &P[DV_BL_C + 1]);
++
++    // ── enhancement layer ───────────────────────────────────────────────
++    void *el_y = NULL, *el_uv = NULL;
++    int el_y_pitch = 0, el_uv_pitch = 0, el_w = 0, el_h = 0, el_bytes = 1;
++    struct mp_image *el = mpi->enhancement_layer;
++    if (el && d->nlq_active) {
++        const char *why = el_unusable(mpi, el);
++        if (why) {
++            if (!c->el_warned) {
++                mp_warn(log, "Dolby Vision enhancement layer ignored (%s); "
++                        "decoding the base layer only.\n", why);
++                c->el_warned = true;
++            }
++        } else {
++            struct mp_regular_imgfmt ereg;
++            mp_get_regular_imgfmt(&ereg, el->params.hw_subfmt);
++            el_y = el->planes[0];
++            el_uv = el->planes[1];
++            el_y_pitch = el->stride[0];
++            el_uv_pitch = el->stride[1];
++            el_w = el->w;
++            el_h = el->h;
++            el_bytes = ereg.component_size;
++
++            // EL luma grid relative to the BL grid: co-sited horizontally,
++            // centred vertically ("left"), when the EL is the smaller one.
++            float lx = 0, ly = 0, layer_x = 0, layer_y = 0;
++            pl_chroma_location_offset(PL_CHROMA_LEFT, &lx, &ly);
++            if (el_w < width)
++                layer_x = lx;
++            if (el_h < height)
++                layer_y = ly;
++            float rlx = snap_ratio((float)el_w / width);
++            float rly = snap_ratio((float)el_h / height);
++            float cx = 0, cy = 0;
++            pl_chroma_location_offset(el->params.chroma_location, &cx, &cy);
++
++            P[DV_EL_Y + 0] = layer_x;
++            P[DV_EL_Y + 1] = layer_y;
++            P[DV_EL_Y + 2] = rlx;
++            P[DV_EL_Y + 3] = rly;
++            P[DV_EL_C + 0] = layer_x + cx / rlx;
++            P[DV_EL_C + 1] = layer_y + cy / rly;
++            P[DV_EL_C + 2] = rlx * 0.5f;
++            P[DV_EL_C + 3] = rly * 0.5f;
++            // MSB-aligned words (P010) back to the integer codes they hold.
++            P[DV_EL_MUL] = 1.0f / (float)(1 << MPMAX(ereg.component_pad, 0));
++            for (int i = 0; i < 3; i++) {
++                P[DV_NLQ + i * 4 + 0] = d->nlq[i].offset;
++                P[DV_NLQ + i * 4 + 1] = d->nlq[i].deadzone_slope;
++                P[DV_NLQ + i * 4 + 2] = d->nlq[i].deadzone_threshold;
++                P[DV_NLQ + i * 4 + 3] = d->nlq[i].hdr_in_max;
++            }
++            P[DV_NLQ_ON] = 1.0f;
++        }
++    }
++
++    // The previous frame's kernel may still be reading the block.
++    cuStreamSynchronize(stream);
++    CUresult res = cuMemcpyHtoD(c->params, P, sizeof(P));
++    if (res != CUDA_SUCCESS) {
++        fprintf(stderr, "dovi_to_rgb: parameter upload failed (%d)\n", res);
++        return false;
++    }
++
++    void *bl_y = mpi->planes[0], *bl_uv = mpi->planes[1];
++    int bl_y_pitch = mpi->stride[0], bl_uv_pitch = mpi->stride[1];
++    CUdeviceptr params = c->params;
++    void *args[] = {
++        &bl_y, &bl_y_pitch, &bl_uv, &bl_uv_pitch,
++        &el_y, &el_y_pitch, &el_uv, &el_uv_pitch,
++        &el_w, &el_h, &el_bytes,
++        &params,
++        &rgba_output, &rgba_pitch,
++        &width, &height,
++    };
++
++    int block_x = 16, block_y = 16;
++    int grid_x = (width  + block_x - 1) / block_x;
++    int grid_y = (height + block_y - 1) / block_y;
++    res = cuLaunchKernel(c->kernel, grid_x, grid_y, 1, block_x, block_y, 1,
++                         0, stream, args, NULL);
++    if (res != CUDA_SUCCESS) {
++        fprintf(stderr, "dovi_to_rgb: cuLaunchKernel failed (%d)\n", res);
++        return false;
++    }
++    return true;
++}
++
++void dovi_to_rgb_destroy(struct dovi_to_rgb *c)
++{
++    if (c->params)
++        cuMemFree(c->params);
++    if (c->module)
++        cuModuleUnload(c->module);
++    c->params = 0;
++    c->module = NULL;
++    c->kernel = NULL;
++    c->ready = false;
++}
+diff --git a/video/filter/dovi_to_rgb.h b/video/filter/dovi_to_rgb.h
+new file mode 100644
+index 0000000000..5999b2be9b
+--- /dev/null
++++ b/video/filter/dovi_to_rgb.h
+@@ -0,0 +1,53 @@
++// video/filter/dovi_to_rgb.h
++#pragma once
++
++#include <cuda.h>
++#include <stdbool.h>
++
++#include "video/mp_image.h"
++
++struct mp_log;
++
++// Dolby Vision decoder for the VFX filters.
++//
++// A Dolby Vision frame is not a YCbCr picture: the coded base layer only
++// becomes one after the RPU's reshaping curves, and for profile 5 it never
++// does (IPTPQc2). The filters work on RGB, so the frame is decoded here, once,
++// by whichever filter converts it first:
++//
++//   BL codes -> reshape (polynomial / MMR) -> [+ FEL residual] -> RPU
++//   "ycc_to_rgb" matrix -> PQ EOTF -> RPU "rgb_to_lms" + LMS->BT.2020 -> PQ
++//
++// which is libplacebo's pl_shader_decode_color for PL_COLOR_SYSTEM_DOLBYVISION,
++// step for step. The result is full-range BT.2020 PQ RGB for every profile
++// (5, 7 MEL/FEL, 8.x), which is what libplacebo's own mapping already tags the
++// frame as (mp_image.params.color), so that tag stays valid on the output.
++struct dovi_to_rgb {
++    CUmodule    module;
++    CUfunction  kernel;
++    CUdeviceptr params;     // device copy of the per-frame parameter block
++    int         bit_depth;  // cache key: BL sample storage bits (8/16)
++    int         out_bits;   // cache key: VFX_BITS_8 / VFX_BITS_10
++    bool        ready;
++    bool        el_warned;
++};
++
++// True when the frame has to go through dovi_to_rgb_convert() instead of a
++// YCbCr matrix.
++static inline bool dovi_frame_needs_decode(const struct mp_image *mpi)
++{
++    return mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && mpi->dovi;
++}
++
++// Decode `mpi` (CUDA, NV12/P010/P016 layout) into chunky RGB at
++// rgba_output. Uses mpi->enhancement_layer for FEL composition when it is a
++// CUDA frame of the same device; otherwise the base layer is decoded alone.
++// The caller must have the frame's CUDA context current. Kernel and parameter
++// buffer are created on first use.
++bool dovi_to_rgb_convert(struct dovi_to_rgb *c, struct mp_log *log,
++                         struct mp_image *mpi, int width, int height,
++                         void *rgba_output, int rgba_pitch, int out_bits,
++                         CUstream stream);
++
++// The caller must have the CUDA context current.
++void dovi_to_rgb_destroy(struct dovi_to_rgb *c);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 000000000..af5a404cd
+index 0000000000..0661c60be4
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1748 @@
+@@ -0,0 +1,1758 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -1109,27 +1767,17 @@ index 000000000..af5a404cd
 + * anywhere, and the output transfer is the input transfer.
 + *
 + * Dolby Vision:
-+ *   P7 / P8    the decoded base layer is PQ BT.2020 YCbCr. We decode it to RGB
-+ *              and run normally. The RPU reshape curves are not applied, and
-+ *              the DoVi tag is dropped -- the frame that leaves this filter is
-+ *              plain full-range PQ RGB, exactly as vsr and truehdr leave it.
-+ *              Consequence for P7 FEL: the enhancement layer can no longer be
-+ *              combined, because libplacebo's FEL merge expects a base layer
-+ *              still in the DoVi domain, at the EL's resolution. The output
-+ *              frame is therefore marked dovi-less and EL-less on purpose, so
-+ *              el_pair discards the EL instead of stamping a DoVi tag onto
-+ *              values that are no longer in that domain. Use `dovi=skip` for
-+ *              a file where FEL detail matters more than NR.
-+ *   P5         ICtCp (IPT), not YCbCr. There is no way to tell it apart from a
-+ *              frame's pl_dovi_metadata: P5's RPU carries a full set of
-+ *              matrices too, and libplacebo's mapping drops the two header
-+ *              fields (vdr_rpu_profile, bl_video_full_range_flag) that
-+ *              ffmpeg's own profile guess uses. So the decision is left to
-+ *              the player, which does know the profile (mpv exposes
-+ *              `current-tracks/video/dolby-vision-profile`); ai.conf keeps
-+ *              profile 5 out of the chain entirely (its `-p5` profiles set no
-+ *              vf at all, because ICtCp is not YCbCr at any stage). Getting it
-+ *              wrong is not silent: P5 run as PQ YCbCr looks obviously wrong.
++ *   Every profile (5, 7 MEL/FEL, 8.x) is decoded on the way in by
++ *   dovi_to_rgb.c: RPU reshape, FEL composition when the enhancement layer is
++ *   on the frame, then the RPU colour matrices -- libplacebo's own steps, on
++ *   CUDA. What enters the pipeline below is BT.2020 PQ RGB, which is also what
++ *   the frame was already tagged as, so the HDR metadata the RPU supplied
++ *   (mastering range, L1 scene brightness) stays valid on the output. The
++ *   output is marked no_dovi / no_enhancement_layer so that nothing applies
++ *   the RPU a second time.
++ *   The EL reaches this filter because f_output_chain.c pairs it ahead of
++ *   the VFX filters. `dovi=skip` remains as the off switch: it passes Dolby
++ *   Vision frames through untouched, to mpv's native path.
 + */
 +
 +#include "filters/filter.h"
@@ -1164,6 +1812,7 @@ index 000000000..af5a404cd
 +#include "cuda_shared.h"
 +#include "dlssnr_proc.h"
 +#include "yuv_to_rgba.h"
++#include "dovi_to_rgb.h"
 +
 +// ── Shared memory contract ────────────────────────────────────────────────
 +//
@@ -1275,8 +1924,8 @@ index 000000000..af5a404cd
 +};
 +
 +enum dlssnr_dovi {
-+    DOVI_RUN = 0,     // treat the base layer as PQ BT.2020 YCbCr (P7/P8)
-+    DOVI_SKIP,        // pass DoVi through untouched (P5, or to keep FEL)
++    DOVI_RUN = 0,     // decode Dolby Vision (any profile) and process it
++    DOVI_SKIP,        // pass DoVi through untouched, to the native path
 +};
 +
 +struct vf_dlssnr_opts {
@@ -1417,6 +2066,7 @@ index 000000000..af5a404cd
 +
 +    // packed YUV → RGB fallback (NR is first in the chain for DoVi streams)
 +    struct yuv_to_rgba yuv_conv;
++    struct dovi_to_rgb dovi_conv;
 +    bool      yuv_conv_ready;
 +    int       yuv_conv_bits;      // output depth the kernel was built for
 +    int       yuv_conv_in_bits;   // input depth (P010 vs P016 both look "10-bit")
@@ -1451,6 +2101,7 @@ index 000000000..af5a404cd
 +
 +    bool      dovi_warned;
 +    bool      fel_warned;
++    bool      layout_warned;
 +    bool      passthrough_warned_sw;
 +
 +    int64_t   frame_count, fail_count;
@@ -1838,6 +2489,7 @@ index 000000000..af5a404cd
 +            dlssnr_proc_uninit(&p->proc);
 +            p->proc_ready = false;
 +        }
++        dovi_to_rgb_destroy(&p->dovi_conv);
 +        if (p->yuv_conv_ready) {
 +            yuv_to_rgba_destroy(&p->yuv_conv);
 +            p->yuv_conv_ready = false;
@@ -1934,7 +2586,8 @@ index 000000000..af5a404cd
 +    av_buffer_unref(&mpi->film_grain);
 +    for (int n = 0; n < mpi->num_ff_side_data; n++)
 +        av_buffer_unref(&mpi->ff_side_data[n].buf);
-+    av_free(mpi->ff_side_data);
++    talloc_free(mpi->ff_side_data);
++    mp_image_unrefp(&mpi->enhancement_layer);
 +}
 +
 +// ── YUV → RGB (only when NR is first in the chain, e.g. the DoVi path) ────
@@ -2254,8 +2907,7 @@ index 000000000..af5a404cd
 +        return;
 +    }
 +
-+    // Profile 5 is IPT, not YCbCr. Pass it through untouched rather than
-+    // mis-decoding it; one warning, then silence.
++    // dovi=skip: leave Dolby Vision frames alone (one notice, then silence).
 +    if (mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
 +        p->opts->dovi == DOVI_SKIP) {
 +        if (!p->dovi_warned) {
@@ -2348,25 +3000,41 @@ index 000000000..af5a404cd
 +        in_bits = bd > 8 ? 10 : 8;
 +        enum yuv_matrix mx = matrix_from_repr(&mpi->params);
 +        enum yuv_range rn = range_from_levels(mpi->params.repr.levels);
-+        if (mpi->num_planes < 2 || !mpi->planes[0] || !mpi->planes[1]) {
-+            MP_ERR(f, "dlssnr: unexpected planar layout (fmt=%d)\n",
-+                   mpi->params.hw_subfmt);
++        if (!vfx_imgfmt_is_nv420(mpi->params.hw_subfmt) ||
++            mpi->num_planes < 2 || !mpi->planes[0] || !mpi->planes[1]) {
++            if (!p->layout_warned) {
++                MP_WARN(f, "dlssnr: only NV12/P010/P016 decoder output is "
++                           "supported (fmt=%s) -- passing frames through\n",
++                        mp_imgfmt_to_name(mpi->params.hw_subfmt));
++                p->layout_warned = true;
++            }
 +            cuCtxPopCurrent(NULL);
 +            mp_pin_in_write(f->ppins[1], frame);
 +            return;
 +        }
-+        if (!ensure_yuv_conv(f, p, bd, in_bits, mx, rn) ||
-+            !ensure_yuv_buf(f, p, src_w, src_h)) {
++        if (!ensure_yuv_buf(f, p, src_w, src_h)) {
 +            cuCtxPopCurrent(NULL);
 +            mp_pin_in_write(f->ppins[1], frame);
 +            return;
 +        }
-+        if (!yuv_to_rgba_convert(&p->yuv_conv,
-+                                 mpi->planes[0], mpi->stride[0],
-+                                 mpi->planes[1], mpi->stride[1],
-+                                 src_w, src_h,
-+                                 (void *)p->yuv_rgb, p->yuv_rgb_pitch,
-+                                 p->cuda_stream)) {
++        bool conv_ok;
++        if (dovi_frame_needs_decode(mpi)) {
++            // Decode Dolby Vision here (reshape, FEL, RPU matrices): the
++            // result is BT.2020 PQ RGB, which is what the frame is tagged as.
++            conv_ok = dovi_to_rgb_convert(&p->dovi_conv, f->log, mpi,
++                                          src_w, src_h, (void *)p->yuv_rgb,
++                                          p->yuv_rgb_pitch, in_bits,
++                                          p->cuda_stream);
++        } else {
++            conv_ok = ensure_yuv_conv(f, p, bd, in_bits, mx, rn) &&
++                      yuv_to_rgba_convert(&p->yuv_conv,
++                                          mpi->planes[0], mpi->stride[0],
++                                          mpi->planes[1], mpi->stride[1],
++                                          src_w, src_h,
++                                          (void *)p->yuv_rgb, p->yuv_rgb_pitch,
++                                          p->cuda_stream);
++        }
++        if (!conv_ok) {
 +            MP_ERR(f, "dlssnr: yuv->rgb failed\n");
 +            cuCtxPopCurrent(NULL);
 +            mp_pin_in_write(f->ppins[1], frame);
@@ -2407,9 +3075,8 @@ index 000000000..af5a404cd
 +    p->proc.filter     = p->opts->filter;
 +
 +    // ── CUDA stages ──────────────────────────────────────────────────────
-+    // Both resizes are unconditional: at ratio 1 the separable kernels
-+    // reproduce the source exactly (Catmull-Rom is interpolating), so the
-+    // 1:1 case needs no branch and no separate copy path.
++    // Both resizes are called unconditionally; dlssnr_proc_scale turns the
++    // 1:1 case into a plain copy (the default Mitchell kernel would blur it).
 +    bool ok = dlssnr_proc_lin(&p->proc, p->cuda_stream, src_ptr, src_pitch,
 +                              src_w, src_h);
 +    if (ok)
@@ -2567,23 +3234,17 @@ index 000000000..af5a404cd
 +    out->params.repr.alpha = PL_ALPHA_NONE;
 +    out->params.repr.dovi = NULL;
 +    memset(&out->params.repr.bits, 0, sizeof(out->params.repr.bits));
-+    if (was_dovi) {
-+        // P7 FEL: el_pair runs *after* the user chain (it is a post filter),
-+        // so without these two flags it would attach the enhancement layer to
-+        // this frame and stamp a DoVi tag back on -- onto RGB values that were
-+        // resampled to panel size and are no longer in the reshape domain.
-+        // libplacebo would then apply the RPU to them. Mark the frame BL-only
-+        // instead: el_pair drops the EL (no_enhancement_layer) and leaves the
-+        // tags alone (no_dovi). FEL detail is the price of NR + rescaling.
-+        out->params.no_dovi = true;
-+        out->params.no_enhancement_layer = true;
-+        if (!p->fel_warned) {
-+            MP_INFO(f, "dlssnr: Dolby Vision base layer only -- NR rescales "
-+                       "the frame out of the DoVi domain, so the FEL "
-+                       "enhancement layer cannot be combined. Use dovi=skip "
-+                       "to keep FEL and give up NR.");
-+            p->fel_warned = true;
-+        }
++    // This frame is finished RGB: any Dolby Vision was decoded above (reshape,
++    // FEL, RPU matrices). Nothing downstream may attach an RPU or an
++    // enhancement layer to it again. Unconditional, because the flags of an
++    // upstream filter do not survive this rebuild, and because a source whose
++    // RPU rides on the EL track reaches a late el_pair untagged.
++    out->params.no_dovi = true;
++    out->params.no_enhancement_layer = true;
++    if (was_dovi && !p->fel_warned) {
++        MP_INFO(f, "dlssnr: Dolby Vision decoded to BT.2020 PQ RGB%s\n",
++                mpi->enhancement_layer ? " (with enhancement layer)" : "");
++        p->fel_warned = true;
 +    }
 +    out->params.p_w = mpi->params.p_w;
 +    out->params.p_h = mpi->params.p_h;
@@ -2658,8 +3319,14 @@ index 000000000..af5a404cd
 +        return false;
 +    }
 +
-+    if (!strcmp(c, "passes"))
++    if (!strcmp(c, "passes")) {
 +        p->opts->passes = v < 0 ? 0 : (v > DLSSNR_MAX_PASSES ? DLSSNR_MAX_PASSES : (int)v);
++        // ai.conf creates the filter with passes=0 and turns it on from here,
++        // so this is where the helper has to be started (no-op once running
++        // or with spawn=0).
++        if (p->opts->passes > 0)
++            helper_spawn(f, p);
++    }
 +    else if (!strcmp(c, "intensity"))
 +        p->opts->intensity = clampf(v, 0.0f, 1.0f);
 +    else if (!strcmp(c, "localtone"))
@@ -2723,6 +3390,7 @@ index 000000000..af5a404cd
 +    if (p->proc_ready)
 +        dlssnr_proc_uninit(&p->proc);
 +
++    dovi_to_rgb_destroy(&p->dovi_conv);
 +    if (p->yuv_conv_ready) {
 +        yuv_to_rgba_destroy(&p->yuv_conv);
 +        p->yuv_conv_ready = false;
@@ -2810,10 +3478,10 @@ index 000000000..af5a404cd
 +};
 diff --git a/video/filter/vf_hwup.c b/video/filter/vf_hwup.c
 new file mode 100644
-index 000000000..688511aac
+index 0000000000..9b4895a337
 --- /dev/null
 +++ b/video/filter/vf_hwup.c
-@@ -0,0 +1,564 @@
+@@ -0,0 +1,589 @@
 +// vf_hwup.c — SW→HW unification pre-filter
 +//
 +// Pipeline: decode → [vf_hwup] → [vf_rife] → [vf_vsr] → VO
@@ -2909,6 +3577,8 @@ index 000000000..688511aac
 +    av_buffer_unref(&mpi->film_grain);
 +    for (int n = 0; n < mpi->num_ff_side_data; n++)
 +        av_buffer_unref(&mpi->ff_side_data[n].buf);
++    talloc_free(mpi->ff_side_data);
++    mp_image_unrefp(&mpi->enhancement_layer);
 +}
 +
 +static void free_cuda_buf(void *opaque, uint8_t *data)
@@ -3011,7 +3681,15 @@ index 000000000..688511aac
 +        return false;
 +    }
 +    CUcontext ctx;
-+    cr = cuCtxCreate(&ctx, CU_CTX_SCHED_AUTO, dev, 0);
++    // CUDA 13 dropped the three-argument cuCtxCreate: the name now maps to
++    // cuCtxCreate_v4(pctx, params, flags, dev). The old call compiled against
++    // neither header correctly (CUDA 12: too many arguments; CUDA 13: `dev`
++    // landed in the flags slot and device 0 was always used).
++#if CUDA_VERSION >= 13000
++    cr = cuCtxCreate(&ctx, NULL, CU_CTX_SCHED_AUTO, dev);
++#else
++    cr = cuCtxCreate(&ctx, CU_CTX_SCHED_AUTO, dev);
++#endif
 +    if (cr != CUDA_SUCCESS) {
 +        MP_ERR(f, "hwup: cuCtxCreate failed (%d)\n", cr);
 +        return false;
@@ -3155,9 +3833,12 @@ index 000000000..688511aac
 +    size_t y_bytes  = (size_t)mpi->w * mpi->h * bpp;
 +    // NV12 chroma is ceil(h/2) rows; the floor left the last row of an
 +    // odd-height source uninitialized in a buffer the VO then maps.
-+    size_t uv_bytes = (size_t)mpi->w * ((mpi->h + 1) / 2) * bpp;
++    // ...and ceil(w/2) interleaved pairs per row: an odd width needs one more
++    // sample than w, or the last V is cut off.
++    size_t uv_row   = (size_t)((mpi->w + 1) / 2) * 2 * bpp;
++    size_t uv_bytes = uv_row * ((mpi->h + 1) / 2);
 +    int pitch_y  = mpi->w * bpp;
-+    int pitch_uv = mpi->w * bpp;
++    int pitch_uv = (int)uv_row;
 +
 +    cuCtxPushCurrent(p->cuda_ref->ctx);
 +    CUresult cr = cuMemAlloc(&p->out_buf, y_bytes + uv_bytes);
@@ -3195,7 +3876,7 @@ index 000000000..688511aac
 +        copy.srcPitch = (size_t)nv12->stride[1];
 +        copy.dstDevice = p->out_buf + y_bytes;
 +        copy.dstPitch = (size_t)pitch_uv;
-+        copy.WidthInBytes = (size_t)mpi->w * bpp;
++        copy.WidthInBytes = uv_row;
 +        copy.Height       = (size_t)(mpi->h + 1) / 2;
 +        cr = cuMemcpy2DAsync(&copy, p->cuda_stream);
 +        if (cr != CUDA_SUCCESS) {
@@ -3237,15 +3918,27 @@ index 000000000..688511aac
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, fmt);
 +    mp_image_params_guess_csp(&out->params);
 +    out->params.color = mpi->params.color;   // HDR metadata preserved
++    // The sample layout is the uploaded one (NV12/P010, MSB-aligned), not the
++    // source's (e.g. yuv420p10 is LSB-aligned): keep the bits set by
++    // mp_image_sethwfmt across the copy.
++    struct pl_bit_encoding out_bits = out->params.repr.bits;
 +    out->params.repr  = mpi->params.repr;    // source levels preserved — NV12
 +                                             // range was not converted,
 +                                             // downstream converts by levels
++    out->params.repr.bits = out_bits;
++    out->params.no_dovi = mpi->params.no_dovi;
++    out->params.no_enhancement_layer = mpi->params.no_enhancement_layer;
++    // The enhancement layer (present when el_pair runs ahead of the VFX
++    // filters) travels with the frame. It stays a software frame here: the VO
++    // can still compose it, the CUDA decoder skips it with a warning.
++    if (mpi->enhancement_layer)
++        out->enhancement_layer = mp_image_new_ref(mpi->enhancement_layer);
 +    // repr.dovi points *into* mpi->dovi (it is set from the AVFrame side data
 +    // in mp_image.c), so the struct copy above leaves the output borrowing
 +    // another frame's RPU. Ref it and repoint at our own buffer: libplacebo
 +    // dereferences repr.dovi unconditionally for PL_COLOR_SYSTEM_DOLBYVISION
 +    // (libplacebo colorspace.c, pl_color_repr_decode).
-+    out->dovi = av_buffer_ref(mpi->dovi);
++    out->dovi = mpi->dovi ? av_buffer_ref(mpi->dovi) : NULL;
 +    if (mpi->dovi && !out->dovi) {
 +        // talloc_free runs mp_image_dtor, which unrefs bufs[0] and frees
 +        // p->out_buf through free_cuda_buf.
@@ -3380,10 +4073,10 @@ index 000000000..688511aac
 +};
 diff --git a/video/filter/vf_truehdr.c b/video/filter/vf_truehdr.c
 new file mode 100644
-index 000000000..85d691f3c
+index 0000000000..588ccc11d7
 --- /dev/null
 +++ b/video/filter/vf_truehdr.c
-@@ -0,0 +1,1046 @@
+@@ -0,0 +1,1055 @@
 +// src/mpv/video/filter/vf_truehdr.c
 +// VFX TrueHDR (SDR → HDR10 up-conversion) — the VFX SDK's AI up-conversion
 +// effect, attached **after** `vf_vsr` (approach in
@@ -3505,6 +4198,7 @@ index 000000000..85d691f3c
 +    // takes effect after Load)
 +    int        e_luminance, e_saturation, e_contrast, e_middle_gray, e_debanding_off;
 +    bool       failed;        // create/Load failed → permanent passthrough (no per-frame retry)
++    bool       no_libs;       // the VFX SDK could not be loaded: nothing to retry, ever
 +    bool       failed_warned;
 +
 +    // ── YUV → RGBA8 (shared kernel; upstream is the raw decoded frame when
@@ -3595,7 +4289,7 @@ index 000000000..85d691f3c
 +        if (old) cuCtxPopCurrent(NULL);
 +        mp_cuda_ctx_ref_release(p->cuda_ref);
 +        p->cuda_ref = NULL;
-+        p->failed = false;       // a context change is a fresh rebuild chance (the failure may be related)
++        p->failed = p->no_libs;  // a context change is a fresh rebuild chance (the failure may be related)
 +        p->fmt_logged = false;
 +        MP_VERBOSE(f, "truehdr: CUDA context changed — engine reset\n");
 +    }
@@ -3838,6 +4532,8 @@ index 000000000..85d691f3c
 +    av_buffer_unref(&mpi->film_grain);
 +    for (int n = 0; n < mpi->num_ff_side_data; n++)
 +        av_buffer_unref(&mpi->ff_side_data[n].buf);
++    talloc_free(mpi->ff_side_data);
++    mp_image_unrefp(&mpi->enhancement_layer);
 +}
 +
 +static void free_cuda_buf(void *opaque, uint8_t *data)
@@ -3890,6 +4586,9 @@ index 000000000..85d691f3c
 +    // for downstream tone mapping to judge the content peak).
 +    out->params.color = pl_color_space_hdr10;
 +    out->params.color.hdr.max_luma = p->e_luminance;
++    // Finished RGB: keep a late el_pair from attaching an RPU or EL to it.
++    out->params.no_dovi = true;
++    out->params.no_enhancement_layer = true;
 +    out->params.p_w = src->params.p_w;
 +    out->params.p_h = src->params.p_h;
 +    // Orientation/timing metadata is invariant under the rebuild.
@@ -4046,7 +4745,8 @@ index 000000000..85d691f3c
 +    const int subfmt = mpi->params.hw_subfmt;
 +    const bool in_rgba8  = (subfmt == IMGFMT_RGBA);
 +    const bool in_rgb10  = (subfmt == IMGFMT_X2BGR10 || subfmt == IMGFMT_X2RGB10);
-+    const bool in_yuv    = !vfx_imgfmt_is_rgb(subfmt);
++    // 4:4:4 / 4:2:2 decoder output is not NV12-shaped: unsupported, below.
++    const bool in_yuv    = vfx_imgfmt_is_nv420(subfmt);
 +    if (!in_rgba8 && !in_rgb10 && !in_yuv) {
 +        if (!p->fmt_warned) {
 +            MP_WARN(f, "truehdr: unsupported input subfmt=%d — passthrough\n", subfmt);
@@ -4345,9 +5045,10 @@ index 000000000..85d691f3c
 +    p->frame_count = 0;
 +    // A seek/reopen after a failed Load is the natural retry point (the
 +    // failure is usually transient driver pressure), so do not keep the
-+    // permanent-passthrough latch across it.
-+    p->failed = false;
-+    p->failed_warned = false;
++    // permanent-passthrough latch across it -- unless the SDK itself is
++    // missing, where a retry would call unloaded (NULL) entry points.
++    p->failed = p->no_libs;
++    p->failed_warned = p->no_libs;
 +}
 +
 +static void f_destroy(struct mp_filter *f)
@@ -4414,6 +5115,7 @@ index 000000000..85d691f3c
 +
 +    if (!vfx_load_libraries()) {
 +        MP_ERR(f, "truehdr: failed to load the VFX libraries -- passthrough\n");
++        p->no_libs = true;
 +        p->failed = true;
 +        p->failed_warned = true;
 +    }
@@ -4432,10 +5134,10 @@ index 000000000..85d691f3c
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 000000000..54246d1a0
+index 0000000000..87a5ea4787
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1278 @@
+@@ -0,0 +1,1324 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -4573,6 +5275,7 @@ index 000000000..54246d1a0
 +#include "vfg_proc.h"
 +#include "cuda_shared.h"
 +#include "yuv_to_rgba.h"
++#include "dovi_to_rgb.h"
 +
 +// vfg-status cadence (output frames)
 +#define VFG_STATUS_EVERY 30
@@ -4739,6 +5442,7 @@ index 000000000..54246d1a0
 +    int  vfg_mode;                  // Mode the engine is currently resolved to (enum vfg_mode)
 +
 +    struct yuv_to_rgba yuv_conv;    // CUDA/YUV → RGB D2D
++    struct dovi_to_rgb dovi_conv;   // Dolby Vision BL(+EL) → RGB
 +    bool  yuv_conv_ready;
 +    int   yuv_conv_bd;
 +    int   yuv_conv_bits;            // output bit depth (8 RGBA U8 / 10 RGB10A2)
@@ -4847,6 +5551,7 @@ index 000000000..54246d1a0
 +            vfg_destroy(&p->vfg);
 +            p->vfg_configured = false;
 +        }
++        dovi_to_rgb_destroy(&p->dovi_conv);
 +        if (p->yuv_conv_ready) {
 +            yuv_to_rgba_destroy(&p->yuv_conv);
 +            p->yuv_conv_ready = false;
@@ -4977,6 +5682,8 @@ index 000000000..54246d1a0
 +                in_w, in_h, vfg_mode_name(mode), bits);
 +        vfg_destroy(&p->vfg);
 +        p->vfg_configured = false;
++        // The staged previous frame lived in the buffers just destroyed.
++        p->have_prev = false;
 +    }
 +
 +    MP_INFO(f, "vfg: init %dx%d mode=%s k=%d bits=%d\n", in_w, in_h,
@@ -5036,6 +5743,8 @@ index 000000000..54246d1a0
 +    av_buffer_unref(&mpi->film_grain);
 +    for (int n = 0; n < mpi->num_ff_side_data; n++)
 +        av_buffer_unref(&mpi->ff_side_data[n].buf);
++    talloc_free(mpi->ff_side_data);
++    mp_image_unrefp(&mpi->enhancement_layer);
 +}
 +
 +static void free_cuda_buf(void *opaque, uint8_t *data)
@@ -5087,13 +5796,12 @@ index 000000000..54246d1a0
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, vfx_imgfmt_from_bits(out_bits));
 +    mp_image_params_guess_csp(&out->params);
 +    out->params.color = src->params.color;   // HDR metadata (same as vf_vsr)
-+    // Same reason as vf_vsr: generated frames are RGB, and el_pair would
-+    // re-attach the source RPU to them (f_enhancement_pair.c:102) unless
-+    // no_dovi is set.
-+    if (src->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION || src->dovi) {
-+        out->params.no_dovi = true;
-+        out->params.no_enhancement_layer = true;
-+    }
++    // Same reason as vf_vsr: these frames are finished RGB (Dolby Vision was
++    // decoded in stage_input), so nothing downstream may attach an RPU or an
++    // enhancement layer to them. Unconditional, because the flags an upstream
++    // filter set on `src` do not survive this rebuild.
++    out->params.no_dovi = true;
++    out->params.no_enhancement_layer = true;
 +    out->params.p_w = src->params.p_w;       // pixel aspect ratio (aspect override)
 +    out->params.p_h = src->params.p_h;
 +    // Orientation is invariant under frame generation. pkt_duration is *not*
@@ -5157,6 +5865,19 @@ index 000000000..54246d1a0
 +        int bd = desc.bpp[0];
 +        enum yuv_matrix mx = matrix_from_repr(&cur->params);
 +        enum yuv_range  rn = range_from_levels(cur->params.repr.levels);
++        if (dovi_frame_needs_decode(cur)) {
++            // Dolby Vision is decoded here (reshape, FEL, RPU matrices) into
++            // the BT.2020 PQ RGB the frame is already tagged as.
++            if (!dovi_to_rgb_convert(&p->dovi_conv, f->log, cur,
++                                     p->video_w, p->video_h,
++                                     p->vfg.in_pixels[idx],
++                                     p->vfg.in_pitch[idx],
++                                     p->vfg.bits, p->cuda_stream)) {
++                MP_ERR(f, "vfg: Dolby Vision decode failed\n");
++                return false;
++            }
++            return true;
++        }
 +        if (!ensure_yuv_converter(f, p, bd, mx, rn, p->vfg.bits, &cur->params))
 +            return false;
 +        if (!yuv_to_rgba_convert(&p->yuv_conv,
@@ -5310,9 +6031,16 @@ index 000000000..54246d1a0
 +
 +    // ── 3. passthrough decision (re-evaluated every frame: a vf-command hot
 +    //    update takes effect on the next frame) ──────────────────────────
-+    bool sw_input = (cur->imgfmt != IMGFMT_CUDA);
++    bool bad_layout = cur->imgfmt == IMGFMT_CUDA &&
++                      !vfx_imgfmt_is_rgb(cur->params.hw_subfmt) &&
++                      !vfx_imgfmt_is_nv420(cur->params.hw_subfmt);
++    bool sw_input = (cur->imgfmt != IMGFMT_CUDA) || bad_layout;
 +    if (sw_input && !p->sw_warned) {
-+        MP_WARN(f, "vfg: software frames — passthrough (prepend @hwup for VFG)\n");
++        MP_WARN(f, bad_layout
++            ? "vfg: this decoder pixel layout is not supported — passthrough\n"
++            : "vfg: software frames — passthrough (prepend @hwup for VFG)\n");
++
++
 +        p->sw_warned = true;
 +    }
 +
@@ -5460,9 +6188,28 @@ index 000000000..54246d1a0
 +        }
 +        MP_DBG(f, "vfg: first frame pts=%.4f kept (%dx%d k=%d mode=%s)\n",
 +               t_cur, in_w, in_h, p->k, vfg_mode_name(p->vfg_mode));
++        // Emit the staged RGB copy rather than the source frame, like every
++        // later [copy] frame. Forwarding the source made the first frame after
++        // each start/seek a different format from the rest (YUV, and for Dolby
++        // Vision still RPU-tagged with its EL), i.e. a VO reconfigure and a
++        // second colour path for one frame.
++        struct mp_image *first = NULL;
++        if (ensure_out_buf(f, p, p->video_w, p->video_h, p->vfg.in_pitch[1]) &&
++            copy_d2d(f, p, (void *)p->out_buf, (size_t)p->out_pitch,
++                     p->vfg.in_pixels[1], (size_t)p->vfg.in_pitch[1],
++                     p->video_w, p->video_h))
++        {
++            cuStreamSynchronize(p->cuda_stream);
++            first = vfg_make_output(f, p, cur, t_cur, out_fps);
++        }
 +        vfg_account(f, p, t0);
 +        cuCtxPopCurrent(NULL);
-+        mp_pin_in_write(f->ppins[1], frame);
++        if (first) {
++            talloc_free(cur);
++            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, first));
++        } else {
++            mp_pin_in_write(f->ppins[1], frame);
++        }
 +        return;
 +    }
 +
@@ -5630,6 +6377,7 @@ index 000000000..54246d1a0
 +    vfg_destroy(&p->vfg);      // internally waits for in-flight Runs to finish
 +    p->vfg_configured = false;
 +
++    dovi_to_rgb_destroy(&p->dovi_conv);
 +    if (p->yuv_conv_ready) {
 +        yuv_to_rgba_destroy(&p->yuv_conv);
 +        p->yuv_conv_ready = false;
@@ -5716,10 +6464,10 @@ index 000000000..54246d1a0
 +};
 diff --git a/video/filter/vf_vsr.c b/video/filter/vf_vsr.c
 new file mode 100644
-index 000000000..f377ee250
+index 0000000000..51a3a132b4
 --- /dev/null
 +++ b/video/filter/vf_vsr.c
-@@ -0,0 +1,1338 @@
+@@ -0,0 +1,1366 @@
 +/*
 + * vf_vsr.c -- Video Super Resolution filter via NVIDIA VFX SDK
 + *
@@ -5765,6 +6513,7 @@ index 000000000..f377ee250
 +
 +#include "vsr_internal.h"
 +#include "cuda_shared.h"
++#include "dovi_to_rgb.h"
 +
 +#include <time.h>
 +
@@ -5941,6 +6690,7 @@ index 000000000..f377ee250
 +
 +    // yuv→rgba D2D
 +    struct yuv_to_rgba    yuv_conv;
++    struct dovi_to_rgb    dovi_conv;
 +    bool                  yuv_conv_ready;
 +    int                   yuv_conv_bd;
 +    int                   yuv_conv_bits;   // output bit depth (8/10)
@@ -6088,6 +6838,7 @@ index 000000000..f377ee250
 +            vsr_destroy(&p->vsr);
 +            p->vsr_configured = false;
 +        }
++        dovi_to_rgb_destroy(&p->dovi_conv);
 +        if (p->yuv_conv_ready) {
 +            yuv_to_rgba_destroy(&p->yuv_conv);
 +            p->yuv_conv_ready = false;
@@ -6325,6 +7076,8 @@ index 000000000..f377ee250
 +    av_buffer_unref(&mpi->film_grain);
 +    for (int n = 0; n < mpi->num_ff_side_data; n++)
 +        av_buffer_unref(&mpi->ff_side_data[n].buf);
++    talloc_free(mpi->ff_side_data);
++    mp_image_unrefp(&mpi->enhancement_layer);
 +}
 +
 +static void free_cuda_buf(void *opaque, uint8_t *data)
@@ -6517,9 +7270,16 @@ index 000000000..f377ee250
 +    // segfault on the second frame (issue #12 defect 6: measured exit 139, the
 +    // SEGV landing in cuMemcpy2DAsync). Handled per contract and the same way
 +    // as vf_rife: one-off WARN + passthrough, no engine init, no CUDA touched.
-+    const bool sw_input = (mpi->imgfmt != IMGFMT_CUDA);
++    // Decoder output that is neither RGB nor NV12-shaped (4:4:4, 4:2:2) cannot
++    // be read by the converters; it takes the same passthrough.
++    const bool bad_layout = mpi->imgfmt == IMGFMT_CUDA &&
++                            !vfx_imgfmt_is_rgb(mpi->params.hw_subfmt) &&
++                            !vfx_imgfmt_is_nv420(mpi->params.hw_subfmt);
++    const bool sw_input = (mpi->imgfmt != IMGFMT_CUDA) || bad_layout;
 +    if (sw_input && !p->sw_warned) {
-+        MP_WARN(f, "vsr: software frames — passthrough (prepend @hwup for VSR)\n");
++        MP_WARN(f, bad_layout
++            ? "vsr: this decoder pixel layout is not supported — passthrough\n"
++            : "vsr: software frames — passthrough (prepend @hwup for VSR)\n");
 +        p->sw_warned = true;
 +    }
 +    p->passthrough = sw_input
@@ -6554,7 +7314,13 @@ index 000000000..f377ee250
 +    }
 +    cuCtxPushCurrent(p->cuda_ref->ctx);
 +
-+    if (!ensure_vsr(f, p, video_w, video_h, out_w, out_h, p->opts->quality, bits)) {
++    // QualityLevel carries the mode: 1-4 upscale, 8-11 denoise. Denoise is a
++    // same-resolution mode of the effect, so it applies when nothing is being
++    // upscaled; while upscaling, `quality` is what the SDK can take.
++    const int qlevel = (fabsf(p->effective_scale - 1.0f) < 0.001f &&
++                        p->opts->denoise != -1) ? p->opts->denoise
++                                                : p->opts->quality;
++    if (!ensure_vsr(f, p, video_w, video_h, out_w, out_h, qlevel, bits)) {
 +        // First failure: destroy the engine state and retry once (transient
 +        // failures self-heal, e.g. GPU busy).
 +        if (p->vsr_configured) {
@@ -6564,7 +7330,7 @@ index 000000000..f377ee250
 +            p->vsr_configured = false;
 +        }
 +        if (!ensure_vsr(f, p, video_w, video_h, out_w, out_h,
-+                        p->opts->quality, bits)) {
++                        qlevel, bits)) {
 +            MP_ERR(f, "vsr: init failed after retry\n");
 +            mp_frame_unref(&frame);
 +            mp_filter_internal_mark_failed(f);
@@ -6586,15 +7352,26 @@ index 000000000..f377ee250
 +        int bd = desc.bpp[0];
 +        enum yuv_matrix mx = matrix_from_repr(&mpi->params);
 +        enum yuv_range  rn = range_from_levels(mpi->params.repr.levels);
-+        if (!ensure_yuv_converter(f, p, bd, mx, rn, bits, &mpi->params)) {
-+            mp_frame_unref(&frame); mp_filter_internal_mark_failed(f); cuCtxPopCurrent(NULL); return;
-+        }
-+        if (!yuv_to_rgba_convert(&p->yuv_conv,
++        bool conv_ok;
++        if (dovi_frame_needs_decode(mpi)) {
++            // Dolby Vision is decoded here (reshape, FEL, RPU matrices) into
++            // the BT.2020 PQ RGB the frame is already tagged as.
++            conv_ok = dovi_to_rgb_convert(&p->dovi_conv, f->log, mpi,
++                                          video_w, video_h,
++                                          p->vsr.in_pixels, vsr_in_pitch,
++                                          bits, p->cuda_stream);
++        } else {
++            if (!ensure_yuv_converter(f, p, bd, mx, rn, bits, &mpi->params)) {
++                mp_frame_unref(&frame); mp_filter_internal_mark_failed(f); cuCtxPopCurrent(NULL); return;
++            }
++            conv_ok = yuv_to_rgba_convert(&p->yuv_conv,
 +                                  mpi->planes[0], mpi->stride[0],
 +                                  mpi->planes[1], mpi->stride[1],
 +                                  video_w, video_h,
 +                                  p->vsr.in_pixels, vsr_in_pitch,
-+                                  p->cuda_stream)) {
++                                  p->cuda_stream);
++        }
++        if (!conv_ok) {
 +            MP_ERR(f, "vsr: yuv_to_rgba_convert failed\n");
 +            mp_frame_unref(&frame); mp_filter_internal_mark_failed(f); cuCtxPopCurrent(NULL); return;
 +        }
@@ -6673,16 +7450,14 @@ index 000000000..f377ee250
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, vfx_imgfmt_from_bits(bits));
 +    mp_image_params_guess_csp(&out->params);
 +    out->params.color = mpi->params.color; // preserve HDR metadata
-+    // A rebuilt frame is RGB, so it is no longer Dolby Vision: the RPU
-+    // describes a reshape of the coded YCbCr signal and resampling in RGB
-+    // destroys that mapping. Clearing the flags is not enough — el_pair
-+    // re-attaches the RPU from the EL track onto whatever frame leaves the
-+    // user chain (filters/f_enhancement_pair.c:102) unless no_dovi is set,
-+    // which would then make libplacebo reshape RGB pixels.
-+    if (mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION || mpi->dovi) {
-+        out->params.no_dovi = true;
-+        out->params.no_enhancement_layer = true;
-+    }
++    // A rebuilt frame is finished RGB: any Dolby Vision was decoded on the
++    // way in (dovi_to_rgb). Nothing downstream may attach an RPU or an
++    // enhancement layer to it again -- el_pair would otherwise do exactly
++    // that when it runs after the user chain (f_enhancement_pair.c), and
++    // libplacebo would then reshape RGB pixels. Unconditional: a source whose
++    // RPU rides on the EL track arrives here untagged.
++    out->params.no_dovi = true;
++    out->params.no_enhancement_layer = true;
 +    out->w = vsr_out_w; out->h = vsr_out_h;
 +    out->params.w = vsr_out_w; out->params.h = vsr_out_h;
 +    out->planes[0] = (uint8_t*)p->out_buf;
@@ -6956,6 +7731,7 @@ index 000000000..f377ee250
 +
 +    vsr_destroy(&p->vsr);
 +
++    dovi_to_rgb_destroy(&p->dovi_conv);
 +    if (p->yuv_conv_ready) {
 +        yuv_to_rgba_destroy(&p->yuv_conv);
 +        p->yuv_conv_ready = false;
@@ -7060,7 +7836,7 @@ index 000000000..f377ee250
 +};
 diff --git a/video/filter/vfg_proc.c b/video/filter/vfg_proc.c
 new file mode 100644
-index 000000000..d27d3b9d9
+index 0000000000..d27d3b9d96
 --- /dev/null
 +++ b/video/filter/vfg_proc.c
 @@ -0,0 +1,258 @@
@@ -7324,7 +8100,7 @@ index 000000000..d27d3b9d9
 +}
 diff --git a/video/filter/vfg_proc.h b/video/filter/vfg_proc.h
 new file mode 100644
-index 000000000..c279d88f9
+index 0000000000..c279d88f98
 --- /dev/null
 +++ b/video/filter/vfg_proc.h
 @@ -0,0 +1,76 @@
@@ -7406,10 +8182,10 @@ index 000000000..c279d88f9
 +void vfg_destroy(struct vfg_context *c);
 diff --git a/video/filter/vfx_loader.c b/video/filter/vfx_loader.c
 new file mode 100644
-index 000000000..211f4f50a
+index 0000000000..96340acddf
 --- /dev/null
 +++ b/video/filter/vfx_loader.c
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,246 @@
 +// src/mpv/video/filter/vfx_loader.c
 +// VFX library locator/loader layer, sole implementation (interface in
 +// vfx_loader.h) — a pure move out of vsr_proc.c: search order, log text,
@@ -7450,6 +8226,9 @@ index 000000000..211f4f50a
 +        if (!pfn_##NAME) {                                        \
 +            fprintf(stderr, "VSR: dlsym(" #NAME ") failed: %s\n", \
 +                    dlerror());                                   \
++            /* A half-loaded library must not look loaded on the next call: */ \
++            dlclose(g_vfx_lib); dlclose(g_nvcv_lib);              \
++            g_vfx_lib = NULL; g_nvcv_lib = NULL;                  \
 +            return false;                                         \
 +        }                                                         \
 +    } while (0)
@@ -7655,7 +8434,7 @@ index 000000000..211f4f50a
 +#undef LOAD_SYM
 diff --git a/video/filter/vfx_loader.h b/video/filter/vfx_loader.h
 new file mode 100644
-index 000000000..1fed8555e
+index 0000000000..1fed8555eb
 --- /dev/null
 +++ b/video/filter/vfx_loader.h
 @@ -0,0 +1,100 @@
@@ -7761,7 +8540,7 @@ index 000000000..1fed8555e
 +#endif
 diff --git a/video/filter/vsr_internal.h b/video/filter/vsr_internal.h
 new file mode 100644
-index 000000000..c69d35307
+index 0000000000..c69d353077
 --- /dev/null
 +++ b/video/filter/vsr_internal.h
 @@ -0,0 +1,45 @@
@@ -7812,7 +8591,7 @@ index 000000000..c69d35307
 +void vsr_destroy(struct vsr_context *c);
 diff --git a/video/filter/vsr_proc.c b/video/filter/vsr_proc.c
 new file mode 100644
-index 000000000..776ef74d6
+index 0000000000..776ef74d62
 --- /dev/null
 +++ b/video/filter/vsr_proc.c
 @@ -0,0 +1,364 @@
@@ -8182,10 +8961,10 @@ index 000000000..776ef74d6
 +}
 diff --git a/video/filter/yuv_to_rgba.c b/video/filter/yuv_to_rgba.c
 new file mode 100644
-index 000000000..8e1873760
+index 0000000000..532afa3288
 --- /dev/null
 +++ b/video/filter/yuv_to_rgba.c
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,263 @@
 +// yuv_to_rgba.c — CUDA YUV(NV12/P010/P016)→chunky U8 RGBA via NVRTC
 +// Parameterized color matrix + range, compiled into kernel as #defines.
 +
@@ -8393,6 +9172,8 @@ index 000000000..8e1873760
 +    cu_res = cuModuleGetFunction(&c->kernel, c->module, "yuv_to_rgb_kernel");
 +    if (cu_res != CUDA_SUCCESS) {
 +        fprintf(stderr, "yuv_to_rgba: cuModuleGetFunction failed (%d)\n", cu_res);
++        cuModuleUnload(c->module);
++        c->module = NULL;
 +        return false;
 +    }
 +
@@ -8449,10 +9230,10 @@ index 000000000..8e1873760
 +}
 diff --git a/video/filter/yuv_to_rgba.h b/video/filter/yuv_to_rgba.h
 new file mode 100644
-index 000000000..0bdd430ab
+index 0000000000..61480af521
 --- /dev/null
 +++ b/video/filter/yuv_to_rgba.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,138 @@
 +// src/mpv/video/filter/yuv_to_rgba.h
 +#pragma once
 +
@@ -8491,11 +9272,10 @@ index 000000000..0bdd430ab
 +    case PL_COLOR_SYSTEM_BT_2020_C:
 +    case PL_COLOR_SYSTEM_BT_2100_PQ:
 +    case PL_COLOR_SYSTEM_BT_2100_HLG: return YUV_MATRIX_BT2020;
-+    // Profile 7/8 carry an HDR10-compatible base layer: BT.2020 YCbCr, PQ.
-+    // Without this case the default below hands them BT.601 coefficients
-+    // (Kr=0.299 instead of 0.2624) and every DV frame comes out red-shifted.
-+    // Profile 5 is ICtCp and no YCbCr matrix is right for it — the P5
-+    // profiles in ai.conf keep such files out of this converter entirely.
++    // Dolby Vision frames do not come through this matrix: the filters send
++    // them to dovi_to_rgb.c (dovi_frame_needs_decode). This is only the
++    // fallback for a frame tagged Dolby Vision whose RPU buffer is missing,
++    // where treating the base layer as BT.2020 YCbCr is the best guess left.
 +    case PL_COLOR_SYSTEM_DOLBYVISION: return YUV_MATRIX_BT2020;
 +    default:                          return YUV_MATRIX_BT601;
 +    }
@@ -8557,6 +9337,19 @@ index 000000000..0bdd430ab
 +{
 +    return imgfmt == IMGFMT_RGBA || imgfmt == IMGFMT_BGRA ||
 +           imgfmt == IMGFMT_X2BGR10 || imgfmt == IMGFMT_X2RGB10;
++}
++
++/// Whether this subfmt has the only YUV layout the converters read: one luma
++/// plane plus one interleaved, 2x2-subsampled chroma plane (NV12/P010/P016).
++/// 4:4:4 and 4:2:2 decoder output has a different plane layout and must be
++/// passed through instead of being read as NV12.
++static inline bool vfx_imgfmt_is_nv420(int imgfmt)
++{
++    struct mp_regular_imgfmt reg;
++    return mp_get_regular_imgfmt(&reg, imgfmt) &&
++           reg.num_planes == 2 && reg.chroma_xs == 1 && reg.chroma_ys == 1 &&
++           reg.planes[0].num_components == 1 &&
++           reg.planes[1].num_components == 2;
 +}
 +
 +struct yuv_to_rgba {

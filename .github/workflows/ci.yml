@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  MPV_COMMIT: 488fec0789e5026804ac8dd03fb749570416d48a
+  MPV_COMMIT: fe753a78246151a2489b472dabcb04f2edd61d50
 
 jobs:
   validate:
