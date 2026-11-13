@@ -66,7 +66,7 @@ jobs:
           git fetch -q --depth=1 origin "$MPV_COMMIT"
           git checkout -q FETCH_HEAD
           patch -Np1 --dry-run -i "$GITHUB_WORKSPACE/vfx-filters.patch"
-          echo "22 files apply cleanly to $(git rev-parse --short HEAD)"
+          echo "Patch applies cleanly to $(git rev-parse --short HEAD)"
 
       - name: Python helpers compile
         run: |
@@ -77,8 +77,15 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
+          sudo apt-get install -y -qq shellcheck lua5.1
           shellcheck -x native/*.sh
+
+      - name: Filter and refresh-rate regressions
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          luac5.1 -p scripts/vfg-sync.lua
+          lua5.1 tests/vfg-sync-refresh.lua
 
       - name: ai.conf is a valid mpv config
         run: |

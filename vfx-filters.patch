@@ -362,10 +362,10 @@ index 0000000000..5016257938
 +}
 diff --git a/video/filter/dlssnr_proc.c b/video/filter/dlssnr_proc.c
 new file mode 100644
-index 0000000000..969341667e
+index 0000000000..bdf522b1fd
 --- /dev/null
 +++ b/video/filter/dlssnr_proc.c
-@@ -0,0 +1,611 @@
+@@ -0,0 +1,618 @@
 +// dlssnr_proc.c — NVRTC kernels for vf_dlssnr. See dlssnr_proc.h.
 +
 +#include "dlssnr_proc.h"
@@ -398,22 +398,17 @@ index 0000000000..969341667e
 +"    float p = powf(fmaxf(l, 0.0f), m1);\n"
 +"    return powf((c1 + c2 * p) / (1.0f + c3 * p), m2);\n"
 +"}\n"
-+"// HLG: inverse OETF is scene light, the OOTF puts it on a 1000-nit display.\n"
-+"// Output scale matches PQ: 1.0 == 10000 nits.\n"
-+"__device__ __forceinline__ float hlg_eotf1(float e)\n"
++"// HLG inverse OETF returns scene-linear light.\n"
++"__device__ __forceinline__ float hlg_scene1(float e)\n"
 +"{\n"
 +"    const float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;\n"
 +"    float s = (e <= 0.5f) ? (e * e / 3.0f) : ((expf((e - c) / a) + b) / 12.0f);\n"
-+"    // HLG OOTF for a 1000-nit display, expressed on the same scale as\n"
-+"    // pq_eotf1: 1.0 == 10000 nits. HLG 1.0 is 1000 nits, so the whole curve\n"
-+"    // is divided by ten -- without that, `white` (203 nits) and `guard`\n"
-+"    // would mean something different on HLG than on PQ.\n"
-+"    return 0.1f * powf(fmaxf(s, 0.0f), 1.2f);\n"
++"    return fmaxf(s, 0.0f);\n"
 +"}\n"
-+"__device__ __forceinline__ float hlg_oetf1(float l)\n"
++"__device__ __forceinline__ float hlg_oetf1(float s)\n"
 +"{\n"
 +"    const float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;\n"
-+"    float s = powf(fmaxf(l / 0.1f, 0.0f), 1.0f / 1.2f);\n"
++"    s = fmaxf(s, 0.0f);\n"
 +"    return (s <= 1.0f / 12.0f) ? (sqrtf(3.0f * s)) : (a * logf(12.0f * s - b) + c);\n"
 +"}\n"
 +"__device__ __forceinline__ float srgb_enc1(float v);\n"
@@ -421,7 +416,12 @@ index 0000000000..969341667e
 +"__device__ __forceinline__ float3 decode3(float3 e, int trc)\n"
 +"{\n"
 +"    if (trc == 1) return make_float3(pq_eotf1(e.x), pq_eotf1(e.y), pq_eotf1(e.z));\n"
-+"    if (trc == 2) return make_float3(hlg_eotf1(e.x), hlg_eotf1(e.y), hlg_eotf1(e.z));\n"
++"    if (trc == 2) {\n"
++"        float3 s = make_float3(hlg_scene1(e.x), hlg_scene1(e.y), hlg_scene1(e.z));\n"
++"        float y = 0.2627f * s.x + 0.6780f * s.y + 0.0593f * s.z;\n"
++"        float k = y > 0.0f ? 0.1f * powf(y, 0.2f) : 0.0f;\n"
++"        return make_float3(s.x * k, s.y * k, s.z * k);\n"
++"    }\n"
 +"    // SDR is the sRGB curve, not a bare 2.4 power. The proxy and the delta\n"
 +"    // are both defined on sRGB (NeuralScreen's ToLinear/ToSrgb), so the\n"
 +"    // frame has to be decoded on the same curve or the residual is measured\n"
@@ -435,7 +435,14 @@ index 0000000000..969341667e
 +"__device__ __forceinline__ float3 encode3(float3 l, int trc)\n"
 +"{\n"
 +"    if (trc == 1) return make_float3(pq_oetf1(l.x), pq_oetf1(l.y), pq_oetf1(l.z));\n"
-+"    if (trc == 2) return make_float3(hlg_oetf1(l.x), hlg_oetf1(l.y), hlg_oetf1(l.z));\n"
++"    if (trc == 2) {\n"
++"        float3 d = make_float3(fmaxf(l.x, 0.0f) * 10.0f,\n"
++"                               fmaxf(l.y, 0.0f) * 10.0f,\n"
++"                               fmaxf(l.z, 0.0f) * 10.0f);\n"
++"        float y = 0.2627f * d.x + 0.6780f * d.y + 0.0593f * d.z;\n"
++"        float k = y > 0.0f ? powf(y, 1.0f / 1.2f - 1.0f) : 0.0f;\n"
++"        return make_float3(hlg_oetf1(d.x * k), hlg_oetf1(d.y * k), hlg_oetf1(d.z * k));\n"
++"    }\n"
 +"    return make_float3(srgb_enc1(l.x), srgb_enc1(l.y), srgb_enc1(l.z));\n"
 +"}\n"
 +"__device__ __forceinline__ float srgb_enc1(float v)\n"
@@ -1714,10 +1721,10 @@ index 0000000000..5999b2be9b
 +void dovi_to_rgb_destroy(struct dovi_to_rgb *c);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 0000000000..0661c60be4
+index 0000000000..9ece0fcca4
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1758 @@
+@@ -0,0 +1,1764 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -2415,7 +2422,6 @@ index 0000000000..0661c60be4
 +{
 +    if (p->helper_spawned || !p->opts->spawn)
 +        return;
-+    p->helper_spawned = true;
 +
 +    const char *env = getenv("DLSSNR_HELPER");
 +    const char *home = getenv("HOME");
@@ -2450,6 +2456,7 @@ index 0000000000..0661c60be4
 +                   "helper is running)\n", path, strerror(rc));
 +        return;
 +    }
++    p->helper_spawned = true;
 +    MP_INFO(f, "dlssnr: helper start launched (pid %d)\n", (int)pid);
 +}
 +
@@ -2715,6 +2722,11 @@ index 0000000000..0661c60be4
 +static bool shm_roundtrip(struct mp_filter *f, struct priv *p,
 +                          int w, int h, double timeout_ms)
 +{
++    if (w <= 0 || h <= 0 || w > 7680 || h > 4320 ||
++        (size_t)w > DLSSNR_SHM_MAX_FRAME / 4 / (size_t)h) {
++        MP_ERR(f, "dlssnr: proxy exceeds shared-memory capacity\n");
++        return false;
++    }
 +    void *base = p->shm;
 +    uint8_t *in = (uint8_t *)base + DLSSNR_SHM_HEADER;
 +    uint8_t *out = in + DLSSNR_SHM_MAX_FRAME;
@@ -3372,6 +3384,7 @@ index 0000000000..0661c60be4
 +    p->frame_count = 0;
 +    p->fail_count = 0;
 +    p->helper_dead = false;     // a seek is the retry point for a dead helper
++    p->cfg_written = false;     // the helper may have restarted and reset its header
 +    p->status_t0 = 0;
 +    p->status_frames = 0;
 +    p->status_cost_ms = 0;
@@ -5134,10 +5147,10 @@ index 0000000000..588ccc11d7
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 0000000000..87a5ea4787
+index 0000000000..3edf363cc4
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1324 @@
+@@ -0,0 +1,1325 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -5220,7 +5233,7 @@ index 0000000000..87a5ea4787
 + * Filter options:
 + *   fps:  off | auto | 2 | 3 | 4         (default: off)  integer multiplier K
 + *   mode: low | medium | high            (default: medium)
-+ *   max-fps: 0..240                      (default: 0 = no cap) output fps cap
++ *   max-fps: 0..1000                     (default: 0 = no cap) output fps cap
 + *
 + * mode **has only three tiers and no auto** (decided 2026-10-16: no automatic
 + * tier) — the tier is the user's explicit choice, the client always sends an
@@ -5292,9 +5305,9 @@ index 0000000000..87a5ea4787
 +// src_fps and max-fps. 0 can never be an explicit multiplier (2..4).
 +#define VFG_FPS_AUTO 0
 +// Output frame rate cap (max-fps): 0 = unlimited (the default, so the old
-+// plain --vf usage is unaffected); the client (UI) only ever sends 48/60/120,
-+// and the cap is relaxed to 240 just to leave headroom for manual tuning.
-+#define VFG_MAX_FPS_LIMIT_MAX 240
++// plain --vf usage is unaffected); supports fractional refresh rates and
++// high-refresh displays reported by the output.
++#define VFG_MAX_FPS_LIMIT_MAX 1000
 +
 +static double vfg_now_ms(void)
 +{
@@ -5310,7 +5323,7 @@ index 0000000000..87a5ea4787
 +struct vf_vfg_opts {
 +    int fps;      // -1 = off, 0 = auto, 2/3/4 = integer multiplier K
 +    int mode;     // 0=low, 1=medium, 2=high (default 1=medium, no auto)
-+    int max_fps;  // output frame rate cap (0=unlimited); k*src_fps above it means passthrough
++    double max_fps; // output frame rate cap (0=unlimited); above it means passthrough
 +};
 +
 +#define OPT_BASE_STRUCT struct vf_vfg_opts
@@ -5406,8 +5419,8 @@ index 0000000000..87a5ea4787
 +    {"mode", OPT_CHOICE(mode,
 +        {"low", 0}, {"medium", 1}, {"high", 2}),
 +        M_RANGE(0, 2)},
-+    // Output frame rate cap: 0 = unlimited; the client (UI/RPC) sends 48/60/120.
-+    {"max-fps", OPT_INT(max_fps), M_RANGE(0, VFG_MAX_FPS_LIMIT_MAX)},
++    // Output frame rate cap: 0 = unlimited; preserves fractional refresh rates.
++    {"max-fps", OPT_DOUBLE(max_fps), M_RANGE(0, VFG_MAX_FPS_LIMIT_MAX)},
 +    {0}
 +};
 +
@@ -6266,13 +6279,14 @@ index 0000000000..87a5ea4787
 +    return *out >= 0 && *out <= 2;   // no auto: illegal values (including "auto") are always rejected
 +}
 +
-+static bool parse_max_fps_arg(const char *arg, int *out)
++static bool parse_max_fps_arg(const char *arg, double *out)
 +{
 +    char *end = NULL;
-+    long v = strtol(arg, &end, 10);
-+    if (!end || *end || v < 0 || v > VFG_MAX_FPS_LIMIT_MAX)
++    double v = strtod(arg, &end);
++    if (end == arg || *end || !isfinite(v) ||
++        v < 0 || v > VFG_MAX_FPS_LIMIT_MAX)
 +        return false;
-+    *out = (int)v;
++    *out = v;
 +    return true;
 +}
 +
@@ -6307,11 +6321,11 @@ index 0000000000..87a5ea4787
 +        return true;
 +    }
 +    if (strcmp(cmd->cmd, "max-fps") == 0) {
-+        int v;
++        double v;
 +        if (!parse_max_fps_arg(cmd->arg, &v))
 +            return false;
 +        if (p->opts->max_fps != v) {
-+            MP_INFO(f, "vfg: max-fps %d -> %d (vf-command)\n",
++            MP_INFO(f, "vfg: max-fps %.17g -> %.17g (vf-command)\n",
 +                    p->opts->max_fps, v);
 +            p->opts->max_fps = v;
 +            // No reset needed: the passthrough decision is re-evaluated on the
@@ -8182,10 +8196,10 @@ index 0000000000..c279d88f98
 +void vfg_destroy(struct vfg_context *c);
 diff --git a/video/filter/vfx_loader.c b/video/filter/vfx_loader.c
 new file mode 100644
-index 0000000000..96340acddf
+index 0000000000..a32e821296
 --- /dev/null
 +++ b/video/filter/vfx_loader.c
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,256 @@
 +// src/mpv/video/filter/vfx_loader.c
 +// VFX library locator/loader layer, sole implementation (interface in
 +// vfx_loader.h) — a pure move out of vsr_proc.c: search order, log text,
@@ -8199,6 +8213,7 @@ index 0000000000..96340acddf
 +#include <stdlib.h>
 +#include <string.h>
 +#include <unistd.h>
++#include "osdep/threads.h"
 +
 +// ── library handles and symbol table (process-wide singleton) ──────────
 +
@@ -8233,7 +8248,7 @@ index 0000000000..96340acddf
 +        }                                                         \
 +    } while (0)
 +
-+bool vfx_load_libraries(void) {
++static bool vfx_load_libraries_locked(void) {
 +    if (g_vfx_lib) return true;
 +
 +    // Find nvvfx lib directory — try common locations
@@ -8429,6 +8444,15 @@ index 0000000000..96340acddf
 +            ngx_vsr_ver[0] ? ", ngx-vsr=" : "", ngx_vsr_ver);
 +    free(resolved_dir);
 +    return true;
++}
++
++bool vfx_load_libraries(void)
++{
++    static mp_static_mutex lock = MP_STATIC_MUTEX_INITIALIZER;
++    mp_mutex_lock(&lock);
++    bool loaded = vfx_load_libraries_locked();
++    mp_mutex_unlock(&lock);
++    return loaded;
 +}
 +
 +#undef LOAD_SYM

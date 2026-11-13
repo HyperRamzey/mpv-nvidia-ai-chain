@@ -1,43 +1,54 @@
--- vfg-sync.lua -- keep VFG's output cap equal to the current display refresh.
---
--- vfg re-reads max-fps every frame and re-decides the fps=auto multiplier on
--- the next frame, so the cap does not have to be a number baked into ai.conf.
--- That matters because the multiplier is a function of source fps AND refresh:
---
---   24 fps -> x4 =  96      30 fps -> x4 = 120      48 fps -> x3 = 144
---   60 fps -> x2 = 120     120 fps -> 240, nothing fits -> passthrough
---
--- With the cap at the refresh (165 here, but 144/120/60 are one mode switch
--- away) the choice follows the panel instead of a fixed 110 that silently
--- turned 60 fps sources into passthrough.
---
--- No-op unless a filter labelled @vfg exists: plain mpv and the Dolby Vision
--- P5 profiles never have one, and the command simply fails there.
+-- Keep VFG's output cap aligned with the active display refresh rate.
 
-local last
+local FALLBACK_FPS = 60
+local MAX_FPS = 1000
+local last_cap
+local last_chain
 
-local function apply()
+local function current_cap()
     local hz = mp.get_property_number("display-fps", 0)
-    if not hz or hz < 20 then
+    if type(hz) ~= "number" or hz ~= hz or hz < 20 or hz > MAX_FPS then
+        -- Keep auto interpolation bounded when the VO cannot report a mode.
+        return FALLBACK_FPS
+    end
+    return hz
+end
+
+local function apply(force)
+    local cap = current_cap()
+    if not force and cap == last_cap then
         return
     end
-    local cap = math.floor(hz + 0.5)
-    if cap == last then
-        return
-    end
-    -- Returns nil, err when the chain does not exist yet (file not loaded,
-    -- P5 profile, plain mpv); leave `last` unset so the next trigger retries.
-    -- The label is the one from the chain string without its "@" sigil:
-    -- `vf=...,@vfg:vfg:...` is addressed as just "vfg".
+
     local _, err = mp.command_native({
-        "vf-command", "vfg", "max-fps", tostring(cap),
+        "vf-command", "vfg", "max-fps", string.format("%.17g", cap),
     })
     if err == nil then
-        last = cap
+        last_cap = cap
     end
 end
 
-mp.observe_property("display-fps", "number", apply)
--- The chain is rebuilt on file load and whenever a resolution profile flips,
--- which can happen after display-fps was first reported.
-mp.observe_property("vf", "string", apply)
+local function on_filter_change(_, chain)
+    if last_chain ~= nil and chain ~= last_chain then
+        last_cap = nil
+    end
+    last_chain = chain
+    apply()
+end
+
+local function on_display_change()
+    apply()
+end
+
+mp.observe_property("display-fps", "number", on_display_change)
+mp.observe_property("vf", "string", on_filter_change)
+
+mp.register_event("start-file", function()
+    last_cap = nil
+end)
+mp.register_event("file-loaded", function()
+    apply(true)
+end)
+mp.register_event("video-reconfig", function()
+    apply(true)
+end)

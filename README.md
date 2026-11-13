@@ -3,6 +3,10 @@
 Four NVIDIA NGX filters compiled into mpv, plus **DLSS 5 NeuralRender** as an
 in-chain filter, driven by a profile set that picks the right chain per source.
 
+**Experimental:** the new Dolby Vision reconstruction path has not yet been
+validated on an NVIDIA GPU with P5, P8.1 or P7 FEL/MEL samples. The project
+currently targets Linux; Windows gpu-next builds have not been verified.
+
 Built for an Arch / KDE Wayland desktop with an RTX 5070 and a 2560×1440 165 Hz
 panel. Nothing here is Windows-specific; the only Wine dependency is the NR
 helper (NGX feature 18 is D3D12-only on Linux).
@@ -10,21 +14,21 @@ helper (NGX feature 18 is D3D12-only on Linux).
 ```
 nvdec  ->  hwup  ->  [vsr]  ->  truehdr  ->  dlssnr  ->  vfg  ->  gpu-next
            CUDA    4/3      SDR->HDR10   DLSS 5 NR    frame
-           upload  upscale  (passthrough  (2 passes)   generation
+           upload  upscale  (passthrough  (optional)   generation
                              on PQ/HLG)
 ```
 
 Order is load-bearing: **NR runs before frame generation**. A present-stage layer
-cannot do that (it would denoise interpolated frames), which is why NR is a
+cannot do that before interpolation, which is why NR is a
 filter and not a Vulkan layer.
 
 ## What is in here
 
 | Path | What |
 | --- | --- |
-| `vfx-filters.patch` | The whole change: 22 files against mpv `488fec0789e5026804ac8dd03fb749570416d48a` |
+| `vfx-filters.patch` | NVIDIA filters and experimental Dolby Vision reconstruction, based on mpv `fe753a7824` |
 | `PKGBUILD`, `mpv.install`, `find-deps.py` | Arch package that builds mpv + static libplacebo + static FFmpeg + the filters |
-| `ai.conf` | Six auto profiles (resolution band × Dolby Vision P5 state) + `[ai]` |
+| `ai.conf` | Three resolution-based auto profiles + `[ai]` |
 | `scripts/vfg-sync.lua` | Keeps VFG's output cap equal to the current display refresh |
 | `extension/` | Chromium MV3 extension: send a page, link or video to the chain |
 | `native/` | Native messaging host (Python, stdlib only) + installer |
@@ -70,7 +74,7 @@ The patch applies to the pinned mpv commit with zero rejects:
 
 ```sh
 git clone https://github.com/mpv-player/mpv && cd mpv
-git checkout 488fec0789e5026804ac8dd03fb749570416d48a
+git checkout fe753a78246151a2489b472dabcb04f2edd61d50
 patch -Np1 --dry-run -i ../vfx-filters.patch
 ```
 
@@ -111,7 +115,7 @@ install -Dm644 ai.conf               ~/.config/mpv/ai.conf
 install -Dm644 scripts/vfg-sync.lua  ~/.config/mpv/scripts/vfg-sync.lua
 ```
 
-Noise reduction is **off by default** (`dlssnr:passes=0`, a true passthrough —
+DLSS 5 Neural Render is **off by default** (`dlssnr:passes=0`, a true passthrough —
 the filter returns before any CUDA work, so it costs nothing). Enable it by
 changing `passes=0` to `passes=2` in the three `vf=` lines, or for one run:
 
@@ -126,6 +130,8 @@ integer multiplier (2..4) that fits the current mode. On the 165 Hz mode that is
 120 Hz for 60 fps material if the 165 Hz pacing shows. Measured with NR off,
 10 s each, drop = `frame-drop-count`: 1080p60+VSR → 120 fps / 1 drop, 2160p60 →
 120 fps / 0 drops, 1080p48 → 144 fps / 4 drops, 2160p24 → 96 fps / 0 drops.
+Fractional refresh rates are retained. If mpv cannot report the current
+display's rate, the cap falls back to 60 fps rather than guessing the monitor.
 
 Live tuning addresses a filter by its chain label, written without the `@` that
 marks it in `vf=` (`@dlssnr:dlssnr:…` is addressed as `dlssnr`):
@@ -189,29 +195,27 @@ Three things worth knowing:
 | --- | --- |
 | ≤ 1080 | VSR at 4/3 (1080p → 1440p, 720p → 960p) |
 | 1080–1440 | passthrough, no VSR |
-| > 1440 | shader downscale to panel first (`dscale=mitchell`), then the AI filters |
+| > 1440 | no VSR; the VO downscales to the panel |
 
-Every AI filter works at or below panel resolution. `dlssnr:size=panel` latches
-to the display size and only ever shrinks; the model itself sees
-`work_scale × panel`.
+When enabled, `dlssnr:size=panel` shrinks the Neural Render target to at most
+the display size; its model sees `work_scale × target`. With Neural Render
+disabled, the VO handles downscaling.
 
 **Dolby Vision:**
 
 | input | NR | note |
 | --- | --- | --- |
-| P7 (FEL/MEL), P8.1 | runs | EL is knowingly dropped (`no_dovi` + `no_enhancement_layer`) |
-| P5 (IPTPQc2) | never runs | no filters at all — native libplacebo DoVi path |
-| 2160p DV | runs | no VSR; the downscale to panel happens inside the AI filters |
+| P5, P7 (FEL/MEL), P8.1 | optional | experimental DoVi reconstruction to PQ RGB before AI processing |
+| 2160p DV | optional | no VSR; Neural Render and frame generation follow their settings |
 
-P5 is ICtCp, not YCbCr, so *any* filter that round-trips through RGB corrupts it —
-`vsr` and `vfg` as much as `dlssnr`. The three `*-p5` profiles therefore set no
-`vf` and play exactly like plain `mpv`.
+The reconstructed output is HDR PQ RGB, not Dolby Vision passthrough. EL
+composition and scene metadata need validation on real hardware and samples.
 
-**Frame generation:** `vfg:fps=auto:max-fps=110`. VFG only does integer
+**Frame generation:** `vfg:fps=auto`; `vfg-sync.lua` supplies the current
+display refresh as the cap. VFG only does integer
 multipliers, and the right K is a function of source fps *and* panel refresh, so
 the filter picks the largest K in 2..4 that fits under the cap and passes through
-only when none does. The cap is 110, not 165, because the chain's presentation
-ceiling with 2-pass NR is ~96–100 fps.
+only when none does. Processing performance can be lower than display refresh.
 
 ## Measured on the reference machine
 
@@ -230,15 +234,12 @@ The anchor is never replaced, so text and edges keep full resolution.
 
 ## Known issues
 
-1. **Dolby Vision + `hwup,vfg` asserts on exit**: `vo_gpu_next.c:2507 uninit:
-   Assertion p->num_dr_buffers == 0`, so quitting produces a core dump instead of
-   a clean exit. Playback is unaffected; it is VFG-specific and predates
-   `dlssnr`.
-2. **FEL detail is lost when NR runs** on P7 — by design. Use plain `mpv` when
-   FEL matters, or `dlssnr:dovi=skip` to keep FEL and drop NR.
-3. **P5 gets no AI at all.** ICtCp has no correct YCbCr matrix in this chain, so
-   the `*-p5` profiles hand the file to libplacebo untouched. Verified by
-   construction; no P5 sample exists in the local corpus.
+1. **Dolby Vision exit assertion** was previously reported with `hwup,vfg`.
+   The frame destructor now releases the enhancement layer, but the assertion
+   has not been retested on the affected GPU.
+2. **Dolby Vision reconstruction is experimental.** FEL composition, profile 5
+   and dynamic metadata need verification against real sample playback. Use the
+   native mpv/libplacebo path when a verified Dolby Vision picture is required.
 4. **1080p48 with VSR is the stress case** (~310–340 dropped frames / 18 s).
    `dlssnr:passes=1` there restores 144 fps.
 5. **The NR answer buffer is allocated per frame** (14.7 MB `cuMemAlloc`, freed
@@ -272,5 +273,5 @@ The second pass added:
 
 `vfx-filters.patch` modifies mpv and is distributed under the same terms as mpv
 (GPLv2 or later). `PKGBUILD` and the docs are provided as-is, no warranty.
-Dolby Vision handling relies on libplacebo 7.377 with libdovi; NGX itself is
+Dolby Vision handling relies on libplacebo 7.392 with libdovi; NGX itself is
 NVIDIA's, shipped with the driver.
