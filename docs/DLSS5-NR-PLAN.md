@@ -101,7 +101,9 @@ detail 983 vs 88 for a plain bilinear upscale.
 
 ### HDR — the part that matters most
 **NeuralScreen never runs the model in HDR.** The model always receives an SDR 8-bit proxy; only
-the delta comes back, and it is re-expanded by the anchor's own magnitude (`native/hdr_shaders.h`):
+the delta comes back, and it is re-expanded by the anchor's own magnitude (on this side:
+`k_comp` in `video/filter/dlssnr_proc.c`, inside `vfx-filters.patch`; the code below is the
+Windows-side HLSL original it mirrors):
 
 ```hlsl
 // capture encode

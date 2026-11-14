@@ -1,12 +1,13 @@
 pre_install() {
   cat <<'EOF'
-NOTE: mpv-dovi-vfx-git carries four extra filters that are dlopen()-based,
+NOTE: mpv-dovi-vfx-git carries five extra filters that are dlopen()-based,
       not linked into the binary:
 
         hwup     upload CUDA/NVDEC frames to a CUDA device buffer
         vsr      NVIDIA NGX VideoSuperRes (AI upscale)
         truehdr  NVIDIA NGX TrueHDR (SDR -> HDR10)
         vfg      NVIDIA VideoFrameGeneration (frame interpolation)
+        dlssnr   DLSS 5 Neural Render (NGX feature 18, via dlssnr-helper)
 
       They need the NVIDIA VFX SDK runtime. The loader looks for it in
       $HOME/.local/lib/vsr-player and enables the filters when it is present;
@@ -22,16 +23,23 @@ NOTE: mpv-dovi-vfx-git carries four extra filters that are dlopen()-based,
       --hwdec=vulkan the frames cannot be uploaded to CUDA and hwup disables
       the whole chain.
 
-      The Dolby Vision P7 FEL path is unaffected and needs no extra runtime.
+      dlssnr is the one filter that needs a second process: the shared-memory
+      server 'dlssnr-helper' must be running (~/.local/bin/dlssnr-helper start,
+      and a reboot stops it). Without it the NR filter logs and fails open,
+      it does not crash playback.
+
+      The Dolby Vision P7/P8 path is unaffected and needs no extra runtime.
 EOF
 }
 
 pre_upgrade() {
   if pacman -Q mpv-dovi-git >/dev/null 2>&1; then
     cat <<'EOF'
-NOTE: this package replaces mpv-dovi-git. It is the same mpv commit
-      (488fec0789) with the same static libplacebo/FFmpeg DoVi stack, plus the
-      NVIDIA VFX filters. Your ~/.config/mpv/mpv.conf keeps working unchanged.
+NOTE: this package replaces mpv-dovi-git: the same static libplacebo/FFmpeg
+      DoVi stack, plus the NVIDIA VFX filters. mpv and libplacebo are pinned to
+      the exact commits in _mpvcommit/_lpcommit in the PKGBUILD, which is why
+      the version string carries a git hash. Your ~/.config/mpv/mpv.conf keeps
+      working unchanged.
 EOF
   fi
 }
