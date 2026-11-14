@@ -30,8 +30,7 @@ filter and not a Vulkan layer.
 | `PKGBUILD`, `mpv.install`, `find-deps.py` | Arch package that builds mpv + static libplacebo + static FFmpeg + the filters |
 | `ai.conf` | Three resolution-based auto profiles + `[ai]` |
 | `scripts/vfg-sync.lua` | Keeps VFG's output cap equal to the current display refresh |
-| `extension/` | Chromium MV3 extension: send a page, link or video to the chain |
-| `native/` | Native messaging host (Python, stdlib only) + installer |
+| [mpv-ai-extension](https://github.com/HyperRamzey/mpv-ai-extension) | Chromium/Helium MV3 extension + native messaging host (separate repo) |
 | `.github/workflows/` | `ci.yml` (fast gates) and `release.yml` (cold makepkg → GitHub release) |
 | `docs/AI-CHAIN.md` | Operation manual: resolution/DoVi policy, trap list, rebuild |
 | `docs/DLSS5-NR-PLAN.md` | Design of record for the NR filter: constraints, composite, every measured number |
@@ -150,42 +149,19 @@ exec mpv --include="$HOME/.config/mpv/ai.conf" --profile=ai "$@"
 
 ## Browser extension (Chromium / Helium)
 
+The extension and its native messaging host live in
+**[HyperRamzey/mpv-ai-extension](https://github.com/HyperRamzey/mpv-ai-extension)**.
 Click the toolbar icon, press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd>, or
-right-click a page / link / video and pick **Send to mpv**. The browser hands the
-URL to a native host, the host starts `mpv-ai` (or `mpv-nr`, or plain `mpv`)
-detached in its own session, and the AI chain does the rest — YouTube URLs go
-through yt-dlp, which mpv's own `ytdl_hook` already drives.
+right-click a page / link / video and pick **Send to mpv**; the host starts
+`mpv-ai` (or `mpv-nr`, or plain `mpv`) detached and this repository's profile set
+and filters do the rest — YouTube URLs go through yt-dlp, which mpv's own
+`ytdl_hook` already drives.
 
-Install once:
-
-```sh
-# 1. register the host (copies it to ~/.local/share/mpv-ai-extension)
-./native/install_native_host.sh
-
-# 2. load the extension
-#    helium-browser chrome://extensions -> Developer mode -> Load unpacked
-#    -> select the extension/ directory
-```
-
-The manifest embeds an RSA public key, so the extension ID is
-`laaljncfmpifjkegkcolkmifmbdpkece` for everyone — that is what the installer
-writes into `allowed_origins`, and it does not change when the checkout moves.
-Re-run the installer after editing `native/mpv_ai_host.py`; it copies the file
-and then round-trips a `ping` through the installed host to prove it works.
-
-Options (right-click the icon → Options) set the default profile, whether to
-start fullscreen, extra mpv arguments, and a `--ytdl-format`. The right-click
-menu overrides the profile per launch. Feedback is the toolbar badge: `OK` on a
-successful spawn, `!` on failure, with the reason in the service-worker console
-and in `~/.local/state/mpv-ai-extension/launch.log`.
-
-Three things worth knowing:
-
-- The host only accepts `http(s)` URLs and only ever starts one of three fixed
-  programs; there is no shell in the path.
-- Playback is detached: closing the browser or the tab does not stop mpv.
-- `mpv-ai` needs a GPU video output. `--vo=null` with the chain segfaults (the
-  filters require the VO's CUDA context); plain `mpv --vo=null` is fine.
+It works against exactly what this package installs, so the two contracts worth
+remembering across the repo boundary are: the host may only start `mpv-ai`,
+`mpv-nr` or `mpv` from `PATH` (that is what `mpv-ai` / `mpv-nr` here provide),
+and it needs a GPU video output — `--vo=null` with the chain segfaults because
+the filters take the VO's CUDA context.
 
 ## Policy the profile set encodes
 

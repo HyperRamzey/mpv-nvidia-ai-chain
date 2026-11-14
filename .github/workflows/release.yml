@@ -68,21 +68,19 @@ jobs:
           patch -Np1 --dry-run -i "$GITHUB_WORKSPACE/vfx-filters.patch"
           echo "Patch applies cleanly to $(git rev-parse --short HEAD)"
 
+      # Mirrors ci.yml exactly. The extension and the native messaging host (and
+      # the shellcheck gate that covered them) live in
+      # https://github.com/HyperRamzey/mpv-ai-extension now.
       - name: Python helpers compile
         run: |
           set -euo pipefail
-          python3 -m py_compile find-deps.py tools/*.py native/*.py
-
-      - name: Shell scripts parse
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck lua5.1
-          shellcheck -x native/*.sh
+          python3 -m py_compile find-deps.py tools/*.py
 
       - name: Filter and refresh-rate regressions
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.1
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           luac5.1 -p scripts/vfg-sync.lua
           lua5.1 tests/vfg-sync-refresh.lua
