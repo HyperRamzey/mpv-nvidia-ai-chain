@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  MPV_COMMIT: 488fec0789e5026804ac8dd03fb749570416d48a
+  MPV_COMMIT: fe753a78246151a2489b472dabcb04f2edd61d50
 
 jobs:
   validate:
@@ -51,8 +51,15 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
+          sudo apt-get install -y -qq shellcheck lua5.1
           shellcheck -x native/*.sh
+
+      - name: Filter and refresh-rate regressions
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          luac5.1 -p scripts/vfg-sync.lua
+          lua5.1 tests/vfg-sync-refresh.lua
 
       - name: JSON manifests are valid
         run: |
