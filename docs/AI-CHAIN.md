@@ -193,6 +193,35 @@ outputs the input's own format and `params.color` is copied through.
     both look like "10-bit" to the output-side key but unpack differently (MSB-aligned
     vs low-bit), so a format switch that keeps the output depth reused the wrong
     kernel. `dlssnr`'s cache was missing that field; `vsr`/`truehdr`/`vfg` were not.
+20. **Polly plugin flags in CFLAGS make meson report Vulkan as missing.** On a
+    clang host with `USE_POLLY=1`, makepkg adds `-fplugin=/usr/lib/LLVMPolly.so`
+    (and five `-mllvm -polly*` pairs) to CFLAGS. meson classifies `-fplugin=` as
+    a *link* argument and re-emits it inside `-Wl,--start-group/--end-group` in
+    its compile-only feature probes; clang calls that unused, meson compiles
+    probes with `-Werror=unused-command-line-argument`, and libplacebo's new
+    probe dies:
+    `Header "vulkan/vulkan_core.h" has symbol "VK_VERSION_1_4" ... NO` /
+    `Feature vulkan cannot be disabled`. The two halves must be dropped together:
+    `-mllvm -polly*` are registered *by the plugin*, so removing only `-fplugin`
+    fails clang's very first compiler sanity test instead. Measured 2026-11-14:
+    probe NO with the flags, YES without. Only clang has that diagnostic, which
+    is why the gcc container in `release.yml` never sees it. `build()` strips
+    them when it sees `LLVMPolly` in CFLAGS.
+21. **LTO must be off for this package (`options=('!lto')`).** With makepkg's
+    `lto` option and clang, `-flto=thin` lands in CFLAGS and the *static* archives
+    built here contain LLVM IR instead of machine code
+    (`ar x libplacebo.a vulkan_context.c.o && file _` -> `LLVM IR bitcode`).
+    FFmpeg's configure links that archive with gcc, which cannot read LLVM
+    bitcode, and the symbol is simply absent:
+    `mold: error: undefined symbol: pl_vulkan_create` ->
+    `ERROR: libplacebo >= 7.351.0 not found using pkg-config`. Cross-compiler LTO
+    could not work here in principle either: FFmpeg is built by gcc, everything
+    else by clang, and FFmpeg is already forced to `-fno-lto` (see the note in
+    `build()`).
+22. **Do not hand `-flto=thin` to FFmpeg's configure.** configure tests the
+    compiler with makepkg's CFLAGS *before* `--extra-cflags` applies, and it
+    tests with gcc: `cc1: error: unrecognized argument to '-flto=' option: 'thin'`
+    -> `C compiler test failed`. `build()` filters `-flto*` for that one command.
 
 ## 6. Known limits / open items
 
@@ -263,13 +292,26 @@ outputs the input's own format and `params.color` is copied through.
 
 ```sh
 cd ~/ai-video/build/arch
-BUILDDIR=~/ai-video/build/makepkg makepkg -f -e --noprepare --check
-sudo pacman -U mpv-dovi-vfx-git-0.41.0_1275_g488fec0789-6-x86_64.pkg.tar.zst
+BUILDDIR=$PWD/../makepkg SRCDEST=$PWD/../srcdest \
+  makepkg -f -e --noprepare --check --noconfirm
+sudo pacman -U mpv-dovi-vfx-git-*.pkg.tar*
 ```
 
+The artifact is written next to the `PKGBUILD` (`PKGDEST` is unset; this host also
+sets `PKGEXT='.pkg.tar'`, so the suffix is not always `.pkg.tar.zst`).
+
+`SRCDEST` is what keeps the five VCS sources and the two tarballs out of
+`$srcdir`, so a wiped build tree does not re-download 200 MB of mpv history.
+
 `-e` reuses `$srcdir` (keeps the FFmpeg/nasm objects); delete
-`src/libplacebo/build-lp` and `src/mpv/build` for a genuinely clean configure. A
-ccache-warm rebuild is ~65 s on 16 threads.
+`src/libplacebo/build-lp` and `src/mpv/build` for a genuinely clean configure —
+and you *must* after any change to `CFLAGS`/`options`, because meson caches the
+compiler arguments it saw at setup time and a re-`setup` in place does not
+refresh them. A ccache-warm rebuild is ~65 s on 16 threads.
+
+Drop `--noprepare` whenever the patch or a pinned commit changed. `prepare()` is
+`patch -Np1` on a pristine checkout: on an already-patched tree it fails, and
+skipping it on a tree patched against the *old* commit builds the old filters.
 
 `check()` fails the build if the filters are not registered, if libav*/libplacebo
 leak in as shared libs, if libmpv exports static-library symbols, or if the DoVi FEL

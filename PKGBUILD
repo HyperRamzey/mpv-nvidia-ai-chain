@@ -98,7 +98,19 @@ makedepends=(
 provides=('mpv' 'mpv-dovi-git' 'libmpv.so=2-64')
 conflicts=('mpv' 'mpv-git' 'mpv-dovi-git')
 replaces=('mpv-dovi-git')
-options=('!emptydirs')
+# '!lto' is load-bearing, not cosmetic.  With makepkg's lto option on, this
+# host's clang toolchain puts -flto=thin into CFLAGS, and the static archives
+# built here then contain LLVM IR instead of machine code:
+#   ar x libplacebo.a vulkan_context.c.o && file $_
+#   -> LLVM IR bitcode
+# FFmpeg's configure links that archive with gcc, which cannot read LLVM
+# bitcode, and the symbol simply is not there:
+#   mold: error: undefined symbol: pl_vulkan_create
+#   ERROR: libplacebo >= 7.351.0 not found using pkg-config
+# Cross-compiler LTO could not work here even in principle: FFmpeg is built by
+# gcc, everything else by clang, and FFmpeg is already forced to -fno-lto (see
+# build()).  LTO would have to span a gcc/clang boundary in one binary.
+options=('!emptydirs' '!lto')
 install=mpv.install
 
 _ffmpegver=9.0.2
@@ -158,6 +170,79 @@ build() {
   local jobs
 
   jobs=$(nproc)
+
+  # Polly is stripped for this package.  makepkg's USE_POLLY=1 adds
+  #   -fplugin=/usr/lib/LLVMPolly.so -fpass-plugin=/usr/lib/LLVMPolly.so
+  #   -mllvm -polly  -mllvm -polly-vectorizer=...  (four more -mllvm pairs)
+  # to CFLAGS.  meson classifies -fplugin= as a *link* argument, so it re-emits
+  # it inside -Wl,--start-group/--end-group in its compile-only feature probes;
+  # clang calls that unused, meson builds probes with
+  # -Werror=unused-command-line-argument, and the probe dies:
+  #   Header "vulkan/vulkan_core.h" has symbol "VK_VERSION_1_4" ... NO
+  #   Feature vulkan cannot be disabled
+  # Measured 2026-11-14 on this host: libplacebo 58dfee73 meson setup exits 1
+  # with those flags and configures clean without them.
+  #
+  # The two halves must go together: -mllvm -polly* are registered *by the
+  # plugin*, so dropping only -fplugin makes clang fail its very first compiler
+  # sanity test ("Unknown command line argument '-polly-vectorizer=stripmine'").
+  #
+  # -Wunused-command-line-argument is a clang-only diagnostic, which is why the
+  # gcc container used by .github/workflows/release.yml never hits this.
+  _strip_polly() {
+    local -a in out=()
+    local i
+    read -r -a in <<<"$1"
+    for ((i = 0; i < ${#in[@]}; i++)); do
+      case "${in[i]}" in
+        -fplugin=*LLVMPolly* | -fpass-plugin=*LLVMPolly*) continue ;;
+        -mllvm)
+          # -mllvm takes one argument; drop the pair only when it is a Polly
+          # option, anything else stays exactly where it was
+          if [[ "${in[i + 1]:-}" == -polly* ]]; then
+            i=$((i + 1))
+            continue
+          fi
+          ;;
+      esac
+      out+=("${in[i]}")
+    done
+    printf '%s' "${out[*]}"
+  }
+
+  if [[ "$CFLAGS$CXXFLAGS" == *LLVMPolly* ]]; then
+    msg 'Polly plugin flags detected in CFLAGS - removing them (see comment in build())'
+    CFLAGS=$(_strip_polly "$CFLAGS")
+    CXXFLAGS=$(_strip_polly "$CXXFLAGS")
+    export CFLAGS CXXFLAGS
+    [[ "$CFLAGS" == *LLVMPolly* || "$CFLAGS" == *'-mllvm -polly'* ]] && {
+      error 'Polly flags survived the strip'
+      return 1
+    }
+  fi
+
+  # Same story, other half of the toolchain.  FFmpeg's configure tests the
+  # compiler with makepkg's CFLAGS *before* --extra-cflags is in play, and it
+  # tests them with gcc, so the clang-flavoured LTO flag this host puts in
+  # CFLAGS kills it outright:
+  #   gcc ... -flto=thin ... -c test.c
+  #   cc1: error: unrecognized argument to '-flto=' option: 'thin'
+  #   C compiler test failed.
+  # '-flto=thin' is a clang spelling; gcc only knows auto/jog/fat/thin-less
+  # -flto.  FFmpeg is compiled with LTO off here anyway (--extra-cflags=-fno-lto
+  # below, added because the LTO partitioner drops the mul15_hi/mask24* constants
+  # that rgb2rgb.c only references from inline asm), so removing it for this one
+  # step costs nothing and lets the configure test run.
+  _strip_lto() {
+    local -a in out=()
+    local f
+    read -r -a in <<<"$1"
+    for f in "${in[@]}"; do
+      [[ "$f" == -flto* ]] && continue
+      out+=("$f")
+    done
+    printf '%s' "${out[*]}"
+  }
 
   # No -Dprefer_static=true for the system libraries.  It made meson resolve
   # every dependency with `pkg-config --static`, so each library's
@@ -234,7 +319,9 @@ build() {
   # -fno-lto is required: libswscale/x86/rgb2rgb.c defines constants that are
   # only referenced from inline asm constraints.  With makepkg's -flto=auto the
   # LTO partitioner drops them and the final mpv link fails on mul15_hi/mask24*.
-  ./configure \
+  #
+  # configure itself must not see any -flto flag at all (see _strip_lto above).
+  CFLAGS=$(_strip_lto "$CFLAGS") ./configure \
     --prefix="$prefix" \
     --disable-shared \
     --enable-static \
