@@ -21,6 +21,26 @@ local PROFILES = { "faithful", "natural", "cinematic", "extreme" }
 local SCALES   = { 0.25, 0.50, 0.65, 0.75, 1.00 }
 local SKINS    = { -1.0, 0.0, 0.5, 1.0, 1.5, 2.0 }
 
+local PROFILE_DEFS = {
+    faithful  = { style = 0, intensity = 0.70, localtone = 0.25, localstructure = 0.75, skin = -1.0, automask = 1, sharpness = 0.0 },
+    natural   = { style = 1, intensity = 1.00, localtone = 0.50, localstructure = 1.00, skin = -1.0, automask = 1, sharpness = 0.0 },
+    cinematic = { style = 2, intensity = 1.00, localtone = 0.90, localstructure = 1.50, skin =  1.0, automask = 1, sharpness = 0.0 },
+    extreme   = { style = 2, intensity = 1.00, localtone = 1.50, localstructure = 1.50, skin =  1.5, automask = 1, sharpness = 0.0 },
+}
+
+local seek_timer = nil
+local function refresh_if_paused()
+    if mp.get_property_bool("pause") then
+        if seek_timer then seek_timer:kill() end
+        seek_timer = mp.add_timeout(0.03, function()
+            seek_timer = nil
+            if mp.get_property_bool("pause") then
+                mp.commandv("seek", "0", "relative+exact")
+            end
+        end)
+    end
+end
+
 local state = {
     profile        = "cinematic",
     work_scale     = 0.50,
@@ -162,6 +182,7 @@ local function enable(passes_target)
             end
         end)
         osd(string.format("DLSS 5 NR: ON (%d pass%s)", current_passes, current_passes > 1 and "es" or ""))
+        refresh_if_paused()
         return
     end
 
@@ -185,6 +206,7 @@ local function enable(passes_target)
             sync_all_settings()
             busy = false
             osd(string.format("DLSS 5 NR: ON (%d pass%s)", current_passes, current_passes > 1 and "es" or ""))
+            refresh_if_paused()
         end)
     end)
 end
@@ -203,6 +225,7 @@ local function disable()
     local others = other_users()
     if was_on and others == 0 then
         osd("DLSS 5 NR: OFF")
+        refresh_if_paused()
         helper("stop", {}, function()
             busy = false
         end)
@@ -213,6 +236,7 @@ local function disable()
         else
             osd("DLSS 5 NR: OFF")
         end
+        refresh_if_paused()
     end
 end
 
@@ -234,6 +258,28 @@ local function cycle_passes()
     end
 end
 
+local function set_profile(name)
+    local n = (name or ""):lower()
+    local def = PROFILE_DEFS[n]
+    if not def then
+        osd("Unknown profile: " .. tostring(name), 2)
+        return
+    end
+    state.profile = n
+    state.style = def.style
+    state.intensity = def.intensity
+    state.localtone = def.localtone
+    state.localstructure = def.localstructure
+    state.skin = def.skin
+    state.sharpness = def.sharpness
+    state.automask = def.automask
+    if nr_on then
+        send_dlssnr("profile", state.profile)
+    end
+    osd(string.format("DLSS 5 Profile: %s", state.profile:upper()))
+    refresh_if_paused()
+end
+
 local function cycle_profile()
     local idx = 1
     for i, name in ipairs(PROFILES) do
@@ -243,11 +289,7 @@ local function cycle_profile()
         end
     end
     idx = (idx % #PROFILES) + 1
-    state.profile = PROFILES[idx]
-    if nr_on then
-        send_dlssnr("profile", state.profile)
-    end
-    osd(string.format("DLSS 5 Profile: %s", state.profile:upper()))
+    set_profile(PROFILES[idx])
 end
 
 local function adjust_work_scale(dir)
@@ -265,6 +307,7 @@ local function adjust_work_scale(dir)
     end
     local label = state.work_scale == 1.0 and "100% (Native)" or string.format("%d%% (Boost)", math.floor(state.work_scale * 100))
     osd(string.format("DLSS 5 Working Scale: %s", label))
+    refresh_if_paused()
 end
 
 local function adjust_intensity(delta)
@@ -273,6 +316,7 @@ local function adjust_intensity(delta)
         send_dlssnr("intensity", state.intensity)
     end
     osd(string.format("DLSS 5 Intensity: %.2f", state.intensity))
+    refresh_if_paused()
 end
 
 local function adjust_localtone(delta)
@@ -281,6 +325,7 @@ local function adjust_localtone(delta)
         send_dlssnr("localtone", state.localtone)
     end
     osd(string.format("DLSS 5 Local Tone: %.2f", state.localtone))
+    refresh_if_paused()
 end
 
 local function adjust_localstructure(delta)
@@ -289,6 +334,7 @@ local function adjust_localstructure(delta)
         send_dlssnr("localstructure", state.localstructure)
     end
     osd(string.format("DLSS 5 Local Structure: %.2f", state.localstructure))
+    refresh_if_paused()
 end
 
 local function adjust_sharpness(delta)
@@ -297,6 +343,7 @@ local function adjust_sharpness(delta)
         send_dlssnr("sharpness", state.sharpness)
     end
     osd(string.format("DLSS 5 Sharpness: %.2f", state.sharpness))
+    refresh_if_paused()
 end
 
 local function cycle_skin()
@@ -314,6 +361,7 @@ local function cycle_skin()
     end
     local label = state.skin < 0 and "Off" or string.format("%.1f", state.skin)
     osd(string.format("DLSS 5 Skin Protection: %s", label))
+    refresh_if_paused()
 end
 
 local function toggle_automask()
@@ -322,6 +370,7 @@ local function toggle_automask()
         send_dlssnr("automask", state.automask)
     end
     osd(string.format("DLSS 5 AutoMask (UI/Text): %s", state.automask == 1 and "ON" or "OFF"))
+    refresh_if_paused()
 end
 
 local function toggle_vfg()
@@ -332,6 +381,7 @@ local function toggle_vfg()
     end
     mp.command_native_async({ "vf-command", "vfg", "fps", state.vfg })
     osd(string.format("DLSS Frame Gen (VFG): %s", state.vfg:upper()))
+    refresh_if_paused()
 end
 
 local function show_status()
@@ -425,6 +475,63 @@ mp.add_key_binding(nil, "dlssnr-skin-cycle", cycle_skin)
 mp.add_key_binding(nil, "dlssnr-automask-toggle", toggle_automask)
 mp.add_key_binding(nil, "vfg-toggle", toggle_vfg)
 mp.add_key_binding(nil, "dlssnr-status", show_status)
+
+-- Script messages (console support)
+mp.register_script_message("dlssnr", function(cmd, arg1, arg2)
+    cmd = (cmd or ""):lower()
+    if cmd == "toggle" then
+        toggle()
+    elseif cmd == "on" then
+        enable(tonumber(arg1) or 2)
+    elseif cmd == "off" then
+        disable()
+    elseif cmd == "profile" or cmd == "preset" then
+        if arg1 and arg1 ~= "" then
+            set_profile(arg1)
+        else
+            cycle_profile()
+        end
+    elseif cmd == "passes" then
+        local p = tonumber(arg1)
+        if p and p > 0 then
+            enable(p)
+        else
+            disable()
+        end
+    elseif cmd == "scale" or cmd == "work_scale" then
+        local s = tonumber(arg1)
+        if s then
+            state.work_scale = s
+            if nr_on then send_dlssnr("work_scale", s) end
+            osd(string.format("DLSS 5 Work Scale: %.2f", s))
+            refresh_if_paused()
+        end
+    elseif cmd == "intensity" then
+        local v = tonumber(arg1)
+        if v then
+            state.intensity = v
+            if nr_on then send_dlssnr("intensity", v) end
+            osd(string.format("DLSS 5 Intensity: %.2f", v))
+            refresh_if_paused()
+        end
+    elseif cmd == "status" or cmd == "info" then
+        show_status()
+    elseif cmd == "refresh" then
+        refresh_if_paused()
+    else
+        osd("dlssnr commands: toggle, on, off, profile <name>, scale <0.25..1.0>, status", 4)
+    end
+end)
+
+mp.register_script_message("dlssnr-toggle", toggle)
+mp.register_script_message("dlssnr-on", function(p) enable(tonumber(p) or 1) end)
+mp.register_script_message("dlssnr-on-2pass", function() enable(2) end)
+mp.register_script_message("dlssnr-off", disable)
+mp.register_script_message("dlssnr-profile", set_profile)
+mp.register_script_message("dlssnr-profile-cycle", cycle_profile)
+mp.register_script_message("dlssnr-status", show_status)
+mp.register_script_message("vfg-toggle", toggle_vfg)
+mp.register_script_message("refresh", refresh_if_paused)
 
 -- Default direct hotkeys
 mp.add_key_binding("Ctrl+Alt+n", "dlssnr-on-default", function() enable(1) end)

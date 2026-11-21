@@ -168,6 +168,30 @@ vf-command vfg fps 3
 vf-command vfg max-fps 120
 ```
 
+### Console Commands (`~` interactive console)
+
+Settings can be changed live from mpv's interactive console (both while playing and while paused; paused frames update immediately):
+
+```sh
+# Via script-message (recommended, auto-refreshes paused frames):
+script-message dlssnr toggle
+script-message dlssnr profile cinematic   # faithful, natural, cinematic, extreme
+script-message dlssnr preset natural      # synonym for profile
+script-message dlssnr scale 0.75          # 0.25 .. 1.00
+script-message dlssnr passes 2            # 0 (off), 1, 2
+script-message dlssnr intensity 0.85
+script-message dlssnr status
+
+# Direct vf-command (addressed to @dlssnr in chain):
+vf-command dlssnr profile cinematic
+vf-command dlssnr preset natural
+vf-command dlssnr scale 0.75
+vf-command dlssnr passes 1
+vf-command dlssnr on
+vf-command dlssnr off
+vf-command dlssnr status
+```
+
 `mpv-ai` is one line:
 
 ```sh

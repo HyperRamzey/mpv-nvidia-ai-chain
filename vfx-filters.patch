@@ -1724,7 +1724,7 @@ new file mode 100644
 index 0000000000..9ece0fcca4
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1764 @@
+@@ -0,0 +1,1879 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -2959,6 +2959,12 @@ index 0000000000..9ece0fcca4
 +
 +    p->frame_count++;
 +
++    if (p->opts->passes > 0 && !p->helper_spawned) {
++        p->helper_dead = false;
++        p->fail_count = 0;
++        helper_spawn(f, p);
++    }
++
 +    if (!ensure_cuda(f, p, mpi)) {
 +        mp_pin_in_write(f->ppins[1], frame);
 +        return;
@@ -3169,7 +3175,7 @@ index 0000000000..9ece0fcca4
 +        if (p->fail_count == 1 || p->opts->verbose)
 +            MP_WARN(f, "dlssnr: frame %lld not denoised (falling back to the "
 +                       "source frame)\n", (long long)p->frame_count);
-+        if (p->fail_count >= 3 && !p->helper_dead) {
++        if (p->fail_count >= 60 && !p->helper_dead) {
 +            p->helper_dead = true;
 +            MP_ERR(f, "dlssnr: %lld failed frames in a row -- NR disabled for "
 +                      "this file. Start the helper again (dlssnr-helper "
@@ -3292,83 +3298,192 @@ index 0000000000..9ece0fcca4
 +// "vf-command dlssnr profile cinematic" is what the docs show; only the
 +// numeric form used to work because the argument was parsed as a double
 +// before the command name was looked at.
++static const char *const dlssnr_profile_names[] = {
++    [PROFILE_FAITHFUL]  = "faithful",
++    [PROFILE_NATURAL]   = "natural",
++    [PROFILE_CINEMATIC] = "cinematic",
++    [PROFILE_EXTREME]   = "extreme",
++    [PROFILE_CUSTOM]    = "custom",
++};
++
++static const char *profile_to_name(int pr)
++{
++    if (pr >= 0 && pr < MP_ARRAY_SIZE(dlssnr_profile_names) && dlssnr_profile_names[pr])
++        return dlssnr_profile_names[pr];
++    return "unknown";
++}
++
 +static int profile_from_name(const char *s)
 +{
-+    static const char *const names[] = {
-+        [PROFILE_FAITHFUL]  = "faithful",
-+        [PROFILE_NATURAL]   = "natural",
-+        [PROFILE_CINEMATIC] = "cinematic",
-+        [PROFILE_EXTREME]   = "extreme",
-+        [PROFILE_CUSTOM]    = "custom",
-+    };
-+    for (int i = 0; i < MP_ARRAY_SIZE(names); i++) {
-+        if (names[i] && !strcmp(s, names[i]))
++    if (!s)
++        return -1;
++    while (*s == ' ' || *s == '\t' || *s == '"' || *s == '\'')
++        s++;
++    char buf[64];
++    snprintf(buf, sizeof(buf), "%s", s);
++    char *end = buf + strlen(buf) - 1;
++    while (end >= buf && (*end == ' ' || *end == '\t' || *end == '"' || *end == '\''))
++        *end-- = '\0';
++
++    if (!buf[0])
++        return -1;
++
++    // Accept numeric 0..3
++    if (buf[1] == '\0' && buf[0] >= '0' && buf[0] <= '3')
++        return buf[0] - '0';
++
++    for (int i = 0; i < MP_ARRAY_SIZE(dlssnr_profile_names); i++) {
++        if (dlssnr_profile_names[i] && !strcasecmp(buf, dlssnr_profile_names[i]))
 +            return i;
 +    }
++    if (!strcasecmp(buf, "strong"))    return PROFILE_CINEMATIC;
++    if (!strcasecmp(buf, "overdrive")) return PROFILE_EXTREME;
++    if (!strcasecmp(buf, "default"))   return PROFILE_CINEMATIC;
++
 +    return -1;
++}
++
++static void apply_profile(struct mp_filter *f, struct priv *p, int pr)
++{
++    p->opts->profile = pr;
++    // Clear fine-tuning overrides so the profile defaults are active
++    p->opts->intensity      = DLSSNR_SENTINEL;
++    p->opts->localtone      = DLSSNR_SENTINEL;
++    p->opts->localstructure = DLSSNR_SENTINEL;
++    p->opts->skin           = DLSSNR_SENTINEL;
++    p->opts->sharpness      = DLSSNR_SENTINEL;
++    p->opts->automask       = -1;
++    p->opts->style          = -1000;
++
++    resolve_config(p->opts, p->pass);
++    p->cfg_hash = cfg_hash_of(p->opts);
++    if (p->shm)
++        shm_write_config(p, p->cfg_hash);
++
++    MP_INFO(f, "dlssnr: profile = %s (style=%u, int=%.2f, tone=%.2f, struct=%.2f, skin=%.1f)\n",
++            profile_to_name(pr), p->pass[0].style, p->pass[0].intensity,
++            p->pass[0].localtone, p->pass[0].localstructure, p->pass[0].skin);
 +}
 +
 +static bool dlssnr_command(struct mp_filter *f, struct mp_filter_command *cmd)
 +{
 +    struct priv *p = f->priv;
++    const char *c = cmd->cmd;
++    const char *a = cmd->arg;
 +
-+    if (!cmd->arg)
++    if (!c)
 +        return false;
 +
-+    const char *c = cmd->cmd;
++    // Parameterless commands
++    if (!strcmp(c, "status") || !strcmp(c, "info")) {
++        MP_INFO(f, "dlssnr status: passes=%d profile=%s work_scale=%.2f intensity=%.2f localtone=%.2f structure=%.2f skin=%.1f sharpness=%.2f automask=%d\n",
++                p->opts->passes, profile_to_name(p->opts->profile), p->opts->work_scale,
++                p->pass[0].intensity, p->pass[0].localtone, p->pass[0].localstructure,
++                p->pass[0].skin, p->pass[0].sharpness, p->pass[0].automask);
++        return true;
++    }
++    if (!strcmp(c, "toggle")) {
++        p->opts->passes = (p->opts->passes > 0) ? 0 : 2;
++        if (p->opts->passes > 0) {
++            p->helper_dead = false;
++            p->fail_count = 0;
++            helper_spawn(f, p);
++        }
++        MP_INFO(f, "dlssnr: toggle -> passes = %d\n", p->opts->passes);
++        return true;
++    }
++    if (!strcmp(c, "on")) {
++        p->opts->passes = (a && atoi(a) > 0) ? atoi(a) : 2;
++        p->helper_dead = false;
++        p->fail_count = 0;
++        helper_spawn(f, p);
++        MP_INFO(f, "dlssnr: on -> passes = %d\n", p->opts->passes);
++        return true;
++    }
++    if (!strcmp(c, "off")) {
++        p->opts->passes = 0;
++        MP_INFO(f, "dlssnr: off -> passes = 0\n");
++        return true;
++    }
++
++    if (!a || !*a)
++        return false;
++
++    // Check profile / preset (both named strings and numeric)
++    if (!strcmp(c, "profile") || !strcmp(c, "preset")) {
++        int pr = profile_from_name(a);
++        if (pr < 0) {
++            char *end = NULL;
++            double v = strtod(a, &end);
++            if (end != a && *end == '\0') {
++                pr = (int)v;
++                if (pr < 0 || pr > PROFILE_EXTREME)
++                    return false;
++            } else {
++                return false;
++            }
++        }
++        apply_profile(f, p, pr);
++        return true;
++    }
++
++    if (!strcmp(c, "automask") || !strcmp(c, "auto_mask") || !strcmp(c, "mask")) {
++        if (!strcasecmp(a, "on") || !strcasecmp(a, "yes") || !strcasecmp(a, "true") || !strcmp(a, "1"))
++            p->opts->automask = 1;
++        else if (!strcasecmp(a, "off") || !strcasecmp(a, "no") || !strcasecmp(a, "false") || !strcmp(a, "0"))
++            p->opts->automask = 0;
++        else
++            p->opts->automask = strtod(a, NULL) != 0;
++        resolve_config(p->opts, p->pass);
++        p->cfg_hash = cfg_hash_of(p->opts);
++        if (p->shm)
++            shm_write_config(p, p->cfg_hash);
++        MP_INFO(f, "dlssnr: automask = %d\n", p->opts->automask);
++        return true;
++    }
 +
 +    char *end = NULL;
-+    double v = strtod(cmd->arg, &end);
-+    if (end == cmd->arg || *end) {
-+        if (!strcmp(c, "profile")) {
-+            int pr = profile_from_name(cmd->arg);
-+            if (pr < 0)
-+                return false;
-+            p->opts->profile = pr;
-+            MP_INFO(f, "dlssnr: profile = %s\n", cmd->arg);
-+            return true;
-+        }
++    double v = strtod(a, &end);
++    if (end == a || *end)
 +        return false;
-+    }
 +
 +    if (!strcmp(c, "passes")) {
 +        p->opts->passes = v < 0 ? 0 : (v > DLSSNR_MAX_PASSES ? DLSSNR_MAX_PASSES : (int)v);
-+        // ai.conf creates the filter with passes=0 and turns it on from here,
-+        // so this is where the helper has to be started (no-op once running
-+        // or with spawn=0).
-+        if (p->opts->passes > 0)
++        if (p->opts->passes > 0) {
++            p->helper_dead = false;
++            p->fail_count = 0;
 +            helper_spawn(f, p);
-+    }
-+    else if (!strcmp(c, "intensity"))
++        }
++    } else if (!strcmp(c, "intensity")) {
 +        p->opts->intensity = clampf(v, 0.0f, 1.0f);
-+    else if (!strcmp(c, "localtone"))
++    } else if (!strcmp(c, "localtone") || !strcmp(c, "local_tone") || !strcmp(c, "tone")) {
 +        p->opts->localtone = clampf(v, 0.0f, 2.0f);
-+    else if (!strcmp(c, "localstructure"))
++    } else if (!strcmp(c, "localstructure") || !strcmp(c, "local_structure") || !strcmp(c, "structure")) {
 +        p->opts->localstructure = clampf(v, 0.0f, 2.0f);
-+    else if (!strcmp(c, "skin"))
++    } else if (!strcmp(c, "skin") || !strcmp(c, "skin_structure")) {
 +        p->opts->skin = clampf(v, -1.0f, 2.5f);
-+    else if (!strcmp(c, "sharpness"))
++    } else if (!strcmp(c, "sharpness")) {
 +        p->opts->sharpness = clampf(v, 0.0f, 1.0f);
-+    else if (!strcmp(c, "style"))
++    } else if (!strcmp(c, "style")) {
 +        p->opts->style = v < 0 ? 0 : (v > 2 ? 2 : (int)v);
-+    else if (!strcmp(c, "automask"))
-+        p->opts->automask = v != 0;
-+    else if (!strcmp(c, "preset"))
-+        p->opts->preset = v < 0 ? 0 : (int)v;
-+    else if (!strcmp(c, "profile"))
-+        p->opts->profile = v < 0 ? 0 : (v > PROFILE_EXTREME ? PROFILE_EXTREME : (int)v);
-+    else if (!strcmp(c, "work-scale") || !strcmp(c, "work_scale"))
++    } else if (!strcmp(c, "work-scale") || !strcmp(c, "work_scale") || !strcmp(c, "scale")) {
 +        p->opts->work_scale = clampf(v, 0.25f, 1.0f);
-+    else if (!strcmp(c, "detail"))
++    } else if (!strcmp(c, "detail")) {
 +        p->opts->detail = clampf(v, 0.0f, 4.0f);
-+    else if (!strcmp(c, "guard"))
++    } else if (!strcmp(c, "guard")) {
 +        p->opts->guard = clampf(v, 0.0f, 1.0f);
-+    else if (!strcmp(c, "blackgate"))
++    } else if (!strcmp(c, "blackgate")) {
 +        p->opts->blackgate = clampf(v, 0.0f, 64.0f);
-+    else if (!strcmp(c, "sdr16"))
++    } else if (!strcmp(c, "sdr16")) {
 +        p->opts->sdr16 = v < 0 ? -1 : (v != 0);
-+    else
++    } else {
 +        return false;
++    }
++
++    resolve_config(p->opts, p->pass);
++    p->cfg_hash = cfg_hash_of(p->opts);
++    if (p->shm)
++        shm_write_config(p, p->cfg_hash);
 +
 +    MP_INFO(f, "dlssnr: %s = %g\n", c, v);
 +    return true;
