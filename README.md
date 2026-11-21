@@ -29,7 +29,7 @@ filter and not a Vulkan layer.
 | `vfx-filters.patch` | NVIDIA filters and experimental Dolby Vision reconstruction, based on mpv `7f505de186` |
 | `PKGBUILD`, `mpv.install`, `find-deps.py` | Arch package that builds mpv + static libplacebo + static FFmpeg + the filters |
 | `ai.conf` | Three resolution-based auto profiles + `[ai]` |
-| `input.conf` | NeuralScreen-style keybindings for all DLSS 5 & VFX settings |
+| `input.conf` | NeuralScreen-style keybindings for all DLSS 5 & VFX settings (60% keyboard layout) |
 | `scripts/vfg-sync.lua` | Keeps VFG's output cap equal to the current display refresh |
 | `scripts/nr-toggle.lua` | Controller for DLSS 5 NR lifecycle, passes, profiles, and OSD HUD |
 | [mpv-ai-extension](https://github.com/HyperRamzey/mpv-ai-extension) | Chromium/Helium MV3 extension + native messaging host (separate repo) |
@@ -109,12 +109,37 @@ mpv-nr movie.mkv        # VSR denoiser at 1:1 only
 mpv movie.mkv           # untouched player, Dolby Vision as before
 ```
 
-Install the config and the refresh script once:
+Install the configs and helper scripts:
 
 ```sh
 install -Dm644 ai.conf               ~/.config/mpv/ai.conf
+install -Dm644 input.conf            ~/.config/mpv/input.conf
 install -Dm644 scripts/vfg-sync.lua  ~/.config/mpv/scripts/vfg-sync.lua
+install -Dm644 scripts/nr-toggle.lua ~/.config/mpv/scripts/nr-toggle.lua
 ```
+
+### 60% Keyboard Controls (No Numpad Required)
+
+All shortcuts use standard alphanumeric keys with `Ctrl+Alt+...` or `Ctrl+Alt+Shift+...`, accommodating 60% keyboards without dedicated numpads or navigation clusters:
+
+| Shortcut | Action | Description |
+| --- | --- | --- |
+| `Ctrl+Alt+n` | `dlssnr-toggle` | Toggle DLSS 5 Neural Render on / off |
+| `Ctrl+Alt+1` | `dlssnr-on` | Enable DLSS 5 NR with 1 pass |
+| `Ctrl+Alt+2` | `dlssnr-on-2pass` | Enable DLSS 5 NR with 2 passes (high quality) |
+| `Ctrl+Alt+c` | `dlssnr-passes-cycle` | Cycle passes (1 pass ↔ 2 passes) |
+| `Ctrl+Alt+0` | `dlssnr-off` | Turn off DLSS 5 NR |
+| `Ctrl+Alt+Shift+n` | `dlssnr-off` | Turn off DLSS 5 NR & stop helper process |
+| `Ctrl+Alt+p` | `dlssnr-profile-cycle` | Cycle profiles (`faithful` → `natural` → `cinematic` → `extreme`) |
+| `Ctrl+Alt+]` / `[` | `dlssnr-scale-up/down` | Adjust work scale / boost (25% → 50% → 65% → 75% → 100%) |
+| `Ctrl+Alt+i` / `Shift+i` | `dlssnr-intensity` | Denoising intensity (±0.05) |
+| `Ctrl+Alt+t` / `Shift+t` | `dlssnr-localtone` | Local tone / shadow contrast (±0.10) |
+| `Ctrl+Alt+e` / `Shift+e` | `dlssnr-localstructure` | Local structure / detail retention (±0.10) |
+| `Ctrl+Alt+s` / `Shift+s` | `dlssnr-sharpness` | Neural sharpness (±0.10) |
+| `Ctrl+Alt+k` | `dlssnr-skin-cycle` | Cycle skin protection level (-1.0 off, 0.0 .. 2.0) |
+| `Ctrl+Alt+m` | `dlssnr-automask-toggle` | Toggle UI & text protection auto-mask |
+| `Ctrl+Alt+f` | `vfg-toggle` | Toggle Frame Generation (VFG auto / off) |
+| `Ctrl+Alt+d` | `dlssnr-status` | Display DLSS 5 live OSD status dashboard |
 
 DLSS 5 Neural Render is **off by default** (`dlssnr:passes=0`, a true passthrough —
 the filter returns before any CUDA work, so it costs nothing). Enable it by
