@@ -12,10 +12,10 @@ panel. Nothing here is Windows-specific; the only Wine dependency is the NR
 helper (NGX feature 18 is D3D12-only on Linux).
 
 ```
-nvdec  ->  hwup  ->  [vsr]  ->  truehdr  ->  dlssnr  ->  vfg  ->  gpu-next
-           CUDA    4/3      SDR->HDR10   DLSS 5 NR    frame
-           upload  upscale  (passthrough  (optional)   generation
-                             on PQ/HLG)
+nvdec  ->  hwup  ->  dlssnr   ->  [vsr]   ->  truehdr  ->  vfg   ->  gpu-next
+           CUDA      DLSS 5 NR    4/3         SDR->HDR10   frame
+           upload    (optional)   upscale     (passthrough generation
+                                               on PQ/HLG)
 ```
 
 Order is load-bearing: **NR runs before frame generation**. A present-stage layer
@@ -26,10 +26,12 @@ filter and not a Vulkan layer.
 
 | Path | What |
 | --- | --- |
-| `vfx-filters.patch` | NVIDIA filters and experimental Dolby Vision reconstruction, based on mpv `fe753a7824` |
+| `vfx-filters.patch` | NVIDIA filters and experimental Dolby Vision reconstruction, based on mpv `7f505de186` |
 | `PKGBUILD`, `mpv.install`, `find-deps.py` | Arch package that builds mpv + static libplacebo + static FFmpeg + the filters |
 | `ai.conf` | Three resolution-based auto profiles + `[ai]` |
+| `input.conf` | NeuralScreen-style keybindings for all DLSS 5 & VFX settings |
 | `scripts/vfg-sync.lua` | Keeps VFG's output cap equal to the current display refresh |
+| `scripts/nr-toggle.lua` | Controller for DLSS 5 NR lifecycle, passes, profiles, and OSD HUD |
 | [mpv-ai-extension](https://github.com/HyperRamzey/mpv-ai-extension) | Chromium/Helium MV3 extension + native messaging host (separate repo) |
 | `.github/workflows/` | `ci.yml` (fast gates) and `release.yml` (cold makepkg → GitHub release) |
 | `docs/AI-CHAIN.md` | Operation manual: resolution/DoVi policy, trap list, rebuild |
@@ -73,7 +75,7 @@ The patch applies to the pinned mpv commit with zero rejects:
 
 ```sh
 git clone https://github.com/mpv-player/mpv && cd mpv
-git checkout fe753a78246151a2489b472dabcb04f2edd61d50
+git checkout 7f505de186ddcaeff6dabf48db79c9b8f8adc309
 patch -Np1 --dry-run -i ../vfx-filters.patch
 ```
 

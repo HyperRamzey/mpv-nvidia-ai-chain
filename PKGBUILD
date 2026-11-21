@@ -27,7 +27,7 @@
 # libnvrtc.so.13 from the 'cuda' package (auto-detected into depends below).
 
 pkgname=mpv-dovi-vfx-git
-pkgver=0.42.0_39_gfe753a7824
+pkgver=0.42.0_200_g7f505de186
 pkgrel=1
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
@@ -113,10 +113,10 @@ replaces=('mpv-dovi-git')
 options=('!emptydirs' '!lto')
 install=mpv.install
 
-_ffmpegver=9.0.2
+_ffmpegver=9.1
 _nasmver=2.16.03
-_mpvcommit=fe753a78246151a2489b472dabcb04f2edd61d50
-_lpcommit=58dfee73db8139d825306b638c844f6908517164
+_mpvcommit=7f505de186ddcaeff6dabf48db79c9b8f8adc309
+_lpcommit=89b04663135b7ee309ef58d1f8997550e98fd9bf
 
 source=(
   "git+https://github.com/mpv-player/mpv#commit=${_mpvcommit}"
@@ -132,7 +132,7 @@ source=(
 sha256sums=(
   'SKIP'
   'SKIP'
-  '8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e'
+  '1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433'
   '1412a1c760bbd05db026b6c0d1657affd6631cd0a63cddb6f73cc6d4aa616148'
   'SKIP'
   'SKIP'

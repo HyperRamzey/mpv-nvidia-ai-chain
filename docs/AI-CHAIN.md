@@ -25,13 +25,13 @@ traps.
 | Old player backup | `~/ai-video/build/backup-mpv-dovi-git/` (binary + libmpv + headers) |
 | Patch (22 files, 8581 lines) | `~/ai-video/build/arch/vfx-filters.patch`, sha256 `8e487d9f…b7a2` |
 
-Pins: mpv `488fec0789e5026804ac8dd03fb749570416d48a`, libplacebo
-`13d0b79827ea1671f991ca57700e5356af9731a5` (PL_API_VER 377, libdovi), FFmpeg static
-9.0.2, nv-codec-headers, nasm 2.16.03.
+Pins: mpv `7f505de186ddcaeff6dabf48db79c9b8f8adc309`, libplacebo
+`89b04663135b7ee309ef58d1f8997550e98fd9bf` (PL_API_VER 399, libdovi), FFmpeg static
+9.1, nv-codec-headers, nasm 2.16.03.
 
-`/usr/bin/mpv --version` → `v0.41.0-1275-g488fec078-dirty`, `libplacebo v7.377.0`,
-`FFmpeg version: 9.0.2`. DoVi FEL option still present (`--vf=format=help` lists
-`enhancement-layer`). The patch applies cleanly to a pristine `488fec0789`
+`/usr/bin/mpv --version` → `v0.42.0-200-g7f505de18-dirty`, `libplacebo v7.399.0`,
+`FFmpeg version: 9.1`. DoVi FEL option still present (`--vf=format=help` lists
+`enhancement-layer`). The patch applies cleanly to a pristine `7f505de186`
 (`patch -Np1 --dry-run`, 0 rejects).
 
 ## 2. How to use
@@ -39,7 +39,7 @@ Pins: mpv `488fec0789e5026804ac8dd03fb749570416d48a`, libplacebo
 | Command | Behaviour |
 | --- | --- |
 | `mpv file.mkv` | unchanged: `hwdec=vulkan,nvdec`, shaders, `[HDR]` profiles. Use for Dolby Vision with FEL and no AI. |
-| `mpv-ai file.mkv` | NVDEC + `hwup → [vsr] → truehdr → dlssnr → vfg` (chain picked by height and DV profile, see §3) |
+| `mpv-ai file.mkv` | NVDEC + `hwup → dlssnr → [vsr] → truehdr → vfg` (chain picked by height and DV profile, see §3) |
 | `mpv-nr file.mkv` | VSR denoiser only, 1:1, no upscale / no HDR pass / no VFG |
 
 Both wrappers accept every normal mpv argument (`mpv-ai --fullscreen --start=10:00 f.mkv`).
