@@ -5,7 +5,7 @@ in-chain filter, driven by a profile set that picks the right chain per source.
 
 **Experimental:** the new Dolby Vision reconstruction path has not yet been
 validated on an NVIDIA GPU with P5, P8.1 or P7 FEL/MEL samples. The project
-currently targets Linux; Windows gpu-next builds have not been verified.
+currently targets Linux; Windows gpu-next builds have not been verified. // seem to work so far for p8.1 and 5
 
 Built for an Arch / KDE Wayland desktop with an RTX 5070 and a 2560×1440 165 Hz
 panel. Nothing here is Windows-specific; the only Wine dependency is the NR
