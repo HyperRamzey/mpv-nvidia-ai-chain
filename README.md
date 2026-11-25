@@ -49,7 +49,7 @@ filter and not a Vulkan layer.
   filters.
 - **`dlssnr-helper`** from [bmitch87/DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer)
   (0.3.1-2, Windows runtime under Proton). It is a shared-memory server; the
-  Linux filter is the client. It is only needed when noise reduction is enabled
+  Linux filter is the client. It is only needed when Neural Renderer is enabled
   (`passes>=1`); the shipped config runs NR off (`passes=0`), which is a true
   passthrough and never talks to the helper:
 
@@ -105,7 +105,7 @@ never the first time a broken patch is noticed.
 
 ```sh
 mpv-ai movie.mkv        # the whole chain, profile picked from the source
-mpv-nr movie.mkv        # VSR denoiser at 1:1 only
+mpv-nr movie.mkv        # VSR at 1:1 only
 mpv movie.mkv           # untouched player, Dolby Vision as before
 ```
 
