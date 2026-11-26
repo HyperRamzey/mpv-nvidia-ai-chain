@@ -160,18 +160,23 @@ do
     near(api.mprt({ subframes = 4, transfer = "sdr", beam_headroom = 4.0 }, 1.0, 4),
          4.0, "mprt: SDR pins headroom to 1.0")
 
-    -- k follows the wanted sweep rate (default 72 Hz), never the source rate:
+    -- k follows the wanted sweep rate (default 60 Hz), never the source rate:
     -- the frame generator upstream supplies whatever rate is asked for.
-    equal(api.subframes_for(240), 3, "subframes: 240 Hz -> 80 Hz sweep")
-    equal(api.subframes_for(165), 2, "subframes: 165 Hz -> 82.5 Hz sweep")
-    equal(api.subframes_for(144), 2, "subframes: 144 Hz -> 72 Hz sweep")
-    equal(api.subframes_for(120), 2, "subframes: 120 Hz -> 60 Hz sweep")
+    -- Two subframes only ever light half the screen at a time, so a third is
+    -- taken whenever the sweep still stays above MIN_SWEEP_HZ.
+    equal(api.subframes_for(240), 4, "subframes: 240 Hz -> 60 Hz sweep")
+    equal(api.subframes_for(165), 3, "subframes: 165 Hz -> 55 Hz sweep")
+    equal(api.subframes_for(144), 3, "subframes: 144 Hz -> 48 Hz sweep")
+    equal(api.subframes_for(120), 2, "subframes: 120 Hz stays at 2 (3 would be 40 Hz)")
     equal(api.subframes_for(60), 2, "subframes: never below 2")
     equal(api.subframes_for(240, 60), 4, "subframes: explicit 60 Hz target -> 4")
     equal(api.subframes_for(240, 48), 5, "subframes: explicit 48 Hz target -> 5")
     equal(api.subframes_for(240, 10), 5, "subframes: target clamped to the 48 Hz floor")
-    equal(api.subframes_for(240, 400), 2, "subframes: absurd target clamps to 2")
+    equal(api.subframes_for(240, 400), 3, "subframes: 2 never survives when 3 fits")
     equal(api.subframes_for(nil), 4, "subframes: unknown refresh falls back")
+    -- the sweep rate that actually results, rounded to 0.1 Hz
+    near(240 / api.subframes_for(240), 60.0, "subframes: 240 Hz sweep", 0.05)
+    near(165 / api.subframes_for(165), 55.0, "subframes: 165 Hz sweep", 0.05)
     equal(api.pacing_ok(165, 82.5), true, "pacing: 82.5 fps on 165 Hz is locked 1:2")
     equal(api.pacing_ok(240, 80), true, "pacing: 80 fps on 240 Hz is locked 1:3")
     local _, why = api.pacing_ok(165, 96)
@@ -434,25 +439,41 @@ end
 -- ---------------------------------------------------------------------------
 do
     local player = new_player(sdr(165, 24, {
-        ["estimated-vf-fps"] = 82.5,
+        ["estimated-vf-fps"] = 55.0,
         ["vf"] = "@hwup:hwup,@vfg:vfg:fps=auto:max-fps=165",
+        ["vo"] = "gpu",
+        ["current-vo"] = "gpu",
+        ["hdr-compute-peak"] = "auto",
     }))
     local api = player.api
     api.enable()
-    contains(player.osd, "pacing locked", "status: uses render_fps (82.5 on 165 Hz)")
+    contains(player.osd, "pacing locked", "status: uses render_fps (55 on 165 Hz)")
+    equal(api.state.subframes, 3, "auto: 165 Hz lands on k=3 (55 Hz sweep)")
     player.bindings["beam-subframes-cycle"]()
-    equal(api.state.subframes, 3, "cycle: 2 -> 3")
-    equal(player.count("vf-command", "vfg", "out-fps", "55"), 1,
-        "cycle: retargets VFG to 165/3 = 55")
+    equal(api.state.subframes, 4, "cycle: 3 -> 4")
+    equal(player.count("vf-command", "vfg", "out-fps", "41.25"), 1,
+        "cycle: retargets VFG to 165/4 = 41.25")
     player.messages["beam"]("subframes", "5")
     equal(player.count("vf-command", "vfg", "out-fps", "33"), 1,
         "message subframes: retargets VFG to 165/5 = 33")
     player.bindings["beam-subframes-auto"]()
-    equal(api.state.subframes, 2, "auto: restores k=2 from sweep_hz (72 Hz), not source_fps")
-    equal(player.count("vf-command", "vfg", "out-fps", "82.5"), 2,
-        "auto: retargets VFG back to 82.5")
+    equal(api.state.subframes, 3, "auto: restores k=3 from sweep_hz (60 Hz), not source_fps")
+    equal(player.count("vf-command", "vfg", "out-fps", "55"), 2,
+        "auto: retargets VFG back to 55")
+    api.set_sweep_hz(600)
+    equal(api.state.subframes, 2, "set_sweep_hz: absurd rate still clamps to k=2")
     api.set_sweep_hz(10)
     equal(api.state.subframes, 3, "set_sweep_hz: clamped to 48 Hz floor (165/48 -> k=3)")
+
+    -- The phase counter is only trustworthy on vo=gpu-next, and the peak pass
+    -- runs the hook twice; both are forced while the beam is on and restored
+    -- afterwards.
+    equal(player.props["hdr-compute-peak"], "no", "enable: peak pass disabled")
+    equal(player.props["vo"], "gpu-next", "enable: vo forced to gpu-next")
+    assert(api.state.on, "enable: beam is on")
+    api.disable()
+    equal(player.props["hdr-compute-peak"], "auto", "disable: peak pass restored")
+    equal(player.props["vo"], "gpu", "disable: vo restored")
     api.disable()
     equal(player.props["glsl-shader-opts"], "", "disable: clears previously empty glsl-shader-opts")
 end

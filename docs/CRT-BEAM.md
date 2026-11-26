@@ -122,20 +122,50 @@ an aged ghost behind it.
 
 Subframes come from a **target sweep rate**, not from the container fps: the
 renderer is fed `display/k` and nothing ties it to 24/30/60. Default target is
-`TARGET_SWEEP_HZ = 72`, so `k = round(display / 72)`, clamped to `2..32`:
+`TARGET_SWEEP_HZ = 60`, so `k = round(display / 60)`, clamped to `2..32` and
+additionally capped by `floor(display / MIN_SWEEP_HZ)`:
 
-| display | 96 Hz | 120 Hz | 144 Hz | 165 Hz | 240 Hz |
+| display | 120 Hz | 144 Hz | 165 Hz | 240 Hz | 360 Hz |
 | --- | --- | --- | --- | --- | --- |
-| k | 2 | 2 | 2 | 2 | 3 |
-| sweep | 48 Hz | 60 Hz | 72 Hz | 82.5 Hz | 80 Hz |
-| VFG `out-fps` | 48 | 60 | 72 | 82.5 | 80 |
+| k | 2 | 3 | 3 | 4 | 6 |
+| sweep | 60 Hz | 48 Hz | 55 Hz | 60 Hz | 60 Hz |
+| VFG `out-fps` | 60 | 48 | 55 | 60 | 60 |
 
-Integer frame multiplication cannot express 165/2 = 82.5, so the chain uses the
+**A subframe is one whole refresh, so `k = 2` is not a beam.** A row is either
+fully lit or fully dark in a given refresh, which means two subframes can only
+alternate the two halves of the screen: plain BFI churn, perceived as a
+flickering/rolling dark region rather than a sweep. Three is the first count
+that resolves a sweep, so the script takes a third subframe whenever the sweep
+still stays above `MIN_SWEEP_HZ` (this is what puts 144 Hz at 3 and leaves
+120 Hz at 2, where a third would be a 40 Hz strobe). More subframes at the same
+display = finer beam steps and a slower sweep; `Ctrl+Alt+Shift+b` cycles them by
+hand if you prefer a different trade.
+
+### Two properties are forced while the beam is on
+
+Both are saved before the change and restored by `beam off`:
+
+- `vo=gpu-next`. The phase is driven by the shader's `frame` counter, and only
+  gpu-next feeds it from libplacebo's per-hook-execution counter, which
+  advances once per *presented refresh*. Legacy `vo=gpu` feeds it from
+  `frames_uploaded`, which advances only when a new image arrives, so the beam
+  would step once per generated frame instead of once per refresh (measured 58
+  steps/s where 240 are needed) and the sweep would run at `refresh/k²`.
+  Measured on the 165 Hz panel with the 8-band frame-counter probe shader:
+  165.0 refreshes/s, 173.2 counter steps/s, the difference being exactly one
+  extra hook run per `screenshot-to-file`.
+- `hdr-compute-peak=no`. Peak detection is an extra pass over the image that
+  runs the hook a second time (measured +8..18% counter steps at 240 Hz), so
+  the beam skips phases and judders. The shader maps PQ per pixel and needs no
+  global peak.
+
+Integer frame multiplication cannot express 165/3 = 55, so the chain uses the
 patched VFG filter's float-timestep mode (`FrameMultiplier=0` + `Timestep`,
 filter option `out-fps`, runtime `vf-command vfg out-fps <fps>`). Measured on a
-165 Hz panel: `est-vf=82.5`, **165.1 renders/s**, `subframes=2`, `transfer=pq`,
+165 Hz panel: `est-vf=55`, **165.1 renders/s**, `subframes=3`, `transfer=pq`,
 `peak_nits=630`; `beam off` restores VFG to its configured integer mode
-(144 fps in that chain) and puts `interpolation`/`video-sync`/`tscale` back.
+(144 fps in that chain) and puts `interpolation`/`video-sync`/`tscale`,
+`hdr-compute-peak` and `vo` back.
 
 ## Keybinds (60% layout, same convention as the DLSS 5 set)
 

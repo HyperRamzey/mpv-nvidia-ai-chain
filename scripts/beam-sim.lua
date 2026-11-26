@@ -108,7 +108,12 @@ end
 -- frame, every refresh drawn once. No integer multiplier can do that.
 -- Default sweep rate: what a good CRT ran at and what 24p film was projected
 -- through (48/72 Hz shutters). The beam frequency is the knob, k is derived.
-local TARGET_SWEEP_HZ = 72
+-- 60 Hz rather than 72 because a subframe is one *whole* refresh: a row is
+-- either fully lit or fully dark in it. At k = 2 the beam therefore only has two
+-- positions, so each row just alternates between the two halves of the screen
+-- (plain BFI churn) instead of rolling. k >= 3 is the first count that can
+-- resolve a sweep, so the target is set where 165 Hz lands on 3 and 240 Hz on 4.
+local TARGET_SWEEP_HZ = 60
 
 -- Refreshes per rendered frame, derived from the *wanted sweep rate* and not
 -- from the source frame rate: with a generator in front the renderer is simply
@@ -120,7 +125,16 @@ local function subframes_for(refresh, target_sweep)
     if type(refresh) ~= "number" or refresh < 20 then return 4.0 end
     target_sweep = tonumber(target_sweep) or TARGET_SWEEP_HZ
     if target_sweep < MIN_SWEEP_HZ then target_sweep = MIN_SWEEP_HZ end
-    return clamp(math.floor(refresh / target_sweep + 0.5), 2, MAX_AUTO_SUBFRAMES) + 0.0
+    -- Most subframes the panel can take before the sweep becomes a strobe.
+    local k_max = math.floor(refresh / MIN_SWEEP_HZ)
+    local k = clamp(math.floor(refresh / target_sweep + 0.5), 2, MAX_AUTO_SUBFRAMES)
+    -- Two subframes cannot draw a rolling beam (see TARGET_SWEEP_HZ above), so
+    -- take a third whenever the sweep still stays above MIN_SWEEP_HZ. This is
+    -- what puts 144 Hz on k = 3 (48 Hz) and keeps 120 Hz at 2 (60 Hz, where 3
+    -- would be a 40 Hz strobe).
+    if k < 3 and k_max >= 3 then k = 3 end
+    if k > k_max and k_max >= 2 then k = k_max end
+    return k + 0.0
 end
 
 -- Pacing verdict: one rendered frame per subframes refreshes exactly. A
@@ -362,6 +376,27 @@ local function ensure_subframes_rendered()
         saved.tscale = saved.tscale or mp.get_property("tscale", "")
         mp.set_property("tscale", "oversample")
     end
+    -- The beam phase is driven by the shader's `frame` counter, and only
+    -- vo=gpu-next increments it once per *presented refresh* (libplacebo's hook
+    -- counter). vo=gpu feeds the counter from frames_uploaded, which advances
+    -- only when a new image arrives, so the phase would step once per VFG frame
+    -- and the sweep would run at refresh/k^2 -- measured 58 steps/s where 240
+    -- were needed.
+    local vo = mp.get_property("current-vo", "")
+    local vo_opt = mp.get_property("vo", "")
+    if vo ~= "" and vo ~= "gpu-next" and vo_opt ~= "" then
+        saved.vo = saved.vo or vo_opt
+        mp.set_property("vo", "gpu-next")
+    end
+    -- Peak detection is a second pass over the image that runs the hook again
+    -- (measured +8..18% counter steps at 240 Hz), so the beam would skip phases
+    -- and judder. The shader does its own PQ handling per pixel and needs no
+    -- global peak, so this pass is pure artefact here.
+    if mp.get_property("hdr-compute-peak", "auto") ~= "no" then
+        saved["hdr-compute-peak"] = saved["hdr-compute-peak"]
+            or mp.get_property("hdr-compute-peak", "auto")
+        mp.set_property("hdr-compute-peak", "no")
+    end
 end
 
 -- The rate VFG was configured with (0 = integer multiplier mode), read from the
@@ -421,6 +456,8 @@ local function disable()
     restore_property("interpolation")
     restore_property("video-sync")
     restore_property("tscale")
+    restore_property("hdr-compute-peak")
+    restore_property("vo")
     -- Only touch VFG if this script was the one that retargeted it.
     if saved.vfg_out_fps and vfg_entry() then
         mp.commandv("vf-command", "vfg", "out-fps", saved.vfg_out_fps)
