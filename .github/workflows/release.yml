@@ -57,6 +57,11 @@ jobs:
           grep -q "$sha" PKGBUILD \
             || { echo "::error::PKGBUILD does not pin the current patch sha256"; exit 1; }
 
+      # A stale pin in sha256sums only surfaces after makepkg has downloaded
+      # and cloned everything, i.e. minutes into the release build.
+      - name: Local sources match their sha256sums pins
+        run: python3 tools/check_pkgbuild_sums.py
+
       - name: Patch applies to the pinned mpv commit
         run: |
           set -euo pipefail
