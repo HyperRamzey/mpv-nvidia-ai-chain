@@ -224,6 +224,27 @@ jobs:
           passthrough); frame generation follows the display refresh through
           \`scripts/vfg-sync.lua\`.
 
+          ### CRT beam simulator
+
+          \`scripts/beam-sim.lua\` and \`shaders/crt-beam-sim.glsl\` render a
+          phosphor beam with a per-pixel photon budget at the end of the filter
+          chain. Enabling it retargets VFG to \`display_hz / k\` through the
+          float-timestep engine, so the presented rate divides the panel
+          exactly (165 Hz / 2 = 82.5) instead of being forced to an integer;
+          disabling it restores every property it touched.
+
+          | Key | Message | Effect |
+          | --- | --- | --- |
+          | \`Ctrl+Alt+b\` | \`beam toggle\` | enable or disable |
+          | \`Ctrl+Alt+v\` | \`beam status\` | MPRT, subframes, VFG |
+          | \`Alt+Shift+b\` | \`beam subframes <n>\` | pin subframes |
+          | \`Ctrl+Alt+g\` | \`beam gain <f>\` | clarity vs brightness |
+          | \`Ctrl+Alt+y\` | \`beam direction <n>\` | raster direction |
+          | — | \`beam sweep <hz>\` | target sweep, rebuilds k |
+
+          \`docs/CRT-BEAM.md\` in the repository has the physics, the shader
+          parameters and the refresh-rate rules.
+
           The package pins the exact mpv commit, the patch, and static
           libplacebo + FFmpeg; nothing in the system is replaced. The VFX SDK
           libraries are \`dlopen\`ed at runtime and are not part of this
