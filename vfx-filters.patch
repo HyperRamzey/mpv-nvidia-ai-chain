@@ -1732,10 +1732,10 @@ index 0000000000..5999b2be9b
 +void dovi_to_rgb_destroy(struct dovi_to_rgb *c);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 0000000000..e594719461
+index 0000000000..48c50ae439
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1940 @@
+@@ -0,0 +1,1946 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -3047,8 +3047,20 @@ index 0000000000..e594719461
 +    } else {
 +        // Packed YUV straight from the decoder: NR is first in the chain.
 +        struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(mpi->params.hw_subfmt);
++        in_bits = desc.bpp[0] > 8 ? 10 : 8;
++    }
++    // Path depth must be settled **before** the converter is compiled: it
++    // writes the engine's input buffer in exactly this depth. A self-created
++    // CUDA context cannot be imported by the VO, and the RGBA hwctx it is
++    // downloaded with cannot express RGB10A2, so such a pipeline stays 8-bit
++    // (see mp_cuda_ctx_is_private).
++    if (mp_cuda_ctx_is_private(p->cuda_ref))
++        in_bits = VFX_BITS_8;
++    p->bits = in_bits;
++
++    if (!src_is_rgb) {
++        struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(mpi->params.hw_subfmt);
 +        int bd = desc.bpp[0];
-+        in_bits = bd > 8 ? 10 : 8;
 +        enum yuv_matrix mx = matrix_from_repr(&mpi->params);
 +        enum yuv_range rn = range_from_levels(mpi->params.repr.levels);
 +        if (!vfx_imgfmt_is_nv420(mpi->params.hw_subfmt) ||
@@ -3104,12 +3116,6 @@ index 0000000000..e594719461
 +    p->src_w = src_w; p->src_h = src_h;
 +    p->tgt_w = tgt_w; p->tgt_h = tgt_h;
 +    p->work_w = work_w; p->work_h = work_h;
-+    // A self-created CUDA context cannot be imported by the VO, and the
-+    // RGBA hwctx it is downloaded with cannot express RGB10A2: stay 8-bit
-+    // there (see mp_cuda_ctx_is_private).
-+    if (mp_cuda_ctx_is_private(p->cuda_ref))
-+        in_bits = VFX_BITS_8;
-+    p->bits = in_bits;
 +
 +    if (!dlssnr_proc_reserve(&p->proc, src_w, src_h, tgt_w, tgt_h,
 +                             work_w, work_h)) {
