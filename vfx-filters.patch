@@ -1725,10 +1725,10 @@ index 0000000000..5999b2be9b
 +void dovi_to_rgb_destroy(struct dovi_to_rgb *c);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 0000000000..08b4998b8a
+index 0000000000..64937cc672
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1879 @@
+@@ -0,0 +1,1905 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -1832,6 +1832,9 @@ index 0000000000..08b4998b8a
 +// and this client refuses the mapping instead of reading a neighbour's value.
 +// Everything here is a 4-byte atomic.
 +
++// Consecutive failed roundtrips before the helper is declared dead (README and
++// DLSS5-NR-PLAN.md document three).
++#define DLSSNR_FAIL_LATCH       3
 +#define DLSSNR_SHM_MAGIC        0x32524E47u
 +#define DLSSNR_SHM_VERSION      20u
 +#define DLSSNR_SHM_HEADER       65536u
@@ -2963,10 +2966,17 @@ index 0000000000..08b4998b8a
 +
 +    p->frame_count++;
 +
-+    if (p->opts->passes > 0 && !p->helper_spawned) {
-+        p->helper_dead = false;
-+        p->fail_count = 0;
++    // Reset the fail-fast latch only when a spawn actually happened. When
++    // helper_spawn() cannot start the helper (missing binary, no /dev/shm) it
++    // leaves helper_spawned false, so the old code cleared fail_count and
++    // helper_dead on *every* frame: the short fail-fast branch never fired, each
++    // frame burned the whole roundtrip timeout, and helper_dead never latched.
++    if (p->opts->passes > 0 && !p->helper_spawned && !p->helper_dead) {
 +        helper_spawn(f, p);
++        if (!p->helper_spawned) {
++            p->helper_dead = true;
++            p->fail_count = 0;
++        }
 +    }
 +
 +    if (!ensure_cuda(f, p, mpi)) {
@@ -3123,13 +3133,20 @@ index 0000000000..08b4998b8a
 +    if (ok && dumping) {
 +        // The decoder's planes are still owned by mpi here, so this is the
 +        // input side of the chain end to end: plane, RGB, linear, proxy.
++        // 1 byte per sample for NV12, 2 for P010/P016.
++        const size_t src_bytes =
++            vfx_bits_from_imgfmt(mpi->params.hw_subfmt) == VFX_BITS_10 ? 2 : 1;
 +        if (!src_is_rgb && mpi->planes[0] && mpi->planes[1]) {
++            // Row size = samples per row * bytes per sample: 1 byte for NV12,
++            // 2 for P010/P016. The old hardcoded *2 read two rows worth of an
++            // 8-bit plane and dumped only half of a 16-bit one, and src_h / 2
++            // dropped the last chroma row on odd heights.
 +            dump_dev_rows(p->dump_dir, "srcY", src_w, src_h,
 +                          (CUdeviceptr)mpi->planes[0], mpi->stride[0],
-+                          (size_t)src_w * 2);
-+            dump_dev_rows(p->dump_dir, "srcUV", src_w / 2, src_h / 2,
++                          (size_t)src_w * (size_t)src_bytes);
++            dump_dev_rows(p->dump_dir, "srcUV", src_w / 2, (src_h + 1) / 2,
 +                          (CUdeviceptr)mpi->planes[1], mpi->stride[1],
-+                          (size_t)(src_w / 2) * 2);
++                          (size_t)(src_w / 2) * (size_t)src_bytes);
 +            dump_dev_rows(p->dump_dir, "yuvrgb", src_w, src_h,
 +                          p->yuv_rgb, p->yuv_rgb_pitch, (size_t)src_w * 4);
 +        }
@@ -3179,7 +3196,7 @@ index 0000000000..08b4998b8a
 +        if (p->fail_count == 1 || p->opts->verbose)
 +            MP_WARN(f, "dlssnr: frame %lld not denoised (falling back to the "
 +                       "source frame)\n", (long long)p->frame_count);
-+        if (p->fail_count >= 60 && !p->helper_dead) {
++        if (p->fail_count >= DLSSNR_FAIL_LATCH && !p->helper_dead) {
 +            p->helper_dead = true;
 +            MP_ERR(f, "dlssnr: %lld failed frames in a row -- NR disabled for "
 +                      "this file. Start the helper again (dlssnr-helper "
@@ -3249,6 +3266,15 @@ index 0000000000..08b4998b8a
 +    out->params.h = tgt_h;
 +    mp_image_params_guess_csp(&out->params);
 +    out->params.color = mpi->params.color;      // keep PQ/HLG and primaries
++    // dovi_to_rgb produced BT.2020 PQ RGB. A DoVi source's VUI carries UNKNOWN
++    // primaries/transfer (P5, IPTPQc2) or HLG (P8.4), so copying the input tags
++    // verbatim would leave PQ pixels labelled SDR/HLG for everything downstream
++    // (truehdr, gpu-next tone mapping).
++    if (mpi->params.repr.dovi ||
++        mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION) {
++        out->params.color.primaries = PL_COLOR_PRIM_BT_2020;
++        out->params.color.transfer = PL_COLOR_TRC_PQ;
++    }
 +    // The frame is now full-range RGB. Dropping the DoVi tag is deliberate:
 +    // the values no longer live in the YCbCr+reshape domain the tag describes.
 +    out->params.repr.sys = PL_COLOR_SYSTEM_RGB;
@@ -4205,10 +4231,10 @@ index 0000000000..9b4895a337
 +};
 diff --git a/video/filter/vf_truehdr.c b/video/filter/vf_truehdr.c
 new file mode 100644
-index 0000000000..588ccc11d7
+index 0000000000..a85d8177a7
 --- /dev/null
 +++ b/video/filter/vf_truehdr.c
-@@ -0,0 +1,1055 @@
+@@ -0,0 +1,1059 @@
 +// src/mpv/video/filter/vf_truehdr.c
 +// VFX TrueHDR (SDR → HDR10 up-conversion) — the VFX SDK's AI up-conversion
 +// effect, attached **after** `vf_vsr` (approach in
@@ -4876,7 +4902,11 @@ index 0000000000..588ccc11d7
 +    // Input form decision (TrueHDR only takes chunky RGBA8; see header comment).
 +    const int subfmt = mpi->params.hw_subfmt;
 +    const bool in_rgba8  = (subfmt == IMGFMT_RGBA);
-+    const bool in_rgb10  = (subfmt == IMGFMT_X2BGR10 || subfmt == IMGFMT_X2RGB10);
++    // X2BGR10 only: that is NVCV_RGB10A2 (R in the low bits). X2RGB10 has the
++    // opposite packed order, so a raw copy would swap R and B; it falls through
++    // to the unsupported/passthrough branch below instead of being silently
++    // mis-rendered.
++    const bool in_rgb10  = (subfmt == IMGFMT_X2BGR10);
 +    // 4:4:4 / 4:2:2 decoder output is not NV12-shaped: unsupported, below.
 +    const bool in_yuv    = vfx_imgfmt_is_nv420(subfmt);
 +    if (!in_rgba8 && !in_rgb10 && !in_yuv) {
@@ -5266,10 +5296,10 @@ index 0000000000..588ccc11d7
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 0000000000..42505acd2e
+index 0000000000..06e6f65184
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1426 @@
+@@ -0,0 +1,1433 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -5955,6 +5985,13 @@ index 0000000000..42505acd2e
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, vfx_imgfmt_from_bits(out_bits));
 +    mp_image_params_guess_csp(&out->params);
 +    out->params.color = src->params.color;   // HDR metadata (same as vf_vsr)
++    // A DoVi-decoded frame is BT.2020 PQ; the source tags (UNKNOWN for P5, HLG
++    // for P8.4) would mislabel it for everything downstream.
++    if (src->params.repr.dovi ||
++        src->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION) {
++        out->params.color.primaries = PL_COLOR_PRIM_BT_2020;
++        out->params.color.transfer = PL_COLOR_TRC_PQ;
++    }
 +    // Same reason as vf_vsr: these frames are finished RGB (Dolby Vision was
 +    // decoded in stage_input), so nothing downstream may attach an RPU or an
 +    // enhancement layer to them. Unconditional, because the flags an upstream
@@ -6698,10 +6735,10 @@ index 0000000000..42505acd2e
 +};
 diff --git a/video/filter/vf_vsr.c b/video/filter/vf_vsr.c
 new file mode 100644
-index 0000000000..51a3a132b4
+index 0000000000..e04a7136da
 --- /dev/null
 +++ b/video/filter/vf_vsr.c
-@@ -0,0 +1,1366 @@
+@@ -0,0 +1,1375 @@
 +/*
 + * vf_vsr.c -- Video Super Resolution filter via NVIDIA VFX SDK
 + *
@@ -7684,6 +7721,15 @@ index 0000000000..51a3a132b4
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, vfx_imgfmt_from_bits(bits));
 +    mp_image_params_guess_csp(&out->params);
 +    out->params.color = mpi->params.color; // preserve HDR metadata
++    // dovi_to_rgb produced BT.2020 PQ RGB. A DoVi source's VUI carries UNKNOWN
++    // primaries/transfer (P5, IPTPQc2) or HLG (P8.4), so copying the input tags
++    // verbatim would leave PQ pixels labelled SDR/HLG for everything downstream
++    // (truehdr, gpu-next tone mapping).
++    if (mpi->params.repr.dovi ||
++        mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION) {
++        out->params.color.primaries = PL_COLOR_PRIM_BT_2020;
++        out->params.color.transfer = PL_COLOR_TRC_PQ;
++    }
 +    // A rebuilt frame is finished RGB: any Dolby Vision was decoded on the
 +    // way in (dovi_to_rgb). Nothing downstream may attach an RPU or an
 +    // enhancement layer to it again -- el_pair would otherwise do exactly
@@ -9585,10 +9631,10 @@ index 0000000000..532afa3288
 +}
 diff --git a/video/filter/yuv_to_rgba.h b/video/filter/yuv_to_rgba.h
 new file mode 100644
-index 0000000000..61480af521
+index 0000000000..6d4fc5f329
 --- /dev/null
 +++ b/video/filter/yuv_to_rgba.h
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,142 @@
 +// src/mpv/video/filter/yuv_to_rgba.h
 +#pragma once
 +
@@ -9690,8 +9736,12 @@ index 0000000000..61480af521
 +/// would be read as Y and the G plane as chroma).
 +static inline bool vfx_imgfmt_is_rgb(int imgfmt)
 +{
-+    return imgfmt == IMGFMT_RGBA || imgfmt == IMGFMT_BGRA ||
-+           imgfmt == IMGFMT_X2BGR10 || imgfmt == IMGFMT_X2RGB10;
++    // Only the two layouts a direct D2D copy lands in unchanged: NVCV_RGBA and
++    // NVCV_RGB10A2 (= IMGFMT_X2BGR10). A BGRA source would swap R and B, and
++    // X2RGB10 is the opposite bit order, so both are *not* "already RGB" for
++    // this purpose -- they have to take the conversion path (or passthrough),
++    // never a raw copy.
++    return imgfmt == IMGFMT_RGBA || imgfmt == IMGFMT_X2BGR10;
 +}
 +
 +/// Whether this subfmt has the only YUV layout the converters read: one luma

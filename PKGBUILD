@@ -138,7 +138,7 @@ sha256sums=(
   'SKIP'
   'SKIP'
   '7dbf0282eb1f5a46b8d4935daba5566d18b7ec7ad9d487430a78f992c99a8e63'
-  '56fbaaf374b23543e800d9c2af41fb9dd6e52bbb10f2f4591db0ba585f8b8c28'
+  '6ec934fac91b3ac6af27145a1efc9a944a3b7061492fdc84a5d499de4b26ab4b'
 )
 
 pkgver() {
