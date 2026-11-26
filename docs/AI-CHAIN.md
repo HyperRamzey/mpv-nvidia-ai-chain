@@ -23,6 +23,7 @@ traps.
 | Wrappers | `~/.local/bin/mpv-ai`, `~/.local/bin/mpv-nr` |
 | NR helper | `~/.local/bin/dlssnr-helper` — **must be running** for `dlssnr` |
 | Old player backup | `~/ai-video/build/backup-mpv-dovi-git/` (binary + libmpv + headers) |
+| CRT beam simulator | `~/.config/mpv/scripts/beam-sim.lua` + `~/.config/mpv/shaders/crt-beam-sim.glsl`, `Ctrl+Alt+b` |
 | Patch (22 files, 8581 lines) | `~/ai-video/build/arch/vfx-filters.patch`, sha256 `8e487d9f…b7a2` |
 
 Pins: mpv `7f505de186ddcaeff6dabf48db79c9b8f8adc309`, libplacebo
@@ -78,6 +79,15 @@ vfg:fps=auto:max-fps=110`.
 
 The gate keys on **source** height (`video-params/h` is pre-filter — it still reports
 1080 while the chain outputs 1440), so 720p/1080p take VSR, 1440p/2160p do not.
+
+`vfg` also has **`out-fps`** (float timestep mode, `0` = off): the engine is built
+with `FrameMultiplier=0` and each generated frame is placed on an exact time grid,
+so the output rate can be any value, e.g. `165/2 = 82.5` for the CRT beam chain.
+Runtime: `vf-command vfg out-fps 82.5`, back with `out-fps 0` (the switch is
+detected and re-Loads the engine, because the multiplier *mode* is part of it).
+`fps` accepts 2..8. `AutomaticShotChangeDetectionEnabled` is forced off: on a
+detected shot change the engine emits the current frame as-is and silently drops
+generated frames.
 
 `fps=auto` picks the largest integer K in 2..4 that fits under `max-fps=110`:
 48→2 (96), 24→4 (96), 120→passthrough (`reason=max-fps`). The cap is 110, not the
@@ -327,6 +337,10 @@ cd /tmp/pristine && patch -Np1 --dry-run -i /tmp/new.patch   # must print no rej
 ```
 
 ## 9. Related documentation
+
+- `docs/CRT-BEAM.md` — CRT beam simulator: the published Blur Busters algorithm,
+  the one deviation (no trailing-frame buffer in mpv), measured light/MPRT
+  evidence, and the shader-header rules that make a bad file fail silently.
 
 - `~/ai-video/DLSS5-NR-PLAN.md` — **design of record for DLSS 5 NR**: runtime
   constraints, the composite, every measured number, known defects.

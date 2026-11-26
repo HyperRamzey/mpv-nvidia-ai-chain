@@ -104,10 +104,10 @@ index f2c31ef66b..5c61c138bf 100644
  extern const struct mp_user_filter_entry vf_sub;
  extern const struct mp_user_filter_entry vf_vapoursynth;
 diff --git a/meson.build b/meson.build
-index 2567e069d6..a635682531 100644
+index 90b261d8d5..9ea1bdaa3e 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -418,6 +418,43 @@ if get_option('fuzzers')
+@@ -420,6 +420,43 @@ if get_option('fuzzers')
      link_flags += ['-fsanitize=address,undefined,fuzzer', '-fno-omit-frame-pointer']
  endif
  
@@ -1721,7 +1721,7 @@ index 0000000000..5999b2be9b
 +void dovi_to_rgb_destroy(struct dovi_to_rgb *c);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 0000000000..9ece0fcca4
+index 0000000000..08b4998b8a
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
 @@ -0,0 +1,1879 @@
@@ -5262,10 +5262,10 @@ index 0000000000..588ccc11d7
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 0000000000..3edf363cc4
+index 0000000000..56f8e48694
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1325 @@
+@@ -0,0 +1,1417 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -5409,12 +5409,13 @@ index 0000000000..3edf363cc4
 +#define VFG_STATUS_EVERY 30
 +// Multiplier range exposed by the option layer (frozen interface:
 +// fps=off|2|3|4). Deliberately separate from the SDK's
-+// VFG_MULT_MIN..MAX (2..8): the SDK can run 5..8, but the interface does not
-+// expose them — out of range is reported clearly at parse time instead of
-+// silently running at 5× (measured: written as 2..8 first, fps=5 was accepted
-+// and really output 150fps at k=5).
++// VFG_MULT_MIN..MAX (2..8): the SDK's FrameMultiplier accepts 2..8 and really
++// runs there (measured: fps=5 accepted, output 150 fps at k=5). 5..8 are
++// exposed again because a beam simulator needs the multipliers that make
++// out_fps*k land exactly on the display refresh (240 Hz, 24p x 5 = 120 fps
++// gives k = 2 exactly).
 +#define VFG_FPS_OPT_MIN 2
-+#define VFG_FPS_OPT_MAX 4
++#define VFG_FPS_OPT_MAX 8
 +// Internal sentinel for fps=auto (the option parser accepts the string
 +// "auto" and stores 0). Resolve to the largest feasible multiplier from
 +// src_fps and max-fps. 0 can never be an explicit multiplier (2..4).
@@ -5439,6 +5440,11 @@ index 0000000000..3edf363cc4
 +    int fps;      // -1 = off, 0 = auto, 2/3/4 = integer multiplier K
 +    int mode;     // 0=low, 1=medium, 2=high (default 1=medium, no auto)
 +    double max_fps; // output frame rate cap (0=unlimited); above it means passthrough
++    // out-fps > 0 selects float-timestep mode (SDK FrameMultiplier=0 + Timestep)
++    // and produces exactly this output rate for any source rate. Used to land on
++    // an exact divisor of the display refresh (display/k) so one beam sweep maps
++    // 1:1 onto one frame. 0 = integer-multiplier mode.
++    double out_fps;
 +};
 +
 +#define OPT_BASE_STRUCT struct vf_vfg_opts
@@ -5536,6 +5542,8 @@ index 0000000000..3edf363cc4
 +        M_RANGE(0, 2)},
 +    // Output frame rate cap: 0 = unlimited; preserves fractional refresh rates.
 +    {"max-fps", OPT_DOUBLE(max_fps), M_RANGE(0, VFG_MAX_FPS_LIMIT_MAX)},
++    // Exact output rate via float timesteps: 0 = off (integer multiplier mode).
++    {"out-fps", OPT_DOUBLE(out_fps), M_RANGE(0, 1000)},
 +    {0}
 +};
 +
@@ -5543,6 +5551,7 @@ index 0000000000..3edf363cc4
 +    .fps     = -1,
 +    .mode    = VFG_MODE_MEDIUM,
 +    .max_fps = 0,
++    .out_fps = 0,
 +};
 +
 +// ── Filter private state ───────────────────────────────────────────────────
@@ -5583,7 +5592,11 @@ index 0000000000..3edf363cc4
 +
 +    int    video_w, video_h;        // engine/input size (VFG output is the same size)
 +    double src_fps;                 // input frame rate (nominal_fps)
-+    int    k;                       // current multiplier (= opts->fps, 2..4)
++    int    k;                       // current multiplier (= opts->fps, 2..8; 0 = timestep)
++    double out_fps_eff;             // timestep mode target rate (0 = multiplier mode)
++    double grid_t0;                 // output grid origin (first pair's prev pts)
++    long long grid_n;               // next grid index: pts = grid_t0 + grid_n/out_fps_eff
++    bool   grid_init;
 +
 +    // scheduling state: one pair is expanded across several process() calls
 +    bool   have_prev;               // in_img[0] already holds prev (content time prev_pts)
@@ -5625,7 +5638,8 @@ index 0000000000..3edf363cc4
 +    // "source frame rate unknown" without lying the way inf/nan would; it is
 +    // not changed to "?" so as not to break the field syntax (field names,
 +    // order and numeric formats all stay as they are).
-+    double out_fps = p->src_fps > 0 ? p->k * p->src_fps : 0.0;
++    double out_fps = p->out_fps_eff > 0 ? p->out_fps_eff :
++                     (p->src_fps > 0 ? p->k * p->src_fps : 0.0);
 +    mp_msg(f->log, MSGL_STATUS,
 +           "vfg-status: mode=active src=%.2f k=%d out=%.2f cost=%.1fms\n",
 +           p->src_fps, p->k, out_fps,
@@ -5796,9 +5810,17 @@ index 0000000000..3edf363cc4
 +        // before Load, whether a later change takes effect is unverified). The
 +        // same applies when the stream changes because ensure_cuda rebinds it
 +        // (CudaStream is bound at Load).
++        // The frame-multiplier *mode* is part of the engine: a timestep engine
++        // is built with FrameMultiplier=0, and a runtime switch from the integer
++        // grid fails at Run time (measured: SetF32(Timestep) returns -7 on an
++        // engine Loaded with a non-zero multiplier), so switching between the
++        // two modes requires a rebuild just like size/Mode/stream do.
++        bool timestep_engine = p->vfg.multiplier == 0;
++        bool timestep_wanted = p->k == 0;
 +        bool same = (p->vfg.in_w == in_w && p->vfg.in_h == in_h &&
 +                     p->vfg.bits == bits &&
-+                     p->vfg_mode == mode && p->vfg.stream == p->cuda_stream);
++                     p->vfg_mode == mode && p->vfg.stream == p->cuda_stream &&
++                     timestep_engine == timestep_wanted);
 +        if (same) {
 +            // FrameMultiplier needs no rebuild (SetU32 before every Run)
 +            if (p->vfg.multiplier != p->k)
@@ -6047,16 +6069,59 @@ index 0000000000..3edf363cc4
 +    double t_prev = p->prev_pts;
 +    double t_cur  = p->cur_pts;
 +    int k = p->k;
-+    double out_fps = k * p->src_fps;
-+    int i = p->emit_i;
++    double out_fps = p->out_fps_eff > 0 ? p->out_fps_eff : k * p->src_fps;
 +    double t0 = vfg_now_ms();
 +    const void *src;
 +    size_t src_pitch;
 +    double pts;
++    bool is_copy = false;   // true = this output is the source frame itself
 +
-+    if (i < k) {
++    if (p->out_fps_eff > 0) {
++        // ── float-timestep mode ───────────────────────────────────────────
++        // One global output grid at out_fps, anchored at the first pair's prev
++        // pts, so long playback cannot drift and VFR sources are followed
++        // exactly. The grid *is* the output timeline: every emitted frame is a
++        // grid point, generated from the pair that contains it, at phase
++        // t = (grid - t_prev) / (t_cur - t_prev).
++        //
++        // The source frame is deliberately NOT emitted as a separate copy: doing
++        // that added src_fps extra frames (measured 105.8 fps for a target of
++        // 82.5 = 82.5 + 24 with the copy). Its content appears at the grid
++        // points inside the next pair instead.
++        if (!p->grid_init) {
++            p->grid_t0 = t_prev;
++            p->grid_n = 1;
++            p->grid_init = true;
++        }
++        double next = p->grid_t0 + (double)p->grid_n / p->out_fps_eff;
++        if (next < t_cur - 1e-9) {
++            double tval = (t_cur > t_prev) ? (next - t_prev) / (t_cur - t_prev) : 0.5;
++            // SDK: Timestep is exclusive (0.0, 1.0).
++            if (tval < 1e-4) tval = 1e-4;
++            if (tval > 1.0 - 1e-4) tval = 1.0 - 1e-4;
++            void *vfg_out = NULL;
++            int vfg_pitch = 0;
++            if (!vfg_process_timestep(&p->vfg, (float)tval, &vfg_out, &vfg_pitch))
++                return false;
++            src = vfg_out;
++            src_pitch = (size_t)vfg_pitch;
++            pts = next;
++            p->grid_n++;
++        } else {
++            // This pair holds no further grid point (out_fps <= src_fps, or the
++            // last point has just been emitted): complete it without output.
++            p->prev_pts = t_cur;
++            p->have_prev = true;
++            talloc_free(p->pending_cur);
++            p->pending_cur = NULL;
++            mp_filter_internal_mark_progress(f);
++            return true;
++        }
++    } else if (p->emit_i < k) {
++        // ── integer multiplier mode (original path) ───────────────────────
 +        void *vfg_out = NULL;
 +        int vfg_pitch = 0;
++        int i = p->emit_i;
 +        if (!vfg_process(&p->vfg, i, &vfg_out, &vfg_pitch))
 +            return false;
 +        src = vfg_out;
@@ -6073,6 +6138,7 @@ index 0000000000..3edf363cc4
 +        src = p->vfg.in_pixels[1];
 +        src_pitch = (size_t)p->vfg.in_pitch[1];
 +        pts = t_cur;
++        is_copy = true;
 +    }
 +
 +    if (!ensure_out_buf(f, p, p->video_w, p->video_h, (int)src_pitch))
@@ -6088,12 +6154,11 @@ index 0000000000..3edf363cc4
 +    if (!out)
 +        return false;
 +
-+    MP_DBG(f, "vfg: OUT pts=%.4f i=%d/%d %s\n", pts, i, k,
-+           i < k ? "[mid]" : "[copy]");
++    MP_DBG(f, "vfg: OUT pts=%.4f %s\n", pts, is_copy ? "[copy]" : "[mid]");
 +    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
 +    vfg_account(f, p, t0);
 +
-+    if (i >= k) {
++    if (is_copy) {
 +        // pair complete: cur becomes the next pair's prev (content is already in
 +        // in_img[1], so the next pair's start moves to in_img[0]); release the
 +        // input frame (do not hold the decode surface long-term)
@@ -6101,8 +6166,8 @@ index 0000000000..3edf363cc4
 +        p->have_prev = true;
 +        talloc_free(p->pending_cur);
 +        p->pending_cur = NULL;
-+    } else {
-+        p->emit_i = i + 1;
++    } else if (p->out_fps_eff <= 0) {
++        p->emit_i++;
 +    }
 +    return true;
 +}
@@ -6183,7 +6248,10 @@ index 0000000000..3edf363cc4
 +    // max-fps. An explicit 2..4 passes through unchanged and still gates
 +    // exactly as it did before this option existed.
 +    int k = p->opts->fps;
-+    if (k == VFG_FPS_AUTO) {
++    // Timestep mode owns the rate: no integer multiplier, no max-fps gate.
++    if (p->opts->out_fps > 0) {
++        k = 0;
++    } else if (k == VFG_FPS_AUTO) {
 +        if (p->opts->max_fps > 0 && p->src_fps > 0) {
 +            k = -1;
 +            for (int t = VFG_FPS_OPT_MAX; t >= VFG_FPS_OPT_MIN; t--) {
@@ -6199,7 +6267,8 @@ index 0000000000..3edf363cc4
 +    }
 +
 +    const char *reason = NULL;
-+    if (p->opts->fps == -1)                          reason = "off";
++    if (p->opts->out_fps > 0)                        ;   // enabled by out-fps
++    else if (p->opts->fps == -1)                     reason = "off";
 +    else if (k < VFG_FPS_OPT_MIN)                    reason = "max-fps";
 +    else if (p->opts->fps > VFG_FPS_OPT_MAX)         reason = "k-range";
 +    // Output cap (user-set, not an automatic downgrade; see the file header).
@@ -6234,6 +6303,7 @@ index 0000000000..3edf363cc4
 +
 +    p->passthrough = false;
 +    p->k = k;
++    p->out_fps_eff = p->opts->out_fps > 0 ? p->opts->out_fps : 0.0;
 +
 +    // Duplicate/reordered/missing PTS: drop cur, keep prev (same semantics as
 +    // vf_rife)
@@ -6291,7 +6361,7 @@ index 0000000000..3edf363cc4
 +    }
 +    p->video_w = in_w;
 +    p->video_h = in_h;
-+    double out_fps = p->k * p->src_fps;
++    double out_fps = p->out_fps_eff > 0 ? p->out_fps_eff : p->k * p->src_fps;
 +
 +    // ── 5. first frame: output directly (the starting point of the
 +    //    keep-source-frame semantics; its content becomes the next pair's
@@ -6435,6 +6505,25 @@ index 0000000000..3edf363cc4
 +        }
 +        return true;
 +    }
++    if (strcmp(cmd->cmd, "out-fps") == 0) {
++        // Exact output rate via float timesteps (0 = back to multiplier mode).
++        // This is what a beam simulator drives: it wants out_fps = display/k so
++        // that one sweep maps 1:1 onto one frame.
++        char *end = NULL;
++        double v = strtod(cmd->arg, &end);
++        if (!end || *end || !(v >= 0) || v > 1000)
++            return false;
++        if (p->opts->out_fps != v) {
++            MP_INFO(f, "vfg: out-fps %.17g -> %.17g (vf-command)\n",
++                    p->opts->out_fps, v);
++            p->opts->out_fps = v;
++            // New timeline: the grid origin belongs to the old one.
++            p->grid_init = false;
++            p->grid_n = 0;
++            f_reset(f);
++        }
++        return true;
++    }
 +    if (strcmp(cmd->cmd, "max-fps") == 0) {
 +        double v;
 +        if (!parse_max_fps_arg(cmd->arg, &v))
@@ -6472,11 +6561,14 @@ index 0000000000..3edf363cc4
 +    p->prev_pts = 0;
 +    p->cur_pts = 0;
 +    p->emit_i = 0;
++    p->grid_init = false;
++    p->grid_n = 0;
++    p->grid_t0 = 0;
 +    p->frame_count = 0;
 +    p->status_frames = 0;
 +    p->status_cost_ms = 0;
 +    p->status_emit = 0;
-+    p->passthrough = (p->opts->fps == -1);
++    p->passthrough = (p->opts->fps == -1 && p->opts->out_fps <= 0);
 +    if (p->passthrough)
 +        snprintf(p->pt_reason, sizeof(p->pt_reason), "off");
 +    // Engine downgrade reset (init may be retried after a file change / a
@@ -7965,10 +8057,10 @@ index 0000000000..51a3a132b4
 +};
 diff --git a/video/filter/vfg_proc.c b/video/filter/vfg_proc.c
 new file mode 100644
-index 0000000000..d27d3b9d96
+index 0000000000..7f7f72c589
 --- /dev/null
 +++ b/video/filter/vfg_proc.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,355 @@
 +// src/mpv/video/filter/vfg_proc.c
 +// VFG (VideoFrameGeneration) engine wrapper implementation (interface in
 +// vfg_proc.h).
@@ -8028,8 +8120,10 @@ index 0000000000..d27d3b9d96
 +{
 +    if (!vfx_load_libraries())
 +        return false;
-+    if (multiplier < VFG_MULT_MIN || multiplier > VFG_MULT_MAX) {
-+        fprintf(stderr, "VFG: FrameMultiplier %d out of range (%d..%d)\n",
++    // 0 = float-timestep mode (SDK: FrameMultiplier 0 selects Timestep);
++    // 2..8 = integer FrameIndex mode.
++    if (multiplier != 0 && (multiplier < VFG_MULT_MIN || multiplier > VFG_MULT_MAX)) {
++        fprintf(stderr, "VFG: FrameMultiplier %d out of range (0, %d..%d)\n",
 +                multiplier, VFG_MULT_MIN, VFG_MULT_MAX);
 +        return false;
 +    }
@@ -8041,31 +8135,10 @@ index 0000000000..d27d3b9d96
 +    c->multiplier = multiplier;
 +    c->bits = (bits == VFX_BITS_10) ? VFX_BITS_10 : VFX_BITS_8;
 +
-+    int ret = pfn_NvVFX_CreateEffect("VideoFrameGeneration", &c->handle);
-+    if (ret != 0) {
-+        fprintf(stderr, "VFG: CreateEffect(VideoFrameGeneration) failed (%d)\n",
-+                ret);
-+        return false;
-+    }
-+
-+    // InputWidth/InputHeight must be set before Load (the official wrapper
-+    // marks requires_reload, and sets them inside load() before Load).
-+    pfn_NvVFX_SetU32(c->handle, "InputWidth", (unsigned int)in_w);
-+    pfn_NvVFX_SetU32(c->handle, "InputHeight", (unsigned int)in_h);
-+    pfn_NvVFX_SetU32(c->handle, "Mode", (unsigned int)mode);
-+    // FrameMultiplier/FrameIndex are **per-Run** parameters (the official
-+    // wrapper's run() re-SetU32 them every time, and they are not marked
-+    // requires_reload); setting them once before Load as well keeps the
-+    // initial state exactly identical to the probe.
-+    pfn_NvVFX_SetU32(c->handle, "FrameMultiplier", (unsigned int)multiplier);
-+    pfn_NvVFX_SetU32(c->handle, "FrameIndex", 1);
-+    // Scene-change detection is left to the engine (single source of truth):
-+    // vf_vfg no longer implements a second MAE.
-+    pfn_NvVFX_SetU32(c->handle, "AutomaticShotChangeDetectionEnabled", 1);
-+
 +    // ── two inputs + one output: RGBA U8 / RGB10A2 chunky GPU ──────────
 +    // All three images must have the same encoding (library documentation:
-+    // RGB8/RGB10A2 mixing is unsupported).
++    // RGB8/RGB10A2 mixing is unsupported). They are created before the engine
++    // so that a Mode retry (below) only has to re-create the handle.
 +    for (int i = 0; i < 2; i++) {
 +        if (!ensure_img(&c->in_img[i], in_w, in_h, c->bits, i ? "src1" : "src0")) {
 +            vfg_destroy(c);
@@ -8082,25 +8155,6 @@ index 0000000000..d27d3b9d96
 +    c->out_pixels = c->out_img.pixels;
 +    c->out_pitch  = (int)c->out_img.pitch;
 +
-+    ret = pfn_NvVFX_SetImage(c->handle, VFG_INPUT0_IMAGE, &c->in_img[0]);
-+    if (ret != 0) {
-+        fprintf(stderr, "VFG: SetImage(SrcImage0) failed (%d)\n", ret);
-+        vfg_destroy(c);
-+        return false;
-+    }
-+    ret = pfn_NvVFX_SetImage(c->handle, VFG_INPUT1_IMAGE, &c->in_img[1]);
-+    if (ret != 0) {
-+        fprintf(stderr, "VFG: SetImage(SrcImage1) failed (%d)\n", ret);
-+        vfg_destroy(c);
-+        return false;
-+    }
-+    ret = pfn_NvVFX_SetImage(c->handle, VFG_OUTPUT_IMAGE, &c->out_img);
-+    if (ret != 0) {
-+        fprintf(stderr, "VFG: SetImage(DstImage0) failed (%d)\n", ret);
-+        vfg_destroy(c);
-+        return false;
-+    }
-+
 +    // ── CUDA stream ───────────────────────────────────────────────────────
 +    if (stream) {
 +        c->stream = stream;
@@ -8109,20 +8163,114 @@ index 0000000000..d27d3b9d96
 +        cuStreamCreate(&c->stream, CU_STREAM_NON_BLOCKING);
 +        c->own_stream = true;
 +    }
-+    pfn_NvVFX_SetCudaStream(c->handle, VFG_CUDA_STREAM, c->stream);
 +
-+    // ── Load (model initialisation; the 1.3 VFG library is 218MB, Load
-+    // cost far exceeds a single frame) ───────────────────────────────────
-+    ret = pfn_NvVFX_Load(c->handle);
-+    if (ret != 0) {
-+        fprintf(stderr, "VFG: Load failed (%d)\n", ret);
++    // ── engine: create + Load, with a Mode fallback ──────────────────────
++    // -1002 here is an allocation failure, not a restriction on a mode, size or
++    // input format. Measured: at 2560x1440 RGB10A2 the engine failed Load in
++    // Mode medium (-1002) but loaded in low and high, and a 2560x1440
++    // float-timestep engine failed Load at all while a 9.3 GB process (the local
++    // vision-model server) sat on the 12 GB card; with that process stopped the
++    // same chain loads in medium and both frame modes and generates at the
++    // requested rate. So a Load failure means "not enough VRAM for this mode's
++    // buffers right now", and the honest response is to try the cheaper modes
++    // before giving up, then report which mode actually loaded. Without this a
++    // transient squeeze silently drops VFG out of the chain — and with it the
++    // generated frames the beam sweep is built on.
++    int try_modes[3] = { mode, VFG_MODE_HIGH, VFG_MODE_LOW };
++    int n_modes = 3;
++    if (mode == VFG_MODE_HIGH) {
++        try_modes[1] = VFG_MODE_LOW;
++        n_modes = 2;
++    } else if (mode == VFG_MODE_LOW) {
++        try_modes[1] = VFG_MODE_HIGH;
++        n_modes = 2;
++    }
++
++    int ret = 0;
++    bool loaded = false;
++    for (int t = 0; t < n_modes && !loaded; t++) {
++        c->mode = try_modes[t];
++        ret = pfn_NvVFX_CreateEffect("VideoFrameGeneration", &c->handle);
++        if (ret != 0) {
++            fprintf(stderr, "VFG: CreateEffect(VideoFrameGeneration) failed (%d)\n",
++                    ret);
++            vfg_destroy(c);
++            return false;
++        }
++
++        // InputWidth/InputHeight must be set before Load (the official wrapper
++        // marks requires_reload, and sets them inside load() before Load).
++        pfn_NvVFX_SetU32(c->handle, "InputWidth", (unsigned int)in_w);
++        pfn_NvVFX_SetU32(c->handle, "InputHeight", (unsigned int)in_h);
++        pfn_NvVFX_SetU32(c->handle, "Mode", (unsigned int)c->mode);
++        // FrameMultiplier/FrameIndex are per-Run parameters (the official
++        // wrapper re-writes them before every Run); the pre-Load write gives
++        // the engine a defined grid while it builds, the post-Load write below
++        // re-establishes it because a FrameMultiplier write resets
++        // FrameIndex/Timestep.
++        pfn_NvVFX_SetU32(c->handle, "FrameMultiplier", (unsigned int)multiplier);
++        if (multiplier != 0)
++            pfn_NvVFX_SetU32(c->handle, "FrameIndex", 1);
++        // Automatic shot-change detection OFF. On a detection the engine emits
++        // the current frame as-is, i.e. it drops the generated frames. Measured
++        // with it on: the filter fell back to passthrough (estimated-vf-fps
++        // returned to the source rate) and with interpolation enabled mpv's
++        // render rate collapsed to ~38/s instead of the panel rate. A beam
++        // simulator cannot tolerate a missing subframe: the missing half of the
++        // sweep is black.
++        pfn_NvVFX_SetU32(c->handle, "AutomaticShotChangeDetectionEnabled", 0);
++
++        for (int i = 0; i < 2; i++) {
++            ret = pfn_NvVFX_SetImage(c->handle,
++                                     i ? VFG_INPUT1_IMAGE : VFG_INPUT0_IMAGE,
++                                     &c->in_img[i]);
++            if (ret != 0) {
++                fprintf(stderr, "VFG: SetImage(SrcImage%d) failed (%d)\n", i, ret);
++                vfg_destroy(c);
++                return false;
++            }
++        }
++        ret = pfn_NvVFX_SetImage(c->handle, VFG_OUTPUT_IMAGE, &c->out_img);
++        if (ret != 0) {
++            fprintf(stderr, "VFG: SetImage(DstImage0) failed (%d)\n", ret);
++            vfg_destroy(c);
++            return false;
++        }
++        pfn_NvVFX_SetCudaStream(c->handle, VFG_CUDA_STREAM, c->stream);
++
++        // ── Load (model initialisation; the 1.3 VFG library is 218MB, Load
++        // cost far exceeds a single frame) ───────────────────────────────
++        ret = pfn_NvVFX_Load(c->handle);
++        if (ret == 0) {
++            loaded = true;
++        } else {
++            fprintf(stderr, "VFG: Load failed (%d) mode=%d %dx%d bits=%d%s\n",
++                    ret, c->mode, in_w, in_h, c->bits,
++                    t + 1 < n_modes ? " - trying next mode" : "");
++            pfn_NvVFX_DestroyEffect(c->handle);
++            c->handle = NULL;
++        }
++    }
++    if (!loaded) {
 +        vfg_destroy(c);
 +        return false;
 +    }
 +
++    // Per-Run parameters, written once here so the first Run has a defined
++    // state (FrameMultiplier=0 selects float-timestep mode).
++    pfn_NvVFX_SetU32(c->handle, "FrameMultiplier", (unsigned int)multiplier);
++    if (multiplier != 0)
++        pfn_NvVFX_SetU32(c->handle, "FrameIndex", 1);
++
 +    c->ready = true;
-+    fprintf(stderr, "VFG: init ok (%dx%d mode=%d k=%d)\n",
-+            in_w, in_h, mode, multiplier);
++    // c->mode, not the requested mode: the Mode fallback above may have picked
++    // a different one, and the log has to show what the engine actually runs.
++    if (multiplier)
++        fprintf(stderr, "VFG: init ok (%dx%d mode=%d%s k=%d shot-change=off)\n",
++                in_w, in_h, c->mode, c->mode != mode ? " fallback" : "", multiplier);
++    else
++        fprintf(stderr, "VFG: init ok (%dx%d mode=%d%s timestep shot-change=off)\n",
++                in_w, in_h, c->mode, c->mode != mode ? " fallback" : "");
 +    return true;
 +}
 +
@@ -8143,8 +8291,12 @@ index 0000000000..d27d3b9d96
 +{
 +    if (!c->handle || !c->ready)
 +        return false;
-+    if (multiplier < VFG_MULT_MIN || multiplier > VFG_MULT_MAX) {
-+        fprintf(stderr, "VFG: FrameMultiplier %d out of range (%d..%d)\n",
++    // 0 = float-timestep mode (FrameMultiplier 0 + Timestep), 2..8 = FrameIndex.
++    // The SDK applies the write on the next Run; vfg_process_timestep re-writes
++    // it anyway when it finds a non-zero multiplier, so this only keeps the
++    // bookkeeping coherent for the runtime switch.
++    if (multiplier != 0 && (multiplier < VFG_MULT_MIN || multiplier > VFG_MULT_MAX)) {
++        fprintf(stderr, "VFG: FrameMultiplier %d out of range (0, %d..%d)\n",
 +                multiplier, VFG_MULT_MIN, VFG_MULT_MAX);
 +        return false;
 +    }
@@ -8182,6 +8334,43 @@ index 0000000000..d27d3b9d96
 +        return false;
 +    }
 +
++    if (output_ptr) *output_ptr = c->out_img.pixels;
++    if (out_pitch)  *out_pitch  = (int)c->out_img.pitch;
++    return true;
++}
++
++// ── vfg_process_timestep ─────────────────────────────────────────────────
++// Arbitrary phase between the staged pair. Per the SDK documentation read out
++// of the installed library:
++//   "FrameMultiplier (uint32) - Set 0 (default) to use TIMESTEP; any write
++//    resets FRAME_INDEX and TIMESTEP"
++//   "Timestep (float) - temporal position in (0.0, 1.0); 0 = previous frame,
++//    1 = current frame (both exclusive). Requires FRAME_MULTIPLIER == 0"
++// so FrameMultiplier is written only when switching modes and Timestep every
++// Run (after that write, because the write clears it).
++
++bool vfg_process_timestep(struct vfg_context *c, float t,
++                          void **output_ptr, int *out_pitch)
++{
++    if (!c->ready || !pfn_NvVFX_SetF32)
++        return false;
++    if (!(t > 0.0f)) t = 1e-4f;
++    if (t > 1.0f - 1e-4f) t = 1.0f - 1e-4f;
++
++    if (c->multiplier != 0) {
++        pfn_NvVFX_SetU32(c->handle, "FrameMultiplier", 0);
++        c->multiplier = 0;
++    }
++    int ret = pfn_NvVFX_SetF32(c->handle, "Timestep", t);
++    if (ret != 0) {
++        fprintf(stderr, "VFG: SetF32(Timestep=%.6f) failed (%d)\n", (double)t, ret);
++        return false;
++    }
++    ret = pfn_NvVFX_Run(c->handle, 0);
++    if (ret != 0) {
++        fprintf(stderr, "VFG: Run(t=%.6f) failed (%d)\n", (double)t, ret);
++        return false;
++    }
 +    if (output_ptr) *output_ptr = c->out_img.pixels;
 +    if (out_pitch)  *out_pitch  = (int)c->out_img.pitch;
 +    return true;
@@ -8229,10 +8418,10 @@ index 0000000000..d27d3b9d96
 +}
 diff --git a/video/filter/vfg_proc.h b/video/filter/vfg_proc.h
 new file mode 100644
-index 0000000000..c279d88f98
+index 0000000000..695069b91d
 --- /dev/null
 +++ b/video/filter/vfg_proc.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,84 @@
 +// src/mpv/video/filter/vfg_proc.h
 +// VFG (NVIDIA VFX SDK VideoFrameGeneration) engine wrapper — isomorphic to
 +// the VSR wrapper in vsr_internal.h: engine handle + per-context NvCVImage
@@ -8278,7 +8467,7 @@ index 0000000000..c279d88f98
 +    bool    ready;
 +    int     in_w, in_h;
 +    int     mode;          // enum vfg_mode
-+    int     multiplier;    // FrameMultiplier (SetU32 before every Run)
++    int     multiplier;    // FrameMultiplier; 0 = float-timestep mode
 +    int     bits;          // 8 = RGBA U8, 10 = packed RGB10A2 (all three images must match)
 +};
 +
@@ -8299,6 +8488,14 @@ index 0000000000..c279d88f98
 +// SetU32 this parameter every time, and it is not marked requires_reload).
 +bool vfg_set_multiplier(struct vfg_context *c, int multiplier);
 +
++// Float-timestep mode (SDK: "FrameMultiplier - set 0 to use TIMESTEP";
++// "Timestep (float) - temporal position in (0.0,1.0), requires
++// FRAME_MULTIPLIER == 0"). Generates the frame at an arbitrary phase, which
++// is what lets the output rate land on an exact divisor of the display
++// refresh (e.g. 82.5 fps for 165 Hz / k=2) instead of an integer multiple.
++bool vfg_process_timestep(struct vfg_context *c, float t,
++                          void **output_ptr, int *out_pitch);
++
 +// Generate the frame_index-th interpolated frame of the current pair
 +// (1..multiplier-1, multiplier mode t = frame_index/multiplier). On success
 +// *output_ptr points at the engine output buffer (the caller must finish
@@ -8311,10 +8508,10 @@ index 0000000000..c279d88f98
 +void vfg_destroy(struct vfg_context *c);
 diff --git a/video/filter/vfx_loader.c b/video/filter/vfx_loader.c
 new file mode 100644
-index 0000000000..a32e821296
+index 0000000000..aede4d61ae
 --- /dev/null
 +++ b/video/filter/vfx_loader.c
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,260 @@
 +// src/mpv/video/filter/vfx_loader.c
 +// VFX library locator/loader layer, sole implementation (interface in
 +// vfx_loader.h) — a pure move out of vsr_proc.c: search order, log text,
@@ -8339,6 +8536,7 @@ index 0000000000..a32e821296
 +PFN_NvVFX_CreateEffect    pfn_NvVFX_CreateEffect;
 +PFN_NvVFX_DestroyEffect   pfn_NvVFX_DestroyEffect;
 +PFN_NvVFX_SetU32          pfn_NvVFX_SetU32;
++PFN_NvVFX_SetF32          pfn_NvVFX_SetF32;   // optional: VFG timestep mode
 +PFN_NvVFX_SetImage        pfn_NvVFX_SetImage;
 +PFN_NvVFX_GetImage        pfn_NvVFX_GetImage;
 +PFN_NvVFX_SetCudaStream   pfn_NvVFX_SetCudaStream;
@@ -8518,6 +8716,9 @@ index 0000000000..a32e821296
 +    LOAD_SYM(g_vfx_lib,  NvVFX_CreateEffect);
 +    LOAD_SYM(g_vfx_lib,  NvVFX_DestroyEffect);
 +    LOAD_SYM(g_vfx_lib,  NvVFX_SetU32);
++    // Optional, not LOAD_SYM: a library without SetF32 must not break
++    // VSR/TrueHDR. Only the VFG float-timestep path needs it.
++    pfn_NvVFX_SetF32 = (PFN_NvVFX_SetF32)dlsym(g_vfx_lib, "NvVFX_SetF32");
 +    LOAD_SYM(g_vfx_lib,  NvVFX_SetImage);
 +    LOAD_SYM(g_vfx_lib,  NvVFX_GetImage);
 +    LOAD_SYM(g_vfx_lib,  NvVFX_SetCudaStream);
@@ -8573,10 +8774,10 @@ index 0000000000..a32e821296
 +#undef LOAD_SYM
 diff --git a/video/filter/vfx_loader.h b/video/filter/vfx_loader.h
 new file mode 100644
-index 0000000000..1fed8555eb
+index 0000000000..0b218fa552
 --- /dev/null
 +++ b/video/filter/vfx_loader.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,102 @@
 +// src/mpv/video/filter/vfx_loader.h
 +// VFX (NVIDIA Video Effects SDK) library locator and load layer — the
 +// **single source of truth** shared by VSR (vsr_proc.c), VFG (vfg_proc.c)
@@ -8641,6 +8842,7 @@ index 0000000000..1fed8555eb
 +typedef int (*PFN_NvVFX_CreateEffect)(const char*, void**);
 +typedef void (*PFN_NvVFX_DestroyEffect)(void*);
 +typedef int (*PFN_NvVFX_SetU32)(void*, const char*, unsigned int);
++typedef int (*PFN_NvVFX_SetF32)(void*, const char*, float);
 +typedef int (*PFN_NvVFX_SetImage)(void*, const char*, NvCVImage*);
 +typedef int (*PFN_NvVFX_GetImage)(void*, const char*, NvCVImage*);
 +typedef int (*PFN_NvVFX_SetCudaStream)(void*, const char*, CUstream);
@@ -8661,6 +8863,7 @@ index 0000000000..1fed8555eb
 +extern PFN_NvVFX_CreateEffect    pfn_NvVFX_CreateEffect;
 +extern PFN_NvVFX_DestroyEffect   pfn_NvVFX_DestroyEffect;
 +extern PFN_NvVFX_SetU32          pfn_NvVFX_SetU32;
++extern PFN_NvVFX_SetF32          pfn_NvVFX_SetF32;
 +extern PFN_NvVFX_SetImage        pfn_NvVFX_SetImage;
 +extern PFN_NvVFX_GetImage        pfn_NvVFX_GetImage;
 +extern PFN_NvVFX_SetCudaStream   pfn_NvVFX_SetCudaStream;

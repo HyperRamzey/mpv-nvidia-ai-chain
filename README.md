@@ -18,6 +18,11 @@ nvdec  ->  hwup  ->  dlssnr   ->  [vsr]   ->  truehdr  ->  vfg   ->  gpu-next
                                                on PQ/HLG)
 ```
 
+The CRT beam simulator (`Ctrl+Alt+b`) sits at the far end of this: it is a
+gpu-next `OUTPUT` user shader, so it runs after every AI filter, after scaling
+and after tone mapping, and it needs one rendered frame per refresh (interpolation
+or VFG) to step the beam. See `docs/CRT-BEAM.md`.
+
 Order is load-bearing: **NR runs before frame generation**. A present-stage layer
 cannot do that before interpolation, which is why NR is a
 filter and not a Vulkan layer.
@@ -32,10 +37,13 @@ filter and not a Vulkan layer.
 | `input.conf` | NeuralScreen-style keybindings for all DLSS 5 & VFX settings (60% keyboard layout) |
 | `scripts/vfg-sync.lua` | Keeps VFG's output cap equal to the current display refresh |
 | `scripts/nr-toggle.lua` | Controller for DLSS 5 NR lifecycle, passes, profiles, and OSD HUD |
+| `scripts/beam-sim.lua` | CRT beam controller: subframes/gain from refresh + source fps, live tuning, OSD |
+| `shaders/crt-beam-sim.glsl` | CRT beam simulator (Blur Busters rolling scan, per-pixel MPRT) |
 | [mpv-ai-extension](https://github.com/HyperRamzey/mpv-ai-extension) | Chromium/Helium MV3 extension + native messaging host (separate repo) |
 | `.github/workflows/` | `ci.yml` (fast gates) and `release.yml` (cold makepkg → GitHub release) |
 | `docs/AI-CHAIN.md` | Operation manual: resolution/DoVi policy, trap list, rebuild |
 | `docs/DLSS5-NR-PLAN.md` | Design of record for the NR filter: constraints, composite, every measured number |
+| `docs/CRT-BEAM.md` | Beam simulator: the published algorithm, the one deviation, measured evidence, limits |
 | `tools/verify_comments_only.py` | Proves a source edit changed only comments/strings (used for the English pass) |
 
 ## Requirements
@@ -140,6 +148,11 @@ All shortcuts use standard alphanumeric keys with `Ctrl+Alt+...` or `Ctrl+Alt+Sh
 | `Ctrl+Alt+m` | `dlssnr-automask-toggle` | Toggle UI & text protection auto-mask |
 | `Ctrl+Alt+f` | `vfg-toggle` | Toggle Frame Generation (VFG auto / off) |
 | `Ctrl+Alt+d` | `dlssnr-status` | Display DLSS 5 live OSD status dashboard |
+| `Ctrl+Alt+b` | `beam-toggle` | Toggle the CRT beam simulator (rolling scan, per-pixel MPRT) |
+| `Ctrl+Alt+Shift+b` | `beam-subframes-cycle` | Cycle beam subframes 2 → 3 → 4 → 5 → 6 → 8 → 10 → 12 |
+| `Ctrl+Alt+g` / `Shift+g` | `beam-gain` | Brightness-vs-clarity ±0.025 (0.7 at 240 Hz, 0.5 at 120 Hz) |
+| `Ctrl+Alt+y` | `beam-direction-cycle` | Raster: global (BFI) → down → up → right → left |
+| `Ctrl+Alt+v` | `beam-status` | Beam status: subframes, gain, MPRT, sweep rate |
 
 DLSS 5 Neural Render is **off by default** (`dlssnr:passes=0`, a true passthrough —
 the filter returns before any CUDA work, so it costs nothing). Enable it by
@@ -166,6 +179,7 @@ marks it in `vf=` (`@dlssnr:dlssnr:…` is addressed as `dlssnr`):
 vf-command dlssnr passes 1
 vf-command vfg fps 3
 vf-command vfg max-fps 120
+vf-command vfg out-fps 82.5   # float timestep: exact rate (0 = back to integer k)
 ```
 
 ### Console Commands (`~` interactive console)

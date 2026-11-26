@@ -59,6 +59,35 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           luac5.1 -p scripts/vfg-sync.lua
           lua5.1 tests/vfg-sync-refresh.lua
+          luac5.1 -p scripts/beam-sim.lua
+          lua5.1 tests/beam-sim.lua
+
+      # libplacebo aborts a whole user shader on an unknown header, and rejects
+      # a PARAM that follows the HOOK block. Both mistakes are silent at
+      # runtime (the shader simply does not load), so they get their own gate.
+      - name: Beam shader headers are well formed
+        run: |
+          set -euo pipefail
+          shader=shaders/crt-beam-sim.glsl
+          known='//!(HOOK|BIND|PARAM|DESC|TYPE|MINIMUM|MAXIMUM)([[:space:]]|$)'
+          stray="$(grep -n '//!' "$shader" | grep -vE "$known" || true)"
+          if [ -n "$stray" ]; then
+            echo "$stray"
+            echo "::error::header marker on a non-header line"
+            exit 1
+          fi
+          first_hook="$(grep -n '//!HOOK' "$shader" | head -1 | cut -d: -f1)"
+          last_param="$(grep -n '//!PARAM' "$shader" | tail -1 | cut -d: -f1)"
+          if [ -n "$last_param" ] && [ "$last_param" -gt "$first_hook" ]; then
+            echo "::error::PARAM block after HOOK is rejected by libplacebo"
+            exit 1
+          fi
+          for name in subframes gain_vs_blur gamma scan_direction \
+                      raster_mod anti_retention slew transfer peak_nits; do
+            grep -q "^//!PARAM $name$" "$shader" \
+              || { echo "::error::missing PARAM $name"; exit 1; }
+          done
+          echo "beam shader headers ok"
 
       - name: ai.conf is a valid mpv config
         run: |
