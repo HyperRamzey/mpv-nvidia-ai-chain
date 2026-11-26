@@ -111,7 +111,8 @@ jobs:
             exit 1
           fi
           for name in subframes gain_vs_blur gamma scan_direction \
-                      raster_mod anti_retention slew transfer peak_nits; do
+                      raster_mod anti_retention slew transfer peak_nits \
+                      beam_headroom; do
             grep -q "^//!PARAM $name$" "$shader" \
               || { echo "::error::missing PARAM $name"; exit 1; }
           done

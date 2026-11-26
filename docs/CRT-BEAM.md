@@ -7,7 +7,7 @@ dithering. Opt-in, one keybind, no rebuild.
 | Piece | What |
 | --- | --- |
 | `shaders/crt-beam-sim.glsl` | the algorithm: per-pixel photon budget + rolling raster |
-| `scripts/beam-sim.lua` | subframes/gain choice, interpolation setup, live tuning, OSD |
+| `scripts/beam-sim.lua` | subframes/headroom choice, interpolation setup, live tuning, OSD |
 | `input.conf` | `Ctrl+Alt+b` toggle + tuning binds |
 
 Reference: <https://github.com/blurbusters/crt-beam-simulator> (`crt-simulator.glsl`,
@@ -23,26 +23,51 @@ beam passes. The published algorithm does the same in software, but with a
 twist that a plain black bar cannot do:
 
 ```text
-budget(refresh units) = linear_brightness * subframes * gain_vs_blur
-window                = one refresh of raster travel, at the current beam position
-output(per refresh)   = length of the overlap between the budget interval and the window
+light per sweep  = intensity * emission_time == linear_brightness * subframes
+emission_time    = linear_brightness * subframes / intensity      (MPRT)
+window           = one refresh of raster travel, at the beam position
+output(per refresh) = intensity * overlap(emission interval, window)
 ```
 
 Every pixel and colour channel gets its own emission interval, anchored where the
-beam reaches it. Over one sweep the pixel delivers exactly
-`linear_brightness * gain_vs_blur` of light, and persistence (MPRT) is
-proportional to its brightness:
+beam reaches it. Persistence (MPRT) is proportional to brightness, and the sweep
+integral equals the source exactly, so **enabling the beam does not change the
+picture's brightness** — that is the whole point of the intensity/duration split.
 
-| pixel (linear) | MPRT at `gain_vs_blur=0.7` | motion blur |
+| pixel (linear) | emission (`beam_headroom=1`) | motion blur |
 | --- | --- | --- |
-| 1.00 (white) | 0.70 of a frame | −30% |
-| 0.22 (sRGB 0.5) | 0.15 of a frame | −85% |
-| 0.05 | 0.04 of a frame | −96% |
+| 1.00 (peak white) | the whole sweep | none — physics: a peak pixel cannot be brief |
+| 0.32 (203 nits at a 630-nit peak) | 0.64 of a refresh | −36% |
+| 0.16 (SDR white through TrueHDR) | 0.32 of a refresh | −68% |
+| 0.05 | 0.10 of a refresh | −90% |
 
 That is the "variable per-pixel MPRT" claim: bright highlights keep a longer
-persistence, mid-tones and shadows get a very short one. It is also why there is
-no gain amplifier and no clipping to compensate for — per-refresh output is 1.0
-at most by construction.
+persistence, mid-tones and shadows get a very short one.
+
+### The reference's GAIN_VS_BLUR is a brightness trade, and HDR cannot take it
+
+The published shader defines `GAIN_VS_BLUR` as brightness: "0.5 is half
+brightness spread over fewer frames", and the article therefore recommends
+running the display in SDR. That is not usable in this chain — every pixel has to
+keep the nits its metadata asks for, or PQ, the TrueHDR peak and the tone mapping
+above it stop meaning anything. Its own HOWTO
+(<https://github.com/blurbusters/crt-beam-simulator/issues/4>) states the rule
+that actually matters: the simulator is Talbot-Plateau arithmetic, so the *time
+average* over a sweep is what must be conserved.
+
+So this port splits the two, and the split is why brightness survives:
+
+- `beam_headroom` (PQ only, default `1.0`) — how far **above** `peak_nits` the
+  beam may flash. `1.0` never exceeds the tone-mapped peak; `1.5` flashes at
+  1.5x for 2/3 of the persistence; average nits unchanged either way. On an OLED
+  with a 630-nit tone-map target and ~1000-nit small-window peak, `1.5` is the
+  useful setting. SDR is pinned to `1.0`: 8-bit output cannot represent anything
+  above its own white.
+- `gain_vs_blur` (default `1.0`) — caps how much of that headroom is used. It no
+  longer dims anything; lowering it lengthens the emission window (less peak
+  flash load, which is what OLED ABL cares about) at the same average brightness.
+
+Persistence at headroom `H`: `MPRT = p * subframes / H` refreshes
 
 ## One deliberate deviation
 
@@ -75,14 +100,17 @@ an aged ghost behind it.
   restores them on disable. Without it the mask only darkens the picture, and the
   OSD says so.
 - **Linear light in, linear light out.** The budget is a photon count, so the
-  shader needs the display's transfer function: `transfer=pq` decodes and
-  re-encodes with the real ST.2084 curve (SMPTE points: 0.50 -> 92.25 nits,
-  0.75 -> 983 nits) scaled by `peak_nits`, `transfer=sdr` uses a pure power
-  curve. The AI chain forces `transfer=pq`: TrueHDR emits HDR10 even for SDR
-  sources, so the script reads the *filter chain*, not `video-params/gamma`
-  (which keeps reporting `bt.1886`), and takes `peak_nits` from the chain's
-  `luminance`. Verified on the live chain: sweep-average out/in = 0.4998 for
-  `gain_vs_blur=0.5`, max deviation 0.0003, no channel above 1.0.
+  shader needs the transfer function of what the `OUTPUT` hook actually receives.
+  That is the **target**, not the chain: `transfer=pq` decodes and re-encodes
+  with the real ST.2084 curve, `transfer=sdr` with a pure power curve.
+  `detect_output()` therefore reads `video-out-params/gamma`:
+  with `vo=gpu-next` + `target-colorspace-hint=yes` (the shipped `mpv.conf`) the
+  target is PQ and the hook gets ST.2084 codes; with a tone-mapped SDR target the
+  hook gets display codes and `transfer=pq` would decode them as PQ and darken
+  the picture badly (measured: a 630-nit band collapsed from code 255 to 181).
+  `peak_nits` is the target peak: `video-out-params/max-luma` when the compositor
+  reports a real one (e.g. 654), else `target-peak`, else 1000 — a bare PQ target
+  reports the 10000-nit encoding ceiling, which is not a display peak.
 - **Fullscreen**, ideally direct scanout. Anything that makes the compositor skip
   or duplicate a present makes the beam stall or jump.
 
@@ -116,15 +144,16 @@ filter option `out-fps`, runtime `vf-command vfg out-fps <fps>`). Measured on a
 | `Ctrl+Alt+b` | toggle the beam |
 | `Ctrl+Alt+Shift+b` | cycle subframes 2 → 3 → 4 → 5 → 6 → 8 → 10 → 12 |
 | `Ctrl+Alt+Shift+o` | subframes back to auto |
-| `Ctrl+Alt+g` / `Ctrl+Alt+Shift+g` | brightness-vs-clarity ±0.025 |
-| `Ctrl+Alt+a` | gain back to the tier for the current refresh (0.7 at ≥200 Hz, 0.5 at ≥100 Hz, 0.35 below) |
+| `Ctrl+Alt+g` / `Ctrl+Alt+Shift+g` | headroom cap ±0.025 (never changes average brightness) |
+| `Ctrl+Alt+a` | gain back to auto (`1.0`: brightest, sharpest) |
 | `Ctrl+Alt+y` | raster: global (classic BFI) → top2bottom → bottom2top → left2right → right2left |
 | `Ctrl+Alt+j` / `Ctrl+Alt+Shift+j` | raster phase shift ±0.05 sweep (moves the seam) |
 | `Ctrl+Alt+l` | LCD anti-retention slew on/off (OLED does not need it) |
-| `Ctrl+Alt+v` | status: subframes, gain, MPRT, sweep Hz |
+| `Ctrl+Alt+v` | status: subframes, gain, headroom, MPRT, sweep Hz |
 
 Script messages: `script-message beam toggle|on|off|status`,
-`beam subframes 4`, `beam gain 0.6`, `beam direction top2bottom`, `beam raster -0.2`,
+`beam subframes 4`, `beam gain 0.6`, `beam headroom 1.5`,
+`beam direction top2bottom`, `beam raster -0.2`,
 and the two that drive the pacing: `beam sweep 72` (target sweep rate in Hz; k is
 re-derived and VFG is retargeted to `display/k`) and `beam k 3` (pin k directly,
 which also retargets VFG). Both print the resulting sweep, VFG rate and pacing
@@ -141,31 +170,33 @@ Measured on this box (RTX 5070, 165 Hz panel, driver 620.73.04), twice: on
 (`gpu-api=vulkan`, `gpu-context=waylandvk`) with the real `mpv.conf`. The two
 backends agree within sampling noise; the numbers below are the Vulkan run.
 
-The shader's light budget was first checked against a numpy reimplementation of
-the published formula over a parameter grid (subframes 2–10, gain 0.3–1.0, all
-raster phases, every brightness in 0..1): the per-refresh output never exceeded
-1.0, and the sweep-average equalled `p * gain` exactly for every point.
-
-Live playback of a ramp with the shipped config (`vulkan`/`waylandvk`,
-`interpolation=yes`, `video-sync=display-resample`, `subframes=4`,
-`gain_vs_blur=0.7`, 30 phase-random samples), by brightness:
+Two instruments, in stages, each replaying/extracting the *shipped* source
+(`/tmp/beam_check.py` extracts the PQ constants from the .glsl; the phase sweep
+uses the real shader on the GPU):
 
 ```text
- x   p_lin   mean_lin/ref_lin   frames_lit   L= p*k*gain   ceil(L)/k
- 48   0.030        0.746           0.267         0.09         0.25
-168   0.281        0.746           0.267         0.79         0.25
-192   0.364        0.743           0.500         1.02         0.50
-288   0.829        0.706           0.767         2.32         0.75
+stage 1  SDR 8-bit ramp, k=2/4/8, H=1     sweep-average == source linear light   PASS
+stage 2  PQ 10-bit, 0.5..630 nits, k=2/4  sweep-average nits == source nits     PASS
+stage 3  headroom 1/1.5/2/4               average unchanged, flash == H*peak     PASS
+stage 4  persistence                      MPRT == p*k/H, <= k for white          PASS
+stage 5  no clipping at H=1               worst emitted sample 1.000 (k=2..8)     PASS
 ```
 
-- per-frame output ceiling: max 1.000 → nothing clips
-- light conservation in linear light: `|ratio − 0.7|` mean 0.033 (OpenGL run:
-  mean 0.033 too, max 0.050 there)
-- frames lit per sweep tracks brightness (correlation 0.931, OpenGL run 0.851) at
-  exactly `ceil(L)/k` → per-pixel MPRT is real, not a global duty cycle
-- toggle through `script-binding beam_sim/beam-toggle` on the real config:
-  shader appended to `glsl-shaders`, seven parameters registered,
-  `interpolation`/`video-sync` switched on and restored on off
+End-to-end on the GPU: a frozen screenshot cannot show a time integral, so the
+integration walks the phase instead. `screenshot-to-file video` renders at a
+fixed phase, but `raster_mod` shifts that phase deterministically, so 20
+screenshots at `raster_mod = i/20` are the sweep integral (compared in linear
+light, code 8-bit):
+
+```text
+band         beam off   beam on integral   deviation
+near-white     236.0          235.7          0.27%
+mid-grey       129.0          128.6          0.76%
+near-black      15.0           15.3          4.8% (<1 code: 20-phase grid limit)
+```
+
+Before the fix the same measurement was 0.5x: `gain_vs_blur` was 0.5 on a 165 Hz
+panel and the budget was `p * k * gain`, i.e. the reference's brightness trade.
 
 Unit tests: `lua tests/beam-sim.lua` (and `luajit`). Each case was re-run against
 five deliberate mutations (MPRT formula, gain tiers, HDR gamma, option merge,
@@ -197,8 +228,11 @@ backend-agnostic and was verified on both.
 
 - The sweep is driven by the renderer, not by the panel's scanout. Compositor
   effects, a non-fullscreen window, or a dropped present break the phase.
-- Shorter persistence is dimmer light: `gain_vs_blur` is the trade, and the
-  reference explicitly warns that HDR/peak boosts re-introduce banding.
+- Brightness is conserved, so persistence and brightness are no longer a trade.
+  What *is* still constrained: a pixel at the display peak cannot be brief. For
+  sharper highlights, raise `beam_headroom` (flash above the tone-map peak) or
+  raise `truehdr:luminance` to what the panel can really do — both are real
+  headroom, and neither changes average brightness.
 - FALD/MiniLED backlights lag the panel and smear the beam; the reference advises
   against them for this algorithm.
 - A 24 fps source at `subframes=8` really does flicker at 30 Hz per pixel. That

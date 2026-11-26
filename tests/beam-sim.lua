@@ -144,12 +144,21 @@ end
 do
     local api = new_player().api
 
-    near(api.mprt({ gain_vs_blur = 0.7 }, 1.0), 0.7, "mprt: white keeps 0.7 frame")
-    near(api.mprt({ gain_vs_blur = 0.7 }, 0.216), 0.1512, "mprt: mid grey is short")
-    near(api.mprt({ gain_vs_blur = 0.7 }, 0.0), 0.0, "mprt: black never lights")
-    near(api.mprt({ gain_vs_blur = 1.0 }, 1.0), 1.0, "mprt: gain 1 is a full hold")
-    near(api.mprt({ gain_vs_blur = 0.5 }, 0.8), 0.4, "mprt: proportional to brightness")
-    near(api.mprt({ gain_vs_blur = 0.5 }, 5.0), 0.5, "mprt: clamped at one frame")
+    -- Light conservation: intensity * emission_time == p * k. With no headroom
+    -- the emission IS the persistence, so MPRT = p * k refreshes and brightness
+    -- is preserved at every level.
+    near(api.mprt({ subframes = 4 }, 1.0, 4), 4.0, "mprt: white holds a whole sweep")
+    near(api.mprt({ subframes = 4 }, 0.216, 4), 0.864, "mprt: mid grey is brief")
+    near(api.mprt({ subframes = 4 }, 0.0, 4), 0.0, "mprt: black never lights")
+    near(api.mprt({ subframes = 2 }, 0.5, 2), 1.0, "mprt: proportional to brightness")
+    -- PQ headroom buys sharpness instead of costing brightness.
+    near(api.mprt({ subframes = 4, transfer = "pq", beam_headroom = 2.0 }, 1.0, 4),
+         2.0, "mprt: PQ headroom 2 halves persistence")
+    near(api.mprt({ subframes = 4, transfer = "pq", beam_headroom = 2.0,
+                    gain_vs_blur = 0.5 }, 1.0, 4), 4.0,
+         "mprt: gain caps the usable headroom")
+    near(api.mprt({ subframes = 4, transfer = "sdr", beam_headroom = 4.0 }, 1.0, 4),
+         4.0, "mprt: SDR pins headroom to 1.0")
 
     -- k follows the wanted sweep rate (default 72 Hz), never the source rate:
     -- the frame generator upstream supplies whatever rate is asked for.
@@ -170,12 +179,12 @@ do
     local _, why_slow = api.pacing_ok(60, 30)
     equal(why_slow, "slow-sweep", "pacing: a 30 Hz beam is rejected as too slow")
 
-    near(api.gain_for(240), 0.7, "gain: 240 Hz recommendation")
-    near(api.gain_for(200), 0.7, "gain: 200 Hz is the 0.7 tier")
-    near(api.gain_for(165), 0.5, "gain: 165 Hz recommendation")
-    near(api.gain_for(120), 0.5, "gain: 120 Hz recommendation")
-    near(api.gain_for(60), 0.35, "gain: low refresh tier")
-    near(api.gain_for(nil), 0.7, "gain: unknown refresh falls back")
+    -- The reference's per-refresh tiers are brightness trades; this chain keeps
+    -- metadata brightness, so the automatic value is always the full headroom.
+    near(api.gain_for(240), 1.0, "gain: 240 Hz keeps full brightness")
+    near(api.gain_for(165), 1.0, "gain: 165 Hz keeps full brightness")
+    near(api.gain_for(120), 1.0, "gain: 120 Hz keeps full brightness")
+    near(api.gain_for(nil), 1.0, "gain: unknown refresh keeps full brightness")
 end
 
 -- ---------------------------------------------------------------------------
@@ -184,7 +193,7 @@ end
 do
     local api = new_player().api
     local st = {
-        subframes = 4.0, gain_vs_blur = 0.7, gamma = 2.2,
+        subframes = 4.0, gain_vs_blur = 1.0, gamma = 2.2,
         scan_direction = "top2bottom", raster_mod = 0.0,
         anti_retention = 0, slew = 0.001,
     }
@@ -192,12 +201,13 @@ do
     local merged = api.merge_opts(
         "crt-beam-sim/gain_vs_blur=1.0,other-shader/x=2,crt-beam-sim/custom=7", st)
     contains(merged, "crt-beam-sim/subframes=4", "merge: subframes written")
-    contains(merged, "crt-beam-sim/gain_vs_blur=0.700", "merge: ours replaced")
+    contains(merged, "crt-beam-sim/gain_vs_blur=1.000", "merge: ours replaced")
     contains(merged, "crt-beam-sim/scan_direction=top2bottom", "merge: enum written")
     contains(merged, "crt-beam-sim/anti_retention=0", "merge: int written")
     contains(merged, "other-shader/x=2", "merge: foreign shader kept")
     contains(merged, "crt-beam-sim/custom=7", "merge: unknown key of ours kept")
-    missing(merged, "gain_vs_blur=1.0", "merge: stale value dropped")
+    missing(merged, "crt-beam-sim/gain_vs_blur=1.0,", "merge: stale value dropped")
+    contains(merged, "crt-beam-sim/beam_headroom=1.00", "merge: beam headroom written")
     missing(merged, ",,", "merge: no empty fields")
 
     st.subframes = 3.5
@@ -218,9 +228,9 @@ do
     equal(player.props["interpolation"], "yes", "enable: interpolation on")
     equal(player.props["video-sync"], "display-resample", "enable: display sync on")
     equal(api.state.subframes, 3, "enable: 3 subframes for a 72 Hz sweep on 240 Hz")
-    near(api.state.gain_vs_blur, 0.7, "enable: 0.7 at 240 Hz")
+    near(api.state.gain_vs_blur, 1.0, "enable: gain 1.0 (brightness is not traded)")
     contains(opts_of(player), "crt-beam-sim/subframes=3", "enable: subframes pushed")
-    contains(opts_of(player), "crt-beam-sim/gain_vs_blur=0.700", "enable: gain pushed")
+    contains(opts_of(player), "crt-beam-sim/gain_vs_blur=1.000", "enable: gain pushed")
     contains(opts_of(player), "crt-beam-sim/gamma=2.200", "enable: SDR gamma pushed")
     contains(opts_of(player), "crt-beam-sim/transfer=sdr", "enable: SDR transfer pushed")
     contains(opts_of(player), "crt-beam-sim/peak_nits=", "enable: peak nits pushed")
@@ -276,21 +286,26 @@ do
 end
 
 do
-    -- HDR source: the budget runs on raw PQ codes, gain stays the SDR-tier one.
+    -- HDR *target*: the OUTPUT hook receives ST.2084 codes (mpv passes PQ
+    -- through when the output is HDR), so the budget runs on absolute nits.
     local player = new_player(sdr(240, 24, {
-        ["video-params/gamma"] = "pq",
+        ["video-out-params/gamma"] = "pq",
+        ["video-out-params/max-luma"] = 654,
         ["interpolation"] = "yes",
         ["video-sync"] = "display-resample",
     }))
     local api = player.api
     api.enable()
     contains(opts_of(player), "crt-beam-sim/transfer=pq", "hdr: PQ transfer selected")
-    contains(opts_of(player), "crt-beam-sim/peak_nits=1000.0", "hdr: peak nits pushed")
-    contains(opts_of(player), "crt-beam-sim/gain_vs_blur=0.700", "hdr: gain tier unchanged")
+    contains(opts_of(player), "crt-beam-sim/peak_nits=654.0", "hdr: peak nits from max-luma")
+    contains(opts_of(player), "crt-beam-sim/gain_vs_blur=1.000", "hdr: gain is 1.0 (brightness kept)")
     contains(player.osd, "PQ output", "hdr: OSD reports the PQ budget")
 
-    player.props["video-params/gamma"] = "bt.1886"
-    player.observed["video-params/gamma"]("video-params/gamma", "bt.1886")
+    -- Compositor flips to SDR: the hook now gets tone-mapped display codes, so
+    -- decoding them as PQ would darken the picture badly (measured: 255 -> 181).
+    player.props["video-out-params/gamma"] = "bt.1886"
+    player.observed["video-out-params"]("video-out-params", {})
+    contains(opts_of(player), "crt-beam-sim/transfer=sdr", "hdr->sdr: transfer follows the target")
     contains(opts_of(player), "crt-beam-sim/gamma=2.200", "hdr->sdr: linear-light budget back")
 end
 
@@ -320,19 +335,29 @@ do
         "~~/shaders/crt-beam-sim.glsl")
     player.bindings["beam-gain-down"]()
     equal(api.state.gain_auto, false, "tuning: manual gain disables auto")
-    near(api.state.gain_vs_blur, 0.675, "tuning: gain steps down by 0.025")
-    contains(opts_of(player), "crt-beam-sim/gain_vs_blur=0.675", "tuning: gain pushed")
+    near(api.state.gain_vs_blur, 0.975, "tuning: gain steps down by 0.025")
+    contains(opts_of(player), "crt-beam-sim/gain_vs_blur=0.975", "tuning: gain pushed")
     equal(player.count("change-list", "glsl-shaders", "append",
         "~~/shaders/crt-beam-sim.glsl"), appends, "tuning: no shader reload for a parameter")
 
     for _ = 1, 60 do player.bindings["beam-gain-up"]() end
-    near(api.state.gain_vs_blur, 1.0, "tuning: gain clamps at 1.0 (no blur reduction)")
+    near(api.state.gain_vs_blur, 1.0, "tuning: gain clamps at 1.0 (full headroom)")
     for _ = 1, 60 do player.bindings["beam-gain-down"]() end
     near(api.state.gain_vs_blur, 0.01, "tuning: gain clamps at 0.01")
 
+    -- beam_headroom is the knob that buys sharpness without touching brightness
+    equal(api.state.beam_headroom, 1.0, "headroom: defaults to 1.0 (never above peak)")
+    player.messages["beam"]("headroom", "2.5")
+    near(api.state.beam_headroom, 2.5, "headroom: set from a message")
+    contains(opts_of(player), "crt-beam-sim/beam_headroom=2.50", "headroom: pushed")
+    player.messages["beam"]("headroom", "99")
+    near(api.state.beam_headroom, 8.0, "headroom: clamped at 8x")
+    player.messages["beam"]("headroom", "0.1")
+    near(api.state.beam_headroom, 1.0, "headroom: clamped at 1.0x")
+
     player.bindings["beam-gain-auto"]()
     equal(api.state.gain_auto, true, "tuning: auto gain back on")
-    near(api.state.gain_vs_blur, 0.7, "tuning: auto gain recomputed for 240 Hz")
+    near(api.state.gain_vs_blur, 1.0, "tuning: auto gain is 1.0 (brightness kept)")
 
     player.bindings["beam-subframes-auto"]()
     equal(api.state.subframes_auto, true, "tuning: auto subframes back on")
@@ -429,20 +454,39 @@ do
             { name = "truehdr", enabled = true, params = { enable = "no", luminance = "630" } },
         },
     }
+    -- SDR target: the VO tone-mapped whatever the chain produced, so the hook
+    -- sees display codes no matter that truehdr/luminance is configured.
+    player.props["video-out-params/gamma"] = "bt.1886"
     local tr, peak = player.api.detect_output()
-    equal(tr, "sdr", "detect_output: truehdr enable=no is SDR")
-    equal(peak, 700, "detect_output: SDR default peak")
+    equal(tr, "sdr", "detect_output: SDR target -> sdr")
+    equal(peak, 100, "detect_output: SDR reports reference white")
 
+    -- Same chain, HDR target: now the hook gets ST.2084 codes and the peak is
+    -- the peak the display is driven at, not the chain's internal luminance.
+    player.props["video-out-params/gamma"] = "pq"
+    player.props["video-out-params/max-luma"] = 654
     player.native.vf[1].params.enable = "yes"
     tr, peak = player.api.detect_output()
-    equal(tr, "pq", "detect_output: truehdr enable=yes is PQ")
-    equal(peak, 630, "detect_output: truehdr luminance used for SDR->HDR")
+    equal(tr, "pq", "detect_output: PQ target -> pq even with truehdr on")
+    equal(peak, 654, "detect_output: peak from the compositor max-luma")
 
-    player.props["video-params/gamma"] = "pq"
+    -- PQ target without max-luma falls back to target-peak, then to 1000.
+    player.props["video-out-params/max-luma"] = nil
     player.props["target-peak"] = 1000
     tr, peak = player.api.detect_output()
     equal(tr, "pq", "detect_output: native PQ stays PQ")
-    equal(peak, 1000, "detect_output: native PQ ignores TrueHDR luminance")
+    equal(peak, 1000, "detect_output: falls back to target-peak")
+
+    player.props["target-peak"] = nil
+    tr, peak = player.api.detect_output()
+    equal(peak, 1000, "detect_output: last resort 1000 nits")
+
+    -- A bare PQ target with no HDR compositor reports the 10000-nit encoding
+    -- ceiling as max-luma; that is not a display peak.
+    player.props["video-out-params/max-luma"] = 10000
+    player.props["target-peak"] = 630
+    tr, peak = player.api.detect_output()
+    equal(peak, 630, "detect_output: 10000 sentinel ignored, target-peak used")
 end
 
 print("beam-sim tests passed")

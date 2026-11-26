@@ -15,22 +15,51 @@
 //   as the beam passes. This shader reconstructs that by giving every pixel, in
 //   every colour channel, a *photon budget* measured in refreshes:
 //
-//       L = linear_brightness * subframes * gain_vs_blur        (refreshes)
+//       L = intensity * emission_time                        (light per sweep)
 //
 //   anchored at the moment the simulated beam reaches that pixel, and emits it
 //   at the first opportunity. The pixel is lit while the current refresh window
-//   overlaps its budget, and dark once the budget is spent, until the next
+//   overlaps its emission window, and dark once it is spent, until the next
 //   sweep. So MPRT (the persistence that causes motion blur) is proportional to
 //   pixel brightness: bright highlights keep a long persistence, mid-tones and
 //   shadows get a very short one. That is the "variable per-pixel MPRT" of the
 //   published algorithm, and it is what avoids the two failure modes of a plain
 //   rolling black bar: banding and clipping.
 //
-//   Light is conserved: over one sweep a pixel delivers exactly
-//   linear_brightness * gain_vs_blur, so gain_vs_blur=1.0 is unchanged
-//   brightness with no blur reduction on white, and 0.7 is the documented
-//   recommendation for 240 Hz. Per-refresh output never exceeds 1.0 by
-//   construction, so there is nothing to clip and nothing to "boost".
+// BRIGHTNESS IS PRESERVED -- and blur reduction is kept
+//   The reference defines GAIN_VS_BLUR as a brightness trade ("0.5 is half
+//   brightness spread over fewer frames") and recommends SDR mode for that
+//   reason. That cannot be shipped in an HDR chain: every displayed pixel has to
+//   keep the nits its metadata asks for, or PQ, the TrueHDR peak and the tone
+//   mapping above it stop meaning anything. Its own HOWTO (blurbusters/
+//   crt-beam-simulator issue #4) states the governing rule: the simulator is
+//   Talbot-Plateau arithmetic, so what must be conserved is the *time average*
+//   over a sweep, not the instantaneous sample.
+//
+//   So the emission is split into an intensity and a duration instead of being
+//   folded into one brightness scale:
+//
+//       intensity * emission_time == p * subframes    (p = source linear light)
+//       emission_time = p * subframes / intensity
+//
+//   MPRT == emission_time, so asking for a *higher* intensity gives a shorter,
+//   brighter flash for the same average nits: peak headroom buys sharpness
+//   instead of costing brightness. beam_headroom = 1.0 never exceeds the tone
+//   mapped peak (nothing can clip); raising it uses whatever the panel has above
+//   peak_nits. Either way the sweep integral equals the source, so enabling the
+//   beam does not change the picture's brightness -- only its persistence.
+//
+//   With TrueHDR at peak_nits=630 an SDR white (100-203 nits) is p = 0.16-0.32,
+//   i.e. a 0.32-0.64 refresh emission window at k=2: most of the blur reduction
+//   and full brightness, no headroom needed. True HDR highlights near the peak
+//   keep a longer persistence -- that is physics, not a bug: a pixel cannot be
+//   both fully bright and brief unless the panel can flash above that peak, and
+//   that is exactly what beam_headroom expresses.
+//
+//   gain_vs_blur below 1.0 now *reduces* the usable headroom (i.e. it lowers the
+//   flash intensity and lengthens the window) instead of dimming the picture, so
+//   the knob still trades peak load against sharpness and never changes average
+//   brightness.
 //
 // DEVIATION FROM THE REFERENCE SHADER -- read this before judging the result
 //   The published algorithm reads the three trailing frames on purpose: a pixel
@@ -61,8 +90,13 @@
 // the reference shader where it has one.
 //   subframes       FRAMES_PER_HZ: native Hz / simulated CRT Hz. Reference uses
 //                   4 for 60 fps on 240 Hz. Fractional values are allowed.
-//   gain_vs_blur    GAIN_VS_BLUR: brightness-vs-clarity. 0.7 at 240 Hz, 0.5 at
-//                   120 Hz (reference defaults).
+//   gain_vs_blur    GAIN_VS_BLUR: the reference's brightness-vs-clarity trade.
+//                   Here it caps how much of beam_headroom is used, so lowering
+//                   it lengthens the emission window instead of dimming the
+//                   picture. 1.0 (default) = use the full headroom.
+//   beam_headroom   PQ only: how far above peak_nits the beam may flash. 1.0
+//                   never exceeds the tone-mapped peak; 1.5 flashes at up to
+//                   1.5x for 2/3 of the persistence. SDR is pinned to 1.0.
 //   gamma           display gamma for the linear-light budget: 2.2 for a
 //                   standard sRGB SDR output, 2.4 recommended by the reference,
 //                   1.0 to work on raw code values (PQ/HLG, approximate).
@@ -90,11 +124,11 @@
 //!MAXIMUM 32.0
 4.0
 //!PARAM gain_vs_blur
-//!DESC brightness vs clarity (1.0 = no blur reduction on white, 0.7 at 240 Hz)
+//!DESC brightness vs clarity; 1.0 preserves source nits (required for HDR)
 //!TYPE float
 //!MINIMUM 0.01
 //!MAXIMUM 1.0
-0.7
+1.0
 //!PARAM gamma
 //!DESC display gamma for the linear-light photon budget (1.0 = raw code values)
 //!TYPE float
@@ -138,6 +172,12 @@ pq
 //!MINIMUM 100.0
 //!MAXIMUM 10000.0
 700.0
+//!PARAM beam_headroom
+//!DESC PQ only: how far above peak_nits the beam may flash (1.0 = never above)
+//!TYPE float
+//!MINIMUM 1.0
+//!MAXIMUM 8.0
+1.0
 
 //!HOOK OUTPUT
 //!BIND HOOKED
@@ -234,8 +274,27 @@ vec4 hook()
     else if (scan_direction == 3) tube_pos = HOOKED_pos.x;        // left to right
     else                          tube_pos = 1.0 - HOOKED_pos.x;  // right to left
 
-    vec3 budget = vec3(bbs_decode(src.r), bbs_decode(src.g), bbs_decode(src.b));
-    budget = clamp(budget * k * clamp(gain_vs_blur, 0.01, 1.0), vec3(0.0), vec3(k));
+    vec3 p = vec3(bbs_decode(src.r), bbs_decode(src.g), bbs_decode(src.b));
+
+    // Beam intensity relative to peak_nits. Light is conserved exactly:
+    //
+    //     intensity * emission_time == p * k      (over one sweep)
+    //
+    // For a given intensity H the emission window is therefore
+    //
+    //     d = p * k / H        (refreshes)
+    //
+    // and MPRT == d, so a higher H means a shorter, brighter flash: same
+    // average nits (Talbot-Plateau, i.e. the source metadata is preserved),
+    // less persistence. H = 1.0 never asks the panel for more than the tone
+    // mapped peak, so nothing can clip; H > 1 uses whatever headroom the panel
+    // has above peak_nits and flashes proportionally harder. SDR cannot exceed
+    // its own white point in 8 bits, so H is pinned to 1.0 there and
+    // gain_vs_blur stays inert unless the output is PQ.
+    float headroom = (transfer == 1) ? clamp(beam_headroom, 1.0, 8.0) : 1.0;
+    headroom *= clamp(gain_vs_blur, 0.01, 1.0);
+    headroom = max(headroom, 1.0);
+    vec3 emit = clamp(p * k / headroom, vec3(0.0), vec3(k));
 
     float tube_frame = tube_pos * k;
 
@@ -247,10 +306,11 @@ vec4 hook()
     vec3 lit = vec3(0.0);
     for (int n = -1; n <= 0; n++) {
         float start = tube_frame + float(n) * k;
-        lit += clamp(min(start + budget, vec3(f_end)) - max(vec3(start), vec3(f_start)),
+        lit += clamp(min(start + emit, vec3(f_end)) - max(vec3(start), vec3(f_start)),
                      vec3(0.0), vec3(1.0));
     }
+    // Overlap is emission time; scale it to the intensity that flashes for it.
+    lit *= headroom;
 
-    // Per-refresh output is <= 1.0 by construction: no clipping, no gain boost.
     return vec4(bbs_encode(lit.r), bbs_encode(lit.g), bbs_encode(lit.b), src.a);
 }

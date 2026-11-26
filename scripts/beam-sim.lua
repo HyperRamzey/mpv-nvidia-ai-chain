@@ -32,7 +32,7 @@ local SHADER_PATH  = "~~/shaders/crt-beam-sim.glsl"
 local SHADER_NAME  = "crt-beam-sim"
 local PARAMS       = { "subframes", "gain_vs_blur", "gamma", "scan_direction",
                        "raster_mod", "anti_retention", "slew", "transfer",
-                       "peak_nits" }
+                       "peak_nits", "beam_headroom" }
 local SUBFRAME_STEPS = { 2, 3, 4, 5, 6, 8, 10, 12 }
 local DIRECTIONS  = { "global", "top2bottom", "bottom2top", "left2right", "right2left" }
 local MAX_SUBFRAMES = 12
@@ -52,8 +52,9 @@ local state = {
     on             = false,
     subframes      = 4.0,
     subframes_auto = true,
-    gain_vs_blur   = 0.7,
+    gain_vs_blur   = 1.0,
     gain_auto      = true,
+    beam_headroom  = 1.0,
     gamma          = 2.2,
     scan_direction = "top2bottom",
     raster_mod     = 0.0,
@@ -73,12 +74,27 @@ local function clamp(v, lo, hi)
     return v
 end
 
--- Persistence, in content frames, for a pixel of linear brightness p:
--- MPRT = p * gain_vs_blur, clipped at one frame. This is the property the
--- algorithm exists for -- it is not a global duty cycle.
-local function mprt(st, linear_brightness)
-    local g = clamp(st.gain_vs_blur, 0.01, 1.0)
-    return math.min(1.0, clamp(linear_brightness, 0.0, 1.0) * g)
+-- Beam intensity relative to the tone-mapped peak. Light conservation requires
+-- intensity * emission_time == p * subframes, so a brighter beam means a shorter
+-- flash for the same average nits. SDR is pinned to 1.0 because an 8-bit output
+-- cannot represent anything above its own white; PQ can flash into whatever
+-- headroom the panel has.
+local function headroom_of(st)
+    local h = clamp(st.gain_vs_blur or 1.0, 0.01, 1.0)
+    if st.transfer == "pq" then
+        h = h * clamp(st.beam_headroom or 1.0, 1.0, 8.0)
+    end
+    return math.max(1.0, h)
+end
+
+-- Persistence, in refreshes, for a pixel of linear brightness p:
+-- MPRT = p * subframes / headroom. At headroom 1.0 this is the conserving case
+-- (a white pixel is held for a whole sweep, dimmer pixels are brief); more
+-- headroom shortens every pixel's flash without touching the average.
+local function mprt(st, linear_brightness, subframes)
+    local p = clamp(linear_brightness, 0.0, 1.0)
+    local k = subframes or st.subframes or 4.0
+    return math.min(k, p * k / headroom_of(st))
 end
 
 -- Refreshes per rendered frame. `fps` here is the rate of the frames the
@@ -121,12 +137,13 @@ local function pacing_ok(refresh, fps)
     return true, "locked"
 end
 
--- Documented recommendation: 0.7 at 240 Hz, 0.5 at 120 Hz.
-local function gain_for(refresh)
-    if type(refresh) ~= "number" or refresh < 20 then return 0.7 end
-    if refresh >= 200 then return 0.7 end
-    if refresh >= 100 then return 0.5 end
-    return 0.35
+-- The reference's 0.7 (240 Hz) / 0.5 (120 Hz) numbers are brightness trades:
+-- they dim the picture to shorten persistence. This chain keeps every pixel at
+-- its metadata brightness, so there is nothing to trade away and the automatic
+-- value is always 1.0 (use the full headroom). Lower it by hand only to reduce
+-- peak flash load (OLED ABL), never for brightness.
+local function gain_for(_refresh)
+    return 1.0
 end
 
 local function fmt(v, digits)
@@ -153,6 +170,7 @@ local function merge_opts(existing, st)
         slew           = fmt(st.slew, 4),
         transfer       = (st.transfer == "pq") and "pq" or "sdr",
         peak_nits      = fmt(st.peak_nits or 700, 1),
+        beam_headroom  = fmt(st.beam_headroom or 1.0, 2),
     }
     local out = {}
     local prefix = SHADER_NAME .. "/"
@@ -176,16 +194,17 @@ local function merge_opts(existing, st)
 end
 
 local function status_line(refresh, fps)
-    local white = mprt(state, 1.0)
-    local mid = mprt(state, MID_LINEAR)
+    local white = mprt(state, 1.0, state.subframes)
+    local mid = mprt(state, MID_LINEAR, state.subframes)
     local sweep = (refresh and refresh > 0) and (refresh / math.max(state.subframes, 1)) or 0
     local ok, why = pacing_ok(refresh, fps)
     return string.format(
-        "Beam %s | %s subframes%s | gain %.2f | MPRT white %.2f / mid %.2f frame"
-        .. " | sweep %.1f Hz | %g fps | %s | %s",
+        "Beam %s | %s subframes%s | gain %.2f headroom %.2fx | MPRT white %.2f /"
+        .. " mid %.2f of %s | sweep %.1f Hz | %g fps | %s | %s",
         state.on and "ON" or "OFF", fmt_subframes(state.subframes),
         state.subframes_auto and " auto" or "",
-        state.gain_vs_blur, white, mid, sweep, fps or 0,
+        state.gain_vs_blur, headroom_of(state), white, mid,
+        fmt_subframes(state.subframes), sweep, fps or 0,
         ok and "pacing locked" or ("pacing " .. tostring(why)),
         state.transfer == "pq" and ("PQ " .. tostring(state.peak_nits) .. "nits") or "SDR")
 end
@@ -206,9 +225,33 @@ local function source_fps()
     return fps
 end
 
-local function is_pq_source()
-    local gamma = mp.get_property("video-params/gamma", "")
-    return gamma == "pq"
+-- The OUTPUT hook runs *after* libplacebo's colour management, so what it
+-- receives is the target space, not the chain's internal space. Two cases:
+--   * HDR target (target-colorspace-hint with an HDR-capable compositor, or an
+--     explicit --target-trc=pq): the hook gets ST.2084 codes that mean absolute
+--     nits, so transfer=pq and peak_nits = the peak the display is driven at.
+--   * SDR target: mpv tone-mapped everything (including whatever truehdr
+--     produced upstream) to the target curve before the hook, so the codes are
+--     display codes and transfer must be sdr.
+-- Reading video-out-params is what tells these apart; the source's or the
+-- chain's transfer cannot, which is why an earlier version mis-decoded a
+-- tone-mapped frame as PQ and lost most of the brightness.
+local function detect_output()
+    local out_gamma = mp.get_property("video-out-params/gamma", "")
+    if out_gamma == "pq" or out_gamma == "smpte2084" then
+        -- max-luma is the peak the target/compositor reports, but a bare PQ
+        -- target (no HDR compositor) reports the encoding ceiling 10000, which
+        -- is not a display peak; anything that high falls through to target-peak.
+        local peak = mp.get_property_number("video-out-params/max-luma", 0)
+        if type(peak) ~= "number" or peak <= 0 or peak >= 9900 then
+            peak = mp.get_property_number("target-peak", 0)
+        end
+        if type(peak) ~= "number" or peak <= 0 then peak = 1000 end
+        return "pq", peak
+    end
+    -- SDR target: peak_nits is unused by the shader there (headroom is pinned
+    -- to 1.0 as well), so report the reference white for the status line.
+    return "sdr", 100
 end
 
 -- Frames the renderer actually draws per second: the VF chain output rate when
@@ -218,41 +261,6 @@ local function render_fps()
     local fps = mp.get_property_number("estimated-vf-fps", 0)
     if type(fps) ~= "number" or fps <= 0 then return source_fps() end
     return fps
-end
-
-local function is_truthy(v)
-    if v == true or v == 1 then return true end
-    if type(v) ~= "string" then return false end
-    local s = v:lower()
-    return s == "yes" or s == "1" or s == "true" or s == "on"
-end
-
--- The shader cannot tell what the output stage did to the frame: TrueHDR emits
--- PQ (ST.2084) even for SDR sources and video-params/gamma keeps reporting the
--- *source* curve, so detection reads both the source transfer and the filter
--- chain. Native HDR passes through TrueHDR unchanged, so check it first.
-local function detect_output()
-    if mp.get_property("target-colorspace-hint", "") == "no" then
-        return "sdr", 700
-    end
-    if is_pq_source() then
-        local tp = mp.get_property_number("target-peak", 0)
-        return "pq", (tp and tp > 0) and tp or 1000
-    end
-    local vf = (type(mp.get_property_native) == "function")
-               and mp.get_property_native("vf", nil) or nil
-    if type(vf) == "table" then
-        for _, entry in ipairs(vf) do
-            if entry.name == "truehdr" and entry.enabled ~= false then
-                local params = entry.params or {}
-                if is_truthy(params.enable) then
-                    local lum = tonumber(params.luminance)
-                    return "pq", (lum and lum > 0) and lum or 700
-                end
-            end
-        end
-    end
-    return "sdr", 700
 end
 
 local function shader_present()
@@ -527,6 +535,10 @@ local function on_video_change()
 end
 
 mp.observe_property("video-params/gamma", "string", on_video_change)
+-- The output target decides transfer/peak_nits (see detect_output): it is only
+-- known once the VO is configured, and it changes when the compositor flips
+-- between SDR and HDR.
+mp.observe_property("video-out-params", "native", on_video_change)
 mp.observe_property("display-fps", "number", on_video_change)
 mp.register_event("file-loaded", on_video_change)
 mp.register_event("video-reconfig", on_video_change)
@@ -582,6 +594,13 @@ mp.register_script_message("beam", function(cmd, arg1)
             state.gain_auto = false
             state.gain_vs_blur = clamp(v, 0.01, 1.0)
             tuned(string.format("Beam gain vs blur: %.3f", state.gain_vs_blur))
+        end
+    elseif cmd == "headroom" or cmd == "beam_headroom" then
+        local v = tonumber(arg1)
+        if v then
+            state.beam_headroom = clamp(v, 1.0, 8.0)
+            tuned(string.format("Beam headroom: %.2fx%s", state.beam_headroom,
+                state.transfer == "pq" and "" or " (SDR ignores it)"))
         end
     elseif cmd == "direction" then
         local found = false
