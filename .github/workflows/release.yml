@@ -196,10 +196,15 @@ jobs:
           ver="${pkgver}-${pkgrel}"
           mkdir -p dist
           cp mpv-dovi-vfx-git-*.pkg.tar.zst dist/
-          cp vfx-filters.patch PKGBUILD mpv.install find-deps.py ai.conf input.conf dist/
-          mkdir -p dist/scripts dist/shaders
-          cp scripts/vfg-sync.lua scripts/nr-toggle.lua scripts/beam-sim.lua dist/scripts/
-          cp shaders/crt-beam-sim.glsl dist/shaders/
+          cp vfx-filters.patch PKGBUILD mpv.install find-deps.py ai.conf \
+             input.conf dist/
+          # Flat on purpose: `gh release create` uploads each file by its
+          # basename, so dist/scripts/x.lua lands as x.lua. Keeping the
+          # subdirectories here made SHA256SUMS list ./scripts/x.lua, which
+          # no asset is named -- `sha256sum -c` then failed on four files.
+          cp scripts/vfg-sync.lua scripts/nr-toggle.lua \
+             scripts/beam-sim.lua dist/
+          cp shaders/crt-beam-sim.glsl dist/
           cat > dist/RELEASE_NOTES.md <<EOF
           ## mpv-dovi-vfx-git ${ver}
 
@@ -219,11 +224,16 @@ jobs:
           sudo pacman -U mpv-dovi-vfx-git-*.pkg.tar.zst
           install -Dm644 ai.conf                   ~/.config/mpv/ai.conf
           install -Dm644 input.conf                ~/.config/mpv/input.conf
-          install -Dm644 scripts/vfg-sync.lua      ~/.config/mpv/scripts/vfg-sync.lua
-          install -Dm644 scripts/nr-toggle.lua     ~/.config/mpv/scripts/nr-toggle.lua
-          install -Dm644 scripts/beam-sim.lua      ~/.config/mpv/scripts/beam-sim.lua
-          install -Dm644 shaders/crt-beam-sim.glsl ~/.config/mpv/shaders/crt-beam-sim.glsl
+          install -Dm644 vfg-sync.lua      ~/.config/mpv/scripts/vfg-sync.lua
+          install -Dm644 nr-toggle.lua     ~/.config/mpv/scripts/nr-toggle.lua
+          install -Dm644 beam-sim.lua      ~/.config/mpv/scripts/beam-sim.lua
+          install -Dm644 crt-beam-sim.glsl \
+            ~/.config/mpv/shaders/crt-beam-sim.glsl
           \`\`\`
+
+          Every asset is a flat file: the release upload uses basenames, so
+          \`scripts/vfg-sync.lua\` in the repository arrives as \`vfg-sync.lua\`
+          and \`shaders/crt-beam-sim.glsl\` as \`crt-beam-sim.glsl\`.
 
           Noise reduction is off by default (\`dlssnr:passes=0\` is a true
           passthrough); frame generation follows the display refresh through
