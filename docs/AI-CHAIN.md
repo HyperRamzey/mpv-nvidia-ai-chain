@@ -237,6 +237,20 @@ outputs the input's own format and `params.color` is copied through.
 
 ## 6. Known limits / open items
 
+- **Software-decoded sources run the chain 8-bit.** With `hwdec=nvdec` the filters
+  borrow the decoder's CUDA context and the VO imports their frames natively, so the
+  10-bit path (RGB10A2 / `X2BGR10`) is used and stays exact. When nvdec declines a
+  stream (FFV1, ProRes, unusual profiles) `hwup` creates its **own** CUDA context,
+  which the VO cannot import: mpv then transfers each frame with
+  `av_hwframe_transfer_data`, which parses the buffer per `hwctx->sw_format`
+  (`AV_PIX_FMT_RGBA`). FFmpeg's CUDA hwframes cannot express a packed 10-10-10-2
+  format, so 10-bit output would be read as 8-bit bytes — measured as a blue-tinted
+  grey (`(4,7,120)` for a neutral 128) and a scrambled picture. `mp_cuda_ctx_is_private()`
+  therefore makes `vsr`, `vfg`, `dlssnr` and `truehdr` emit 8-bit RGBA on a
+  self-created context; colours are then exact at the cost of 10-bit precision. HDR
+  is still carried (the frame keeps its PQ/primaries tags), only the sample depth
+  drops.
+
 - **DoVi P7 + `hwup,vfg` asserts on exit**: `vo_gpu_next.c:2507 uninit: Assertion
   p->num_dr_buffers == 0`, so quit produces a core dump instead of a clean exit.
   Playback itself is unaffected. Pre-existing and VFG-specific; not caused by

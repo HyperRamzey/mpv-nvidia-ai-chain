@@ -190,10 +190,10 @@ index 32110828fe..54c6701f7c 100644
 +       description: 'RPATH for the NVIDIA VFX runtime (empty = rely on system search path)')
 diff --git a/video/filter/cuda_shared.h b/video/filter/cuda_shared.h
 new file mode 100644
-index 0000000000..5016257938
+index 0000000000..039fc85b00
 --- /dev/null
 +++ b/video/filter/cuda_shared.h
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,207 @@
 +// cuda_shared.h — CUDA helpers shared by the filter chain (vf_vsr, vf_rife).
 +#pragma once
 +
@@ -277,6 +277,21 @@ index 0000000000..5016257938
 +                              // the source frames ctx alive; NULL for shared
 +                              // structs and owned (self-created) contexts
 +};
++
++// A self-created (owned) context is invisible to the VO's hwdec interop: mpv
++// only imports frames that belong to the decoder's CUDA context, so frames on
++// our own context are transferred with av_hwframe_transfer_data, which parses
++// the buffer per hwctx->sw_format. FFmpeg's CUDA hwframes cannot express a
++// packed 10-10-10-2 format (x2bgr10: "Pixel format not supported"), so a
++// 10-bit output buffer is downloaded as 8-bit RGBA and looks like scrambled
++// colours (measured: software-decoded 10-bit source through hwup→vsr→truehdr).
++// Keep such a pipeline 8-bit: the stored bytes are then exactly what the
++// download reads. Decoder-context frames (hwdec=nvdec) are imported natively
++// and keep their 10-bit path.
++static inline bool mp_cuda_ctx_is_private(const struct mp_cuda_ctx_ref *ref)
++{
++    return !ref || ref->owned;
++}
 +
 +static inline struct mp_cuda_ctx_ref *mp_cuda_ctx_ref_from_mpi(
 +    const struct mp_image *mpi)
@@ -1717,10 +1732,10 @@ index 0000000000..5999b2be9b
 +void dovi_to_rgb_destroy(struct dovi_to_rgb *c);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 0000000000..844df1c0d1
+index 0000000000..e594719461
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1935 @@
+@@ -0,0 +1,1940 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -3089,6 +3104,11 @@ index 0000000000..844df1c0d1
 +    p->src_w = src_w; p->src_h = src_h;
 +    p->tgt_w = tgt_w; p->tgt_h = tgt_h;
 +    p->work_w = work_w; p->work_h = work_h;
++    // A self-created CUDA context cannot be imported by the VO, and the
++    // RGBA hwctx it is downloaded with cannot express RGB10A2: stay 8-bit
++    // there (see mp_cuda_ctx_is_private).
++    if (mp_cuda_ctx_is_private(p->cuda_ref))
++        in_bits = VFX_BITS_8;
 +    p->bits = in_bits;
 +
 +    if (!dlssnr_proc_reserve(&p->proc, src_w, src_h, tgt_w, tgt_h,
@@ -4286,10 +4306,10 @@ index 0000000000..990281bc89
 +};
 diff --git a/video/filter/vf_truehdr.c b/video/filter/vf_truehdr.c
 new file mode 100644
-index 0000000000..f5be9e87cf
+index 0000000000..09cbb2e7b2
 --- /dev/null
 +++ b/video/filter/vf_truehdr.c
-@@ -0,0 +1,1086 @@
+@@ -0,0 +1,1139 @@
 +// src/mpv/video/filter/vf_truehdr.c
 +// VFX TrueHDR (SDR → HDR10 up-conversion) — the VFX SDK's AI up-conversion
 +// effect, attached **after** `vf_vsr` (approach in
@@ -4403,8 +4423,14 @@ index 0000000000..f5be9e87cf
 +    NvCVImage  in_img;        // RGBA8 (engine input, we own it)
 +    NvCVImage  in10_img;      // RGB10A2 (staging for the 10-bit SDR source, lazy)
 +    NvCVImage  out_img;       // RGB10A2 (engine output, we own it)
++    NvCVImage  out8_img;      // RGBA8 mirror of out_img (private-context path)
 +    bool       imgs_alloc;    // in_img/out_img allocated
 +    bool       in10_alloc;
++    bool       out8_alloc;
++    bool       out8;          // hand out RGBA8 instead of X2BGR10 (see
++                              // mp_cuda_ctx_is_private: a self-created CUDA
++                              // context is downloaded by the VO per sw_format,
++                              // which cannot express packed RGB10A2)
 +    int        eng_w, eng_h;
 +    bool       loaded;
 +    // engine parameter snapshot (any change rebuilds; do not assume SetU32
@@ -4488,6 +4514,10 @@ index 0000000000..f5be9e87cf
 +        if (p->in10_alloc) {
 +            pfn_NvCVImage_Dealloc(&p->in10_img);
 +            p->in10_alloc = false;
++        }
++        if (p->out8_alloc) {
++            pfn_NvCVImage_Dealloc(&p->out8_img);
++            p->out8_alloc = false;
 +        }
 +        if (p->yuv_conv_ready) {
 +            yuv_to_rgba_destroy(&p->yuv_conv);
@@ -4610,6 +4640,10 @@ index 0000000000..f5be9e87cf
 +    if (p->in10_alloc) {
 +        pfn_NvCVImage_Dealloc(&p->in10_img);
 +        p->in10_alloc = false;
++    }
++    if (p->out8_alloc) {
++        pfn_NvCVImage_Dealloc(&p->out8_img);
++        p->out8_alloc = false;
 +    }
 +}
 +
@@ -4800,8 +4834,10 @@ index 0000000000..f5be9e87cf
 +    mp_image_setfmt(out, IMGFMT_CUDA);
 +    // Output = VFX RGB10A2 = IMGFMT_X2BGR10; sw_format is always RGBA (FFmpeg
 +    // CUDA hwframes does not support x2bgr10, the 10-bit is carried by
-+    // hw_subfmt — same in vf_vsr.c).
-+    mp_image_sethwfmt(out, IMGFMT_CUDA, IMGFMT_X2BGR10);
++    // hw_subfmt — same in vf_vsr.c). On the software-decode path the data is
++    // converted to RGBA8 first (p->out8), so the download reads it correctly.
++    mp_image_sethwfmt(out, IMGFMT_CUDA,
++                      p->out8 ? IMGFMT_RGBA : IMGFMT_X2BGR10);
 +    // Colour metadata **aligned with mpv's own NVIDIA True HDR reference
 +    // implementation** (third_party/mpv/video/filter/vf_d3d11vpp.c:410): the
 +    // output is tagged HDR10 (pl_color_space_hdr10 = BT.2020/PQ/light=HDR10) +
@@ -5010,6 +5046,10 @@ index 0000000000..f5be9e87cf
 +        return;
 +    }
 +    cuCtxPushCurrent(p->cuda_ref->ctx);
++    // A private (self-created) context is downloaded by the VO per
++    // hwctx->sw_format and cannot express packed RGB10A2, so hand out RGBA8
++    // there (see mp_cuda_ctx_is_private).
++    p->out8 = mp_cuda_ctx_is_private(p->cuda_ref);
 +
 +    double t0 = truehdr_now_ms();
 +
@@ -5039,9 +5079,10 @@ index 0000000000..f5be9e87cf
 +
 +    if (!p->fmt_logged) {
 +        p->fmt_logged = true;
-+        MP_INFO(f, "truehdr: %dx%d subfmt=%d (bits=%d) → X2BGR10 HDR10 "
++        MP_INFO(f, "truehdr: %dx%d subfmt=%d (bits=%d) → %s HDR10 "
 +                "(primaries=%d transfer=%d max_luma=%d) luminance=%d debanding=%s\n",
 +                w, h, subfmt, vfx_bits_from_imgfmt(subfmt),
++                p->out8 ? "RGBA8" : "X2BGR10",
 +                (int)pl_color_space_hdr10.primaries, (int)pl_color_space_hdr10.transfer,
 +                p->e_luminance, p->e_luminance,
 +                p->e_debanding_off ? "OFF(diagnostic)" : "on");
@@ -5134,11 +5175,42 @@ index 0000000000..f5be9e87cf
 +        return;
 +    }
 +
++    // A private (self-created) CUDA context is downloaded by the VO per
++    // hwctx->sw_format, and FFmpeg's CUDA hwframes has no packed 10-10-10-2
++    // format: hand out RGBA8 instead, converted here by the SDK (the same
++    // NvCVImage_Transfer the 10-bit SDR input staging uses).
++    const void *src_pixels = p->out_img.pixels;
++    size_t src_pitch = (size_t)p->out_img.pitch;
++    if (p->out8) {
++        if (!p->out8_alloc) {
++            int r = pfn_NvCVImage_Alloc(&p->out8_img, w, h, NVCV_RGBA,
++                                        NVCV_U8, NVCV_CHUNKY, NVCV_GPU, 32);
++            if (r != 0) {
++                MP_ERR(f, "truehdr: out8 alloc failed (%d)\n", r);
++                mp_frame_unref(&frame);
++                mp_filter_internal_mark_failed(f);
++                cuCtxPopCurrent(NULL);
++                return;
++            }
++            p->out8_alloc = true;
++        }
++        if (pfn_NvCVImage_Transfer(&p->out_img, &p->out8_img, 1.0f,
++                                   p->cuda_stream, NULL) != 0) {
++            MP_ERR(f, "truehdr: 10-bit\u21928-bit output transfer failed\n");
++            mp_frame_unref(&frame);
++            mp_filter_internal_mark_failed(f);
++            cuCtxPopCurrent(NULL);
++            return;
++        }
++        src_pixels = p->out8_img.pixels;
++        src_pitch  = (size_t)p->out8_img.pitch;
++    }
++
 +    {
 +        CUDA_MEMCPY2D copy = {0};
 +        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-+        copy.srcDevice     = (CUdeviceptr)p->out_img.pixels;
-+        copy.srcPitch      = (size_t)p->out_img.pitch;
++        copy.srcDevice     = (CUdeviceptr)src_pixels;
++        copy.srcPitch      = src_pitch;
 +        copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
 +        copy.dstDevice     = p->out_buf;
 +        copy.dstPitch      = (size_t)p->out_pitch;
@@ -5165,7 +5237,8 @@ index 0000000000..f5be9e87cf
 +        return;
 +    }
 +
-+    MP_DBG(f, "truehdr: frame %d %dx%d → X2BGR10 PQ\n", p->frame_count, w, h);
++    MP_DBG(f, "truehdr: frame %d %dx%d → %s PQ\n", p->frame_count, w, h,
++           p->out8 ? "RGBA8" : "X2BGR10");
 +    talloc_free(mpi);
 +
 +    p->status_cost_ms += truehdr_now_ms() - t0;
@@ -5378,10 +5451,10 @@ index 0000000000..f5be9e87cf
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 0000000000..6a76b8be4c
+index 0000000000..2f2bf72935
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1473 @@
+@@ -0,0 +1,1477 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -6505,6 +6578,10 @@ index 0000000000..6a76b8be4c
 +    // vsr) or the source bit depth is >8 (P010/P016) → 10-bit path; otherwise
 +    // keep the historical 8-bit behaviour.
 +    int bits = vfx_bits_from_imgfmt(cur->params.hw_subfmt);
++    // Private (self-created) CUDA context: the VO cannot import it and would
++    // download the buffer as 8-bit RGBA (see mp_cuda_ctx_is_private).
++    if (mp_cuda_ctx_is_private(p->cuda_ref))
++        bits = VFX_BITS_8;
 +    if (!ensure_vfg(f, p, in_w, in_h, bits)) {
 +        cuCtxPopCurrent(NULL);
 +        // engine unavailable → one-shot passthrough downgrade (no per-frame
@@ -6857,10 +6934,10 @@ index 0000000000..6a76b8be4c
 +};
 diff --git a/video/filter/vf_vsr.c b/video/filter/vf_vsr.c
 new file mode 100644
-index 0000000000..7bdf956d78
+index 0000000000..c084800374
 --- /dev/null
 +++ b/video/filter/vf_vsr.c
-@@ -0,0 +1,1406 @@
+@@ -0,0 +1,1417 @@
 +/*
 + * vf_vsr.c -- Video Super Resolution filter via NVIDIA VFX SDK
 + *
@@ -7632,6 +7709,12 @@ index 0000000000..7bdf956d78
 +    int bits = (mpi->imgfmt == IMGFMT_CUDA)
 +                   ? vfx_bits_from_imgfmt(mpi->params.hw_subfmt)
 +                   : VFX_BITS_8;
++    // A self-created CUDA context cannot be imported by the VO (see
++    // mp_cuda_ctx_is_private): its frames are downloaded per hwctx->sw_format,
++    // which cannot express RGB10A2, so 10-bit output would be misread as
++    // 8-bit RGBA. Software-decoded sources therefore stay 8-bit. The clamp is
++    // applied after ensure_cuda() below, because the first frame can arrive
++    // before the context is known.
 +
 +    // Scale/resolution detection
 +    int video_w = mpi->w;
@@ -7717,6 +7800,11 @@ index 0000000000..7bdf956d78
 +        return;
 +    }
 +    cuCtxPushCurrent(p->cuda_ref->ctx);
++
++    // Now the context is known: a self-created one cannot be imported by the
++    // VO, so its frames must stay 8-bit (see the note at the bits computation).
++    if (mp_cuda_ctx_is_private(p->cuda_ref))
++        bits = VFX_BITS_8;
 +
 +    // QualityLevel carries the mode: 1-4 upscale, 8-11 denoise. Denoise is a
 +    // same-resolution mode of the effect, so it applies when nothing is being
@@ -9547,10 +9635,10 @@ index 0000000000..ddc2a90711
 +}
 diff --git a/video/filter/yuv_to_rgba.c b/video/filter/yuv_to_rgba.c
 new file mode 100644
-index 0000000000..9fa03a1971
+index 0000000000..f71204f536
 --- /dev/null
 +++ b/video/filter/yuv_to_rgba.c
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,319 @@
 +// yuv_to_rgba.c — CUDA YUV(NV12/P010/P016)→chunky U8 RGBA via NVRTC
 +// Parameterized color matrix + range, compiled into kernel as #defines.
 +
@@ -9681,7 +9769,8 @@ index 0000000000..9fa03a1971
 +"#if OUT_BITS == 10\n"
 +"    // packed RGB10A2 (little-endian u32): R bit0-9 / G bit10-19 / B bit20-29 / A bit30-31.\n"
 +"    // Same bit order as mpv IMGFMT_X2BGR10 (NOT X2RGB10 -- the names differ\n"
-+"    // by one letter and that swaps R/B), VK_FORMAT_A2B10G10R10_UNORM_PACK32\n"    // (measured basis in the VFX_BITS_10 comment in yuv_to_rgba.h).\n"
++"    // by one letter and that swaps R/B), VK_FORMAT_A2B10G10R10_UNORM_PACK32\n"
++"    // (measured basis in the VFX_BITS_10 comment in yuv_to_rgba.h).\n"
 +"    unsigned int r10 = (unsigned int)(r * 1023.0f + 0.5f);\n"
 +"    unsigned int g10 = (unsigned int)(g * 1023.0f + 0.5f);\n"
 +"    unsigned int b10 = (unsigned int)(b * 1023.0f + 0.5f);\n"
@@ -9841,6 +9930,7 @@ index 0000000000..9fa03a1971
 +    void *args[] = {
 +        &y_plane, &y_pitch,
 +        &uv_plane, &uv_pitch,
++        &chroma_x, &chroma_y,      // must match the kernel parameter list 1:1
 +        &rgba_output, &rgba_pitch,
 +        &width, &height
 +    };
