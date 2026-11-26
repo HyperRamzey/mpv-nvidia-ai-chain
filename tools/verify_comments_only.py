@@ -23,7 +23,11 @@ import os
 import re
 import sys
 
-SPEC = re.compile(r'%(?:[-+ #0]*(?:\*|\d*)(?:\.(?:\*|\d*))?(?:hh|h|ll|l|j|z|t|L)?[diouxXeEfgGaAcspn%])')
+SPEC = re.compile(r'%(?:[-+ #0]*(?:\*|\d*)(?:\.(?:\*|\d*))?(?:hh|h|ll|l|j|z|t|L)?[diouxXeEfgGaAcspn%])'
+                   # A literal can also end in a bare '%' whose conversion
+                   # character lives in the next literal (the PRIu64/SCNu32
+                   # macros: "%" PRIu64 is two adjacent literals).
+                   r'|%(?=$)')
 
 
 def tokens(src):
@@ -102,7 +106,7 @@ def main(argv):
         spec_ok = len(sa) == len(sb)
         bad = []
         if spec_ok:
-            for i, (x, y) in enumerate(zip(sa, sb)):
+            for i, (x, y) in enumerate(zip(sa, sb, strict=False)):
                 if SPEC.findall(x) != SPEC.findall(y):
                     spec_ok = False
                     bad.append((i, x, y))
@@ -115,7 +119,7 @@ def main(argv):
         for i, x, y in bad[:3]:
             print(f"     spec mismatch #{i}: {x!r} -> {y!r}")
         if not code_ok:
-            for x, y in zip(ca, cb):
+            for x, y in zip(ca, cb, strict=False):
                 if x != y:
                     print(f"     first code diff:\n       OLD: {x[:160]}\n       NEW: {y[:160]}")
                     break

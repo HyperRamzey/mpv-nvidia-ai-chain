@@ -117,15 +117,22 @@ _ffmpegver=9.1
 _nasmver=2.16.03
 _mpvcommit=7f505de186ddcaeff6dabf48db79c9b8f8adc309
 _lpcommit=89b04663135b7ee309ef58d1f8997550e98fd9bf
+# Also pinned: these three are compiled into the same binary as the pinned mpv
+# and libplacebo, so a floating HEAD made "verified against this tree" expire
+# on the next fetch. The SHAs are the ones the last full build (and every
+# measurement in docs/) used.
+_nvcodecheaders=f2053071ea93137255b6dcf42e9b4c9e0965a44e
+_gladcommit=0a7cf1af9e25e02821587bd4095807fc90b6426a
+_fastfloatcommit=8ec59686a1430867ba609c2777ca15143dd81003
 
 source=(
   "git+https://github.com/mpv-player/mpv#commit=${_mpvcommit}"
   "git+https://code.videolan.org/videolan/libplacebo#commit=${_lpcommit}"
   "https://ffmpeg.org/releases/ffmpeg-${_ffmpegver}.tar.xz"
   "https://www.nasm.us/pub/nasm/releasebuilds/${_nasmver}/nasm-${_nasmver}.tar.xz"
-  'git+https://github.com/FFmpeg/nv-codec-headers.git'
-  'git+https://github.com/Dav1dde/glad.git'
-  'git+https://github.com/fastfloat/fast_float.git'
+  "git+https://github.com/FFmpeg/nv-codec-headers#commit=${_nvcodecheaders}"
+  "git+https://github.com/Dav1dde/glad#commit=${_gladcommit}"
+  "git+https://github.com/fastfloat/fast_float#commit=${_fastfloatcommit}"
   'find-deps.py'
   'vfx-filters.patch'
 )
@@ -138,7 +145,7 @@ sha256sums=(
   'SKIP'
   'SKIP'
   '7dbf0282eb1f5a46b8d4935daba5566d18b7ec7ad9d487430a78f992c99a8e63'
-  '6ec934fac91b3ac6af27145a1efc9a944a3b7061492fdc84a5d499de4b26ab4b'
+  '362e32bc03e9241f446b4913f140d2b8adfcb998ede4c3772eb4774ebee43ae1'
 )
 
 pkgver() {

@@ -291,8 +291,8 @@ The anchor is never replaced, so text and edges keep full resolution.
 
 ## Correctness fixes in this revision
 
-`pkgrel 6` (patch sha256 `8e487d9f…`) closes eleven defects found by reading the
-whole chain, not just the new filter. The first four:
+The patch pinned in `PKGBUILD` (sha256 there) closes eleven defects found by
+reading the whole chain, not just the new filter. The first four:
 
 | defect | fix | measured |
 | --- | --- | --- |

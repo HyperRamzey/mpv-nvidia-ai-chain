@@ -104,10 +104,10 @@ index f2c31ef66b..5c61c138bf 100644
  extern const struct mp_user_filter_entry vf_sub;
  extern const struct mp_user_filter_entry vf_vapoursynth;
 diff --git a/meson.build b/meson.build
-index 90b261d8d5..5193f00590 100644
+index 90b261d8d5..ea9fa15667 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -420,6 +420,47 @@ if get_option('fuzzers')
+@@ -420,6 +420,69 @@ if get_option('fuzzers')
      link_flags += ['-fsanitize=address,undefined,fuzzer', '-fno-omit-frame-pointer']
  endif
  
@@ -115,12 +115,34 @@ index 90b261d8d5..5193f00590 100644
 +# Needs the CUDA toolkit (cuda.h driver API) and NVRTC (runtime kernel JIT
 +# used by yuv_to_rgba.c). Missing toolkit = filters simply not built; mpv
 +# itself is unaffected.
-+cuda_root = '/opt/cuda'
-+if not cc.has_header('cuda.h', args: '-I' + cuda_root / 'include')
-+    cuda_root = '/usr/local/cuda'
++#
++# Search order: the toolkit's own environment convention, then the common
++# install prefixes. Hardcoding /opt/cuda alone made the patch Arch-specific:
++# NVIDIA's runfile and Debian use /usr/local/cuda, distro packages use /usr.
++cuda_root = ''
++foreach envvar : ['CUDA_PATH', 'CUDA_HOME', 'CUDA_ROOT']
++    if cuda_root == ''
++        cuda_env = run_command('sh', '-c', 'printf %s "$' + envvar + '"',
++                               check: false).stdout().strip()
++        if cuda_env != '' and cc.has_header('cuda.h', args: '-I' + cuda_env / 'include')
++            cuda_root = cuda_env
++        endif
++    endif
++endforeach
++if cuda_root == ''
++    foreach cand : ['/opt/cuda', '/usr/local/cuda', '/usr']
++        if cuda_root == '' and cc.has_header('cuda.h', args: '-I' + cand / 'include')
++            cuda_root = cand
++        endif
++    endforeach
++endif
++if cuda_root == ''
++    cuda_root = '/usr'      # last resort: headers on the default search path
 +endif
 +cuda_inc = cuda_root / 'include'
-+cuda_lib_dir = cuda_root / 'lib64'
++# /usr-style installs put the shared objects in lib/, the toolkit prefixes in
++# lib64/.
++cuda_lib_dir = cuda_root == '/usr' ? cuda_root / 'lib' : cuda_root / 'lib64'
 +cuda_h = cc.has_header('cuda.h', args: '-I' + cuda_inc)
 +nvrtc_h = cc.has_header('nvrtc.h', args: '-I' + cuda_inc)
 +cuda_lib = cuda_h ? cc.find_library('cuda', required: false) : dependency('', required: false)
@@ -366,10 +388,10 @@ index 0000000000..5016257938
 +}
 diff --git a/video/filter/dlssnr_proc.c b/video/filter/dlssnr_proc.c
 new file mode 100644
-index 0000000000..bdf522b1fd
+index 0000000000..3a8f76b35c
 --- /dev/null
 +++ b/video/filter/dlssnr_proc.c
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,585 @@
 +// dlssnr_proc.c — NVRTC kernels for vf_dlssnr. See dlssnr_proc.h.
 +
 +#include "dlssnr_proc.h"
@@ -518,7 +540,7 @@ index 0000000000..bdf522b1fd
 +"{\n"
 +"    return fmaxf(0.0f, 1.0f - fabsf(x));\n"
 +"}\n"
-+"__device__ __forceinline__ float weight(float t, float ratio, int mode)\n"
++"__device__ __forceinline__ float weight(float t, int mode)\n"
 +"{\n"
 +"    if (mode == 2) return bilin(t);\n"
 +"    // Same kernel both ways. The upscale used to be Catmull-Rom on the\n"
@@ -540,14 +562,16 @@ index 0000000000..bdf522b1fd
 +"    if (x >= dw || y >= sh) return;\n"
 +"    float center = (x + 0.5f) * ratio - 0.5f;\n"
 +"    float widen = (ratio > 1.0f) ? ratio : 1.0f;\n"
-+"    float support = 2.0f * widen;\n"
++"    // bilin() has a support of one lobe, mitchell/catmull of two: the old\n"
++"    // constant 2.0 doubled the tap loop for mode 2 and only added zeros.\n"
++"    float support = (mode == 2) ? widen : 2.0f * widen;\n"
 +"    int i0 = (int)floorf(center - support + 0.5f);\n"
 +"    int i1 = (int)ceilf(center + support - 0.5f);\n"
 +"    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
 +"    float wsum = 0.0f;\n"
 +"    for (int i = i0; i <= i1; ++i) {\n"
 +"        float t = (i - center) / widen;\n"
-+"        float w = weight(t, ratio, mode);\n"
++"        float w = weight(t, mode);\n"
 +"        if (w == 0.0f) continue;\n"
 +"        int xc = min(max(i, 0), sw - 1);\n"
 +"        float4 v = src[(size_t)y * sw + xc];\n"
@@ -568,14 +592,14 @@ index 0000000000..bdf522b1fd
 +"    if (x >= sw || y >= dh) return;\n"
 +"    float center = (y + 0.5f) * ratio - 0.5f;\n"
 +"    float widen = (ratio > 1.0f) ? ratio : 1.0f;\n"
-+"    float support = 2.0f * widen;\n"
++"    float support = (mode == 2) ? widen : 2.0f * widen;\n"
 +"    int j0 = (int)floorf(center - support + 0.5f);\n"
 +"    int j1 = (int)ceilf(center + support - 0.5f);\n"
 +"    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
 +"    float wsum = 0.0f;\n"
 +"    for (int j = j0; j <= j1; ++j) {\n"
 +"        float t = (j - center) / widen;\n"
-+"        float w = weight(t, ratio, mode);\n"
++"        float w = weight(t, mode);\n"
 +"        if (w == 0.0f) continue;\n"
 +"        int yc = min(max(j, 0), sh - 1);\n"
 +"        float4 v = src[(size_t)yc * sw + x];\n"
@@ -763,6 +787,11 @@ index 0000000000..bdf522b1fd
 +    size_t ptx_size = 0;
 +    nvrtcGetPTXSize(prog, &ptx_size);
 +    char *ptx = malloc(ptx_size);
++    if (!ptx) {
++        fprintf(stderr, "dlssnr: out of memory (PTX, %zu bytes)\n", ptx_size);
++        nvrtcDestroyProgram(&prog);
++        return false;
++    }
 +    nvrtcGetPTX(prog, ptx);
 +    nvrtcDestroyProgram(&prog);
 +
@@ -785,6 +814,10 @@ index 0000000000..bdf522b1fd
 +        cr = cuModuleGetFunction(syms[i].fn, c->module, syms[i].name);
 +        if (cr != CUDA_SUCCESS) {
 +            fprintf(stderr, "dlssnr: cuModuleGetFunction(%s) failed (%d)\n", syms[i].name, cr);
++            // Unload the module, otherwise it leaks on every retry (the caller
++            // re-enters this function until it succeeds).
++            cuModuleUnload(c->module);
++            c->module = NULL;
 +            return false;
 +        }
 +    }
@@ -830,9 +863,6 @@ index 0000000000..bdf522b1fd
 +    if (!grow(&c->delta_up, &c->du_cap, la)) return false;
 +    c->out_pitch = dst_w * 4;
 +    if (!grow(&c->out, &c->out_cap, (size_t)c->out_pitch * dst_h)) return false;
-+    c->ln_w = src_w; c->ln_h = src_h;
-+    c->la_w = dst_w; c->la_h = dst_h;
-+    c->lw_w = work_w; c->lw_h = work_h;
 +    return true;
 +}
 +
@@ -920,50 +950,10 @@ index 0000000000..bdf522b1fd
 +bool dlssnr_proc_delta_up(struct dlssnr_proc *c, CUstream stream,
 +                          int ww, int wh, int tw, int th)
 +{
-+    // Upscale is a resize like any other; the kernel picks Catmull-Rom from
-+    // the ratio. Route it through the same two passes with the work raster as
-+    // the source.
-+    if (ww == tw && wh == th) {
-+        // nothing to do: the composite reads delta directly — handled by the
-+        // caller copying delta into delta_up
-+        CUDA_MEMCPY2D cp = {0};
-+        cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-+        cp.srcDevice = c->delta;
-+        cp.srcPitch = (size_t)ww * 16;
-+        cp.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-+        cp.dstDevice = c->delta_up;
-+        cp.dstPitch = (size_t)tw * 16;
-+        cp.WidthInBytes = (size_t)tw * 16;
-+        cp.Height = (size_t)th;
-+        return cuMemcpy2DAsync(&cp, stream) == CUDA_SUCCESS;
-+    }
-+    // Horizontal into scratch (tw x wh), then vertical into delta_up (tw x th).
-+    size_t need = (size_t)tw * wh * 16;
-+    if (!c->scratch || c->scratch_cap < need) {
-+        if (c->scratch) {
-+            cuMemFree(c->scratch);
-+            c->scratch = 0;
-+            c->scratch_cap = 0;
-+        }
-+        if (cuMemAlloc(&c->scratch, need) != CUDA_SUCCESS)
-+            return false;
-+        c->scratch_cap = need;
-+    }
-+    CUdeviceptr tmp = c->scratch;
-+    float rx = (float)ww / (float)tw;
-+    int mode = c->filter;
-+    {
-+        void *args[] = {&c->delta, &ww, &wh, &tmp, &tw, &rx, &mode};
-+        if (!launch2ds(c->fn_scale_h, tw, wh, stream, args))
-+            return false;
-+    }
-+    float ry = (float)wh / (float)th;
-+    {
-+        void *args[] = {&tmp, &tw, &wh, &c->delta_up, &th, &ry, &mode};
-+        if (!launch2ds(c->fn_scale_v, tw, th, stream, args))
-+            return false;
-+    }
-+    return true;
++    // The delta upscale is a resize like any other; this used to be a
++    // line-for-line copy of dlssnr_proc_scale() with c->delta / c->delta_up
++    // substituted in.
++    return dlssnr_proc_scale(c, stream, c->delta, ww, wh, c->delta_up, tw, th);
 +}
 +
 +bool dlssnr_proc_composite(struct dlssnr_proc *c, CUstream stream,
@@ -979,7 +969,6 @@ index 0000000000..bdf522b1fd
 +
 +void *dlssnr_proc_proxy_ptr(struct dlssnr_proc *c) { return (void *)c->proxy; }
 +void *dlssnr_proc_ans_ptr(struct dlssnr_proc *c)   { return (void *)c->ans; }
-+void *dlssnr_proc_out_ptr(struct dlssnr_proc *c)   { return (void *)c->out; }
 +
 +CUdeviceptr dlssnr_proc_take_out(struct dlssnr_proc *c)
 +{
@@ -990,7 +979,7 @@ index 0000000000..bdf522b1fd
 +}
 diff --git a/video/filter/dlssnr_proc.h b/video/filter/dlssnr_proc.h
 new file mode 100644
-index 0000000000..a78ccc0ea4
+index 0000000000..f111b15991
 --- /dev/null
 +++ b/video/filter/dlssnr_proc.h
 @@ -0,0 +1,133 @@
@@ -1055,10 +1044,11 @@ index 0000000000..a78ccc0ea4
 +    CUmodule module;
 +    CUfunction fn_lin, fn_scale_h, fn_scale_v, fn_proxy, fn_delta, fn_comp;
 +
-+    // linear float4 rasters (RGB used, A = 1)
-+    CUdeviceptr lin_native;  int ln_w, ln_h;  size_t ln_cap;
-+    CUdeviceptr lin_anchor;  int la_w, la_h;  size_t la_cap;
-+    CUdeviceptr lin_work;    int lw_w, lw_h;  size_t lw_cap;
++    // linear float4 rasters (RGB used, A = 1). Only the capacities are kept:
++    // the per-buffer w/h fields were written by the plan step and never read.
++    CUdeviceptr lin_native;  size_t ln_cap;
++    CUdeviceptr lin_anchor;  size_t la_cap;
++    CUdeviceptr lin_work;    size_t lw_cap;
 +
 +    // 8-bit proxies (tight pitch, w*4) and the answer
 +    CUdeviceptr proxy;  CUdeviceptr ans;
@@ -1116,7 +1106,6 @@ index 0000000000..a78ccc0ea4
 +
 +void *dlssnr_proc_proxy_ptr(struct dlssnr_proc *c);
 +void *dlssnr_proc_ans_ptr(struct dlssnr_proc *c);
-+void *dlssnr_proc_out_ptr(struct dlssnr_proc *c);
 +
 +// Hand the composite buffer to the caller: the returned pointer is now owned
 +// by whoever asked (an output frame), and the next reserve() allocates a new
@@ -1129,10 +1118,10 @@ index 0000000000..a78ccc0ea4
 +                         int dst_w, int dst_h, int work_w, int work_h);
 diff --git a/video/filter/dovi_to_rgb.c b/video/filter/dovi_to_rgb.c
 new file mode 100644
-index 0000000000..207024820f
+index 0000000000..3dc813eaba
 --- /dev/null
 +++ b/video/filter/dovi_to_rgb.c
-@@ -0,0 +1,531 @@
+@@ -0,0 +1,534 @@
 +// video/filter/dovi_to_rgb.c — Dolby Vision (P5 / P7 MEL+FEL / P8) → chunky
 +// RGB on CUDA. See dovi_to_rgb.h for what it computes and why.
 +
@@ -1621,9 +1610,12 @@ index 0000000000..207024820f
 +        }
 +    }
 +
-+    // The previous frame's kernel may still be reading the block.
-+    cuStreamSynchronize(stream);
-+    CUresult res = cuMemcpyHtoD(c->params, P, sizeof(P));
++    // Queued on the same stream as the kernel that reads it, so the stream's
++    // own ordering is the only synchronisation needed. The old code called
++    // cuStreamSynchronize(stream) and then a blocking cuMemcpyHtoD (legacy
++    // stream 0) on every Dolby Vision frame, stalling the GPU pipeline twice
++    // per frame.
++    CUresult res = cuMemcpyHtoDAsync(c->params, P, sizeof(P), stream);
 +    if (res != CUDA_SUCCESS) {
 +        fprintf(stderr, "dovi_to_rgb: parameter upload failed (%d)\n", res);
 +        return false;
@@ -1725,10 +1717,10 @@ index 0000000000..5999b2be9b
 +void dovi_to_rgb_destroy(struct dovi_to_rgb *c);
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 0000000000..64937cc672
+index 0000000000..844df1c0d1
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,1905 @@
+@@ -0,0 +1,1935 @@
 +/*
 + * vf_dlssnr.c -- DLSS 5 NR (NGX feature 18) as an in-chain mpv filter.
 + *
@@ -2497,8 +2489,9 @@ index 0000000000..64937cc672
 +    // reinit after a seek), then rebuild lazily.
 +    if (p->cuda_ref) {
 +        CUcontext old = p->cuda_ref->ctx;
-+        if (old)
-+            cuCtxPushCurrent(old);
++        CUresult pcr = old ? cuCtxPushCurrent(old) : CUDA_SUCCESS;
++        if (pcr != CUDA_SUCCESS)
++            MP_ERR(f, "dlssnr: cuCtxPushCurrent(old) failed (%d)\n", pcr);
 +        if (p->proc_ready) {
 +            dlssnr_proc_uninit(&p->proc);
 +            p->proc_ready = false;
@@ -2518,7 +2511,7 @@ index 0000000000..64937cc672
 +            p->cuda_stream = NULL;
 +            p->cuda_init_done = false;
 +        }
-+        if (old)
++        if (old && pcr == CUDA_SUCCESS)
 +            cuCtxPopCurrent(NULL);
 +        mp_cuda_ctx_ref_release(p->cuda_ref);
 +        p->cuda_ref = NULL;
@@ -2545,11 +2538,17 @@ index 0000000000..64937cc672
 +        atomic_init(&p->cuda_ref->refs, 1);
 +    }
 +
-+    cuCtxPushCurrent(p->cuda_ref->ctx);
++    CUresult scr = cuCtxPushCurrent(p->cuda_ref->ctx);
++    if (scr != CUDA_SUCCESS) {
++        MP_ERR(f, "dlssnr: cuCtxPushCurrent failed (%d)\n", scr);
++        mp_cuda_ctx_ref_release(p->cuda_ref);
++        p->cuda_ref = NULL;
++        return false;
++    }
 +    // A blocking stream, like every other filter here: the kernels must order
 +    // against the hwdec's work on the same context, and a non-blocking stream
 +    // has no implicit ordering with the legacy default stream.
-+    CUresult scr = cuStreamCreate(&p->cuda_stream, CU_STREAM_DEFAULT);
++    scr = cuStreamCreate(&p->cuda_stream, CU_STREAM_DEFAULT);
 +    cuCtxPopCurrent(NULL);
 +    if (scr != CUDA_SUCCESS) {
 +        MP_ERR(f, "dlssnr: cuStreamCreate failed (%d)\n", scr);
@@ -2687,11 +2686,16 @@ index 0000000000..64937cc672
 +        info->get_render_target_size(info, res);
 +        // Latch the largest target seen: fullscreen playback reports the
 +        // panel, a window reports itself, and we do not want the model's
-+        // raster to follow every window resize.
-+        if (res[0] > p->panel_w)
++        // raster to follow every window resize. Latch the *pair*, not each
++        // axis independently: max(w) with max(h) of a differently shaped
++        // window synthesizes an aspect ratio no output ever had (a rotated
++        // window would make the model work on a 4:3 raster for a 16:9
++        // panel).
++        if ((long)res[0] * (long)res[1] >
++            (long)p->panel_w * (long)p->panel_h) {
 +            p->panel_w = res[0];
-+        if (res[1] > p->panel_h)
 +            p->panel_h = res[1];
++        }
 +    }
 +
 +    if (p->panel_w <= 0 || p->panel_h <= 0) {
@@ -3064,7 +3068,8 @@ index 0000000000..64937cc672
 +                                          mpi->planes[1], mpi->stride[1],
 +                                          src_w, src_h,
 +                                          (void *)p->yuv_rgb, p->yuv_rgb_pitch,
-+                                          p->cuda_stream);
++                                          p->cuda_stream,
++                                          mpi->params.chroma_location);
 +        }
 +        if (!conv_ok) {
 +            MP_ERR(f, "dlssnr: yuv->rgb failed\n");
@@ -3439,8 +3444,25 @@ index 0000000000..64937cc672
 +    if (!a || !*a)
 +        return false;
 +
-+    // Check profile / preset (both named strings and numeric)
-+    if (!strcmp(c, "profile") || !strcmp(c, "preset")) {
++    // `preset` is the NGX preset (-1..4), deliberately NOT an alias of `profile`
++    // (the tuning table): aliasing them made the preset option unreachable at
++    // runtime.
++    if (!strcmp(c, "preset")) {
++        char *end = NULL;
++        long n = strtol(a, &end, 10);
++        if (end == a || *end || n < -1 || n > 4)
++            return false;
++        p->opts->preset = (int)n;
++        resolve_config(p->opts, p->pass);
++        p->cfg_hash = cfg_hash_of(p->opts);
++        if (p->shm)
++            shm_write_config(p, p->cfg_hash);
++        MP_INFO(f, "dlssnr: preset = %d\n", p->opts->preset);
++        return true;
++    }
++
++    // Check profile (both named strings and numeric)
++    if (!strcmp(c, "profile")) {
 +        int pr = profile_from_name(a);
 +        if (pr < 0) {
 +            char *end = NULL;
@@ -3636,10 +3658,10 @@ index 0000000000..64937cc672
 +};
 diff --git a/video/filter/vf_hwup.c b/video/filter/vf_hwup.c
 new file mode 100644
-index 0000000000..9b4895a337
+index 0000000000..990281bc89
 --- /dev/null
 +++ b/video/filter/vf_hwup.c
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,622 @@
 +// vf_hwup.c — SW→HW unification pre-filter
 +//
 +// Pipeline: decode → [vf_hwup] → [vf_rife] → [vf_vsr] → VO
@@ -3719,6 +3741,10 @@ index 0000000000..9b4895a337
 +
 +    CUdeviceptr out_buf;         // Y + UV two segments (single buf)
 +    size_t      out_buf_size;
++
++    // Reused across frames: allocating a SwsContext per frame re-reads the
++    // scaler tables and re-initialises filter state for every software frame.
++    struct mp_sws_context *sws;
 +};
 +
 +// ── AVBufferRef free callback for CUDA memory ──────────────────────────────
@@ -3854,13 +3880,28 @@ index 0000000000..9b4895a337
 +    }
 +
 +    p->cuda_ref = calloc(1, sizeof(*p->cuda_ref));
++    if (!p->cuda_ref) {
++        MP_ERR(f, "hwup: out of memory for the CUDA context ref\n");
++        cuCtxDestroy(ctx);
++        return false;
++    }
 +    p->cuda_ref->magic = MP_CUDA_CTX_REF_MAGIC;
 +    p->cuda_ref->ctx = ctx;
 +    p->cuda_ref->owned = true;
 +    atomic_init(&p->cuda_ref->refs, 1);
 +
-+    cuCtxPushCurrent(ctx);
-+    cr = cuStreamCreate(&p->cuda_stream, CU_STREAM_NON_BLOCKING);
++    cr = cuCtxPushCurrent(ctx);
++    if (cr != CUDA_SUCCESS) {
++        // Do not pop a context we never pushed: that popped the caller's.
++        MP_ERR(f, "hwup: cuCtxPushCurrent failed (%d)\n", cr);
++        mp_cuda_ctx_ref_release(p->cuda_ref);
++        p->cuda_ref = NULL;
++        return false;
++    }
++    // CU_STREAM_DEFAULT, not CU_STREAM_NON_BLOCKING: VFX 1.3 submits an
++    // internal stage on the legacy default stream, which never synchronises
++    // with a non-blocking stream (same note in vf_vsr.c / vf_truehdr.c).
++    cr = cuStreamCreate(&p->cuda_stream, CU_STREAM_DEFAULT);
 +    cuCtxPopCurrent(NULL);
 +    if (cr != CUDA_SUCCESS) {
 +        MP_ERR(f, "hwup: cuStreamCreate failed (%d)\n", cr);
@@ -3869,7 +3910,8 @@ index 0000000000..9b4895a337
 +        return false;
 +    }
 +    p->cuda_init_done = true;
-+    MP_VERBOSE(f, "hwup: created CUDA context on device 0 (SW input)\n");
++    // Not "device 0": pick_cuda_device() may resolve a specific GPU by UUID.
++    MP_VERBOSE(f, "hwup: created CUDA context (SW input)\n");
 +    return true;
 +}
 +
@@ -3968,23 +4010,25 @@ index 0000000000..9b4895a337
 +        return;
 +    }
 +    mp_image_copy_attributes(nv12, mpi);
-+    struct mp_sws_context *sws = mp_sws_alloc(f);
++    struct mp_sws_context *sws = p->sws;
 +    if (!sws) {
-+        talloc_free(nv12);
-+        mp_frame_unref(&frame);
-+        mp_filter_internal_mark_failed(f);
-+        return;
++        sws = mp_sws_alloc(p);
++        if (!sws) {
++            talloc_free(nv12);
++            mp_frame_unref(&frame);
++            mp_filter_internal_mark_failed(f);
++            return;
++        }
++        sws->force_scaler = MP_SWS_AUTO;
++        p->sws = sws;
 +    }
-+    sws->force_scaler = MP_SWS_AUTO;
 +    if (mp_sws_scale(sws, nv12, mpi) < 0) {
 +        MP_ERR(f, "hwup: sws_scale failed\n");
-+        talloc_free(sws);
 +        talloc_free(nv12);
 +        mp_frame_unref(&frame);
 +        mp_filter_internal_mark_failed(f);
 +        return;
 +    }
-+    talloc_free(sws);
 +
 +    // Output buffer: Y + UV two segments (single buf, same layout as an hwdec
 +    // NV12 frame)
@@ -4074,7 +4118,6 @@ index 0000000000..9b4895a337
 +    }
 +    mp_image_setfmt(out, IMGFMT_CUDA);
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, fmt);
-+    mp_image_params_guess_csp(&out->params);
 +    out->params.color = mpi->params.color;   // HDR metadata preserved
 +    // The sample layout is the uploaded one (NV12/P010, MSB-aligned), not the
 +    // source's (e.g. yuv420p10 is LSB-aligned): keep the bits set by
@@ -4120,12 +4163,24 @@ index 0000000000..9b4895a337
 +    out->pkt_duration    = mpi->pkt_duration;
 +    out->w = mpi->w; out->h = mpi->h;
 +    out->params.w = mpi->w; out->params.h = mpi->h;
++    mp_image_params_guess_csp(&out->params);
 +    out->planes[0] = (uint8_t *)p->out_buf;
 +    out->planes[1] = (uint8_t *)p->out_buf + y_bytes;
 +    out->stride[0] = pitch_y;
 +    out->stride[1] = pitch_uv;
 +    out->num_planes = 2;
 +    out->hwctx = av_buffer_ref(p->av_hw_frames);
++    if (!out->hwctx) {
++        MP_ERR(f, "hwup: out of memory (hwframes ref)\n");
++        // talloc_free runs mp_image_dtor, which frees p->out_buf via
++        // free_cuda_buf through bufs[0].
++        talloc_free(out);
++        p->out_buf = 0; p->out_buf_size = 0;
++        cuCtxPopCurrent(NULL);
++        mp_frame_unref(&frame);
++        mp_filter_internal_mark_failed(f);
++        return;
++    }
 +    out->pts = mpi->pts;
 +    out->dts = mpi->dts;
 +    out->nominal_fps = mpi->nominal_fps;
@@ -4231,10 +4286,10 @@ index 0000000000..9b4895a337
 +};
 diff --git a/video/filter/vf_truehdr.c b/video/filter/vf_truehdr.c
 new file mode 100644
-index 0000000000..a85d8177a7
+index 0000000000..f5be9e87cf
 --- /dev/null
 +++ b/video/filter/vf_truehdr.c
-@@ -0,0 +1,1059 @@
+@@ -0,0 +1,1086 @@
 +// src/mpv/video/filter/vf_truehdr.c
 +// VFX TrueHDR (SDR → HDR10 up-conversion) — the VFX SDK's AI up-conversion
 +// effect, attached **after** `vf_vsr` (approach in
@@ -4415,7 +4470,11 @@ index 0000000000..a85d8177a7
 +    // Everything must be invalidated **inside the old context**.
 +    if (p->cuda_ref) {
 +        CUcontext old = p->cuda_ref->ctx;
-+        if (old) cuCtxPushCurrent(old);
++        // Pop only what was pushed (see vf_vsr.c): a failed push leaves the
++        // caller's context current, and an unconditional pop removes that.
++        CUresult pcr = old ? cuCtxPushCurrent(old) : CUDA_SUCCESS;
++        if (pcr != CUDA_SUCCESS)
++            MP_ERR(f, "truehdr: cuCtxPushCurrent(old) failed (%d)\n", pcr);
 +        if (p->loaded || p->effect) {
 +            if (p->effect) pfn_NvVFX_DestroyEffect(p->effect);
 +            p->effect = NULL;
@@ -4444,7 +4503,7 @@ index 0000000000..a85d8177a7
 +            p->cuda_stream = NULL;
 +            p->cuda_init_done = false;
 +        }
-+        if (old) cuCtxPopCurrent(NULL);
++        if (old && pcr == CUDA_SUCCESS) cuCtxPopCurrent(NULL);
 +        mp_cuda_ctx_ref_release(p->cuda_ref);
 +        p->cuda_ref = NULL;
 +        p->failed = p->no_libs;  // a context change is a fresh rebuild chance (the failure may be related)
@@ -4458,6 +4517,10 @@ index 0000000000..a85d8177a7
 +        p->cuda_ref = shared;
 +    } else if (borrow) {
 +        p->cuda_ref = calloc(1, sizeof(*p->cuda_ref));
++        if (!p->cuda_ref) {
++            MP_ERR(f, "truehdr: out of memory for the CUDA context ref\n");
++            return false;
++        }
 +        p->cuda_ref->magic = MP_CUDA_CTX_REF_MAGIC;
 +        p->cuda_ref->ctx = borrow;
 +        p->cuda_ref->owned = false;
@@ -4474,12 +4537,18 @@ index 0000000000..a85d8177a7
 +        return false;
 +    }
 +
-+    cuCtxPushCurrent(p->cuda_ref->ctx);
++    CUresult cr = cuCtxPushCurrent(p->cuda_ref->ctx);
++    if (cr != CUDA_SUCCESS) {
++        MP_ERR(f, "truehdr: cuCtxPushCurrent failed (%d)\n", cr);
++        mp_cuda_ctx_ref_release(p->cuda_ref);
++        p->cuda_ref = NULL;
++        return false;
++    }
 +    // It must be a **blocking stream** (VFX 1.3 internally has a stage
 +    // permanently attached to the legacy default stream; a non-blocking stream
 +    // has no implicit ordering with the legacy stream → it reads input that
 +    // has not landed; same in vf_vsr.c).
-+    CUresult cr = cuStreamCreate(&p->cuda_stream, CU_STREAM_DEFAULT);
++    cr = cuStreamCreate(&p->cuda_stream, CU_STREAM_DEFAULT);
 +    cuCtxPopCurrent(NULL);
 +    if (cr != CUDA_SUCCESS) {
 +        MP_ERR(f, "truehdr: cuStreamCreate failed (%d)\n", cr);
@@ -4733,7 +4802,6 @@ index 0000000000..a85d8177a7
 +    // CUDA hwframes does not support x2bgr10, the 10-bit is carried by
 +    // hw_subfmt — same in vf_vsr.c).
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, IMGFMT_X2BGR10);
-+    mp_image_params_guess_csp(&out->params);
 +    // Colour metadata **aligned with mpv's own NVIDIA True HDR reference
 +    // implementation** (third_party/mpv/video/filter/vf_d3d11vpp.c:410): the
 +    // output is tagged HDR10 (pl_color_space_hdr10 = BT.2020/PQ/light=HDR10) +
@@ -4759,6 +4827,7 @@ index 0000000000..a85d8177a7
 +    out->h = h;
 +    out->params.w = w;
 +    out->params.h = h;
++    mp_image_params_guess_csp(&out->params);
 +    out->planes[0] = (uint8_t *)p->out_buf;
 +    out->stride[0] = p->out_pitch;
 +    out->num_planes = 1;
@@ -4791,20 +4860,32 @@ index 0000000000..a85d8177a7
 +static void sample_output_nits(struct priv *p, double *med, double *peak)
 +{
 +    const int n = 32;
-+    unsigned int words[32];
++    unsigned int words[32] = {0};
 +    double nits[32];
 +    int y = p->eng_h / 2, w = p->eng_w;
++    // One strided copy for the whole row of samples, not 32 separate 4-byte
++    // D2H transfers: each was a full PCIe round-trip, and this runs every
++    // frame for a status line that is only printed every 30th.
++    CUDA_MEMCPY2D cp = {0};
++    cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
++    cp.srcDevice     = (CUdeviceptr)p->out_img.pixels + (size_t)y * p->out_img.pitch;
++    cp.srcPitch      = (size_t)p->out_img.pitch;
++    cp.dstMemoryType = CU_MEMORYTYPE_HOST;
++    cp.dstHost       = words;
++    cp.dstPitch      = 4;
++    cp.WidthInBytes  = (size_t)w * 4;
++    cp.Height        = 1;
++
++    bool ok = cuMemcpy2D(&cp) == CUDA_SUCCESS;
 +    for (int i = 0; i < n; i++) {
-+        int x = (int)((double)i / (n - 1) * (w - 1));
-+        words[i] = 0;
-+        if (cuMemcpyDtoH(&words[i], (CUdeviceptr)p->out_img.pixels +
-+                         (size_t)y * p->out_img.pitch + (size_t)x * 4, 4)
-+            != CUDA_SUCCESS)
-+            words[i] = 0;
-+        unsigned int wd = words[i];
++        int x = ok ? (int)((double)i / (n - 1) * (w - 1)) : 0;
++        unsigned int wd = ok ? words[x] : 0;
 +        double r = (wd & 0x3FF) / 1023.0, g = ((wd >> 10) & 0x3FF) / 1023.0,
 +               b = ((wd >> 20) & 0x3FF) / 1023.0;
-+        nits[i] = (pq_code_to_nits(r) + pq_code_to_nits(g) + pq_code_to_nits(b)) / 3.0;
++        // BT.2020 luminance weights, not (R+G+B)/3: an equal-channel average
++        // makes a saturated green read as dim as a grey of the same code.
++        nits[i] = 0.2627 * pq_code_to_nits(r) + 0.6780 * pq_code_to_nits(g) +
++                  0.0593 * pq_code_to_nits(b);
 +    }
 +    for (int i = 0; i < n; i++)
 +        for (int j = i + 1; j < n; j++)
@@ -4979,7 +5060,8 @@ index 0000000000..a85d8177a7
 +                                        mpi->planes[0], mpi->stride[0],
 +                                        mpi->planes[1], mpi->stride[1],
 +                                        w, h, p->in_img.pixels, p->in_img.pitch,
-+                                        p->cuda_stream)) {
++                                        p->cuda_stream,
++                                        mpi->params.chroma_location)) {
 +            MP_ERR(f, "truehdr: yuv_to_rgba_convert failed\n");
 +            in_ok = false;
 +        }
@@ -5296,10 +5378,10 @@ index 0000000000..a85d8177a7
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 0000000000..06e6f65184
+index 0000000000..6a76b8be4c
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1433 @@
+@@ -0,0 +1,1473 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -5334,13 +5416,13 @@ index 0000000000..06e6f65184
 + * vfg-status: mode=passthrough reason=src-fps). When src_fps is unknown the
 + * metadata stays unknown (0), and 1.0/0 = inf is never written.
 + *
-+ * Scene change: **relies only on the engine's own detection**
-+ * (AutomaticShotChangeDetectionEnabled=1, an SDK 1.3 capability) — this filter
-+ * does not implement a second MAE detector (single source of truth; vf_rife's
-+ * RIFE_SC_MAE is a historical artefact of the RIFE engine lacking this
-+ * capability). On a cut the engine's passthrough behaviour = copying the
-+ * current frame (cur). ⚠️ This is **semantically different** from vf_rife.c's
-+ * "copy the nearer endpoint in time" (alpha>0.5 copies cur, otherwise prev):
++ * Scene change: detection is **off** (AutomaticShotChangeDetectionEnabled=0,
++ * written in vfg_proc.c before Load). An SDK shot change makes the engine emit
++ * the current frame as-is, i.e. it drops the generated frames; with the beam
++ * simulator a missing subframe is not a small artefact, it is half the sweep
++ * black, and with interpolation enabled the render rate collapsed to ~38/s in
++ * the measurement. This filter therefore implements no second detector either
++ * (single source of truth).
 + * rife picks the nearest endpoint on each side by tval, whereas VFG's
 + * intermediate frame content is decided by the engine's internal detection,
 + * and this node only maps "the FrameIndex-mode intermediate frame" uniformly to
@@ -5522,6 +5604,8 @@ index 0000000000..06e6f65184
 +    int v = *(const int *)val;
 +    if (v == VFG_FPS_AUTO)
 +        return talloc_strdup(NULL, "auto");
++    if (v == -1)
++        return talloc_strdup(NULL, "off");
 +    return talloc_asprintf(NULL, "%d", v);
 +}
 +
@@ -5760,6 +5844,10 @@ index 0000000000..06e6f65184
 +        MP_VERBOSE(f, "vfg: sharing upstream CUDA context\n");
 +    } else if (borrow) {
 +        p->cuda_ref = calloc(1, sizeof(*p->cuda_ref));
++        if (!p->cuda_ref) {
++            MP_ERR(f, "vfg: out of memory for the CUDA context ref\n");
++            return false;
++        }
 +        p->cuda_ref->magic = MP_CUDA_CTX_REF_MAGIC;
 +        p->cuda_ref->ctx = borrow;
 +        p->cuda_ref->owned = false;
@@ -5781,8 +5869,18 @@ index 0000000000..06e6f65184
 +        return false;
 +    }
 +
-+    cuCtxPushCurrent(p->cuda_ref->ctx);
-+    cr = cuStreamCreate(&p->cuda_stream, CU_STREAM_NON_BLOCKING);
++    cr = cuCtxPushCurrent(p->cuda_ref->ctx);
++    if (cr != CUDA_SUCCESS) {
++        // Popping here would pop the caller's context instead of ours.
++        MP_ERR(f, "vfg: cuCtxPushCurrent failed (%d)\n", cr);
++        mp_cuda_ctx_ref_release(p->cuda_ref);
++        p->cuda_ref = NULL;
++        return false;
++    }
++    // CU_STREAM_DEFAULT, not CU_STREAM_NON_BLOCKING: VFX 1.3 submits an
++    // internal stage on the legacy default stream, which does not synchronise
++    // with a non-blocking stream (same note in vf_vsr.c / vf_truehdr.c).
++    cr = cuStreamCreate(&p->cuda_stream, CU_STREAM_DEFAULT);
 +    cuCtxPopCurrent(NULL);
 +    if (cr != CUDA_SUCCESS) {
 +        MP_ERR(f, "vfg: cuStreamCreate failed (%d)\n", cr);
@@ -5983,7 +6081,6 @@ index 0000000000..06e6f65184
 +    }
 +    mp_image_setfmt(out, IMGFMT_CUDA);
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, vfx_imgfmt_from_bits(out_bits));
-+    mp_image_params_guess_csp(&out->params);
 +    out->params.color = src->params.color;   // HDR metadata (same as vf_vsr)
 +    // A DoVi-decoded frame is BT.2020 PQ; the source tags (UNKNOWN for P5, HLG
 +    // for P8.4) would mislabel it for everything downstream.
@@ -6011,10 +6108,28 @@ index 0000000000..06e6f65184
 +    out->h = p->out_h;
 +    out->params.w = p->out_w;
 +    out->params.h = p->out_h;
++    // The frame is now full-range RGB without a DoVi RPU. Reset the repr before
++    // guessing the CSP, and guess only once w/h are real: guess_csp() inspects
++    // the dimensions, so calling it on a zero-sized params struct is pointless
++    // and leaves the decision to whatever defaults it had.
++    out->params.repr.sys    = PL_COLOR_SYSTEM_RGB;
++    out->params.repr.levels = PL_COLOR_LEVELS_FULL;
++    out->params.repr.alpha  = PL_ALPHA_NONE;
++    out->params.repr.dovi   = NULL;
++    mp_image_params_guess_csp(&out->params);
 +    out->planes[0] = (uint8_t *)p->out_buf;
 +    out->stride[0] = p->out_pitch;
 +    out->num_planes = 1;
 +    out->hwctx = av_buffer_ref(p->av_hw_frames);
++    if (!out->hwctx) {
++        // talloc_free runs mp_image_dtor, which releases bufs[0] and therefore
++        // p->out_buf through free_cuda_buf.
++        MP_ERR(f, "vfg: out of memory (hwframes ref)\n");
++        talloc_free(out);
++        p->out_buf = 0;
++        p->out_buf_size = 0;
++        return NULL;
++    }
 +    out->pts         = pts;
 +    out->dts         = src->dts;
 +    // src_fps unknown (live stream nominal_fps=0) → metadata stays unknown:
@@ -6082,7 +6197,8 @@ index 0000000000..06e6f65184
 +                                 p->video_w, p->video_h,
 +                                 p->vfg.in_pixels[idx],
 +                                 p->vfg.in_pitch[idx],
-+                                 p->cuda_stream)) {
++                                 p->cuda_stream,
++                                 cur->params.chroma_location)) {
 +            MP_ERR(f, "vfg: yuv_to_rgba_convert failed\n");
 +            return false;
 +        }
@@ -6365,9 +6481,8 @@ index 0000000000..06e6f65184
 +    // seek, core-idle=yes).
 +    // The trigger is old material with broken timestamps (large numbers of
 +    // duplicate pts / pts=N/A in Ogg/VBR containers, where mpv prints
-+    // `Invalid video timestamp`) — measured: the file 2.avi in /home/zmq's
-+    // video folder (XVID in Ogg, 640x480) stalls outright on the second
-+    // duplicate pts frame.
++    // `Invalid video timestamp`) — measured on an XVID-in-Ogg 640x480 sample
++    // with duplicate pts: it stalls outright on the second duplicate-pts frame.
 +    // Contrast: vf_rife's version of this branch `continue`s inside a for(;;)
 +    // prefetch loop, so it does not need this.
 +    double t_cur = cur->pts;
@@ -6507,11 +6622,18 @@ index 0000000000..06e6f65184
 +
 +static bool parse_mode_arg(const char *arg, int *out)
 +{
-+    if (!strcmp(arg, "low"))         *out = 0;
-+    else if (!strcmp(arg, "medium")) *out = 1;
-+    else if (!strcmp(arg, "high"))   *out = 2;
-+    else *out = atoi(arg);
-+    return *out >= 0 && *out <= 2;   // no auto: illegal values (including "auto") are always rejected
++    if (!strcmp(arg, "low"))         { *out = VFG_MODE_LOW;    return true; }
++    if (!strcmp(arg, "medium"))      { *out = VFG_MODE_MEDIUM; return true; }
++    if (!strcmp(arg, "high"))        { *out = VFG_MODE_HIGH;   return true; }
++    // Numeric form is accepted, but only when the whole argument is a number:
++    // atoi() turned "auto" (and any garbage) into 0 = low and reported success,
++    // contradicting the "no auto, illegal values are rejected" contract.
++    char *end = NULL;
++    long n = strtol(arg, &end, 10);
++    if (end == arg || *end || n < VFG_MODE_LOW || n > VFG_MODE_HIGH)
++        return false;
++    *out = (int)n;
++    return true;
 +}
 +
 +static bool parse_max_fps_arg(const char *arg, double *out)
@@ -6735,10 +6857,10 @@ index 0000000000..06e6f65184
 +};
 diff --git a/video/filter/vf_vsr.c b/video/filter/vf_vsr.c
 new file mode 100644
-index 0000000000..e04a7136da
+index 0000000000..7bdf956d78
 --- /dev/null
 +++ b/video/filter/vf_vsr.c
-@@ -0,0 +1,1375 @@
+@@ -0,0 +1,1406 @@
 +/*
 + * vf_vsr.c -- Video Super Resolution filter via NVIDIA VFX SDK
 + *
@@ -6762,14 +6884,11 @@ index 0000000000..e04a7136da
 +#include "filters/user_filters.h"
 +#include "video/img_format.h"
 +#include "video/mp_image.h"
-+#include "video/sws_utils.h"
-+#include "video/image_writer.h"
++#include "video/image_writer.h"   // dump_png (vsr dump-both command)
 +#include "options/m_option.h"
 +#include "common/msg.h"
 +#include "common/common.h"
 +#include "mpv/client.h"   // struct mpv_node (set/get for custom option types)
-+
-+#include <libavcodec/avcodec.h>
 +
 +#include <cuda.h>
 +#include <stdatomic.h>
@@ -7104,7 +7223,11 @@ index 0000000000..e04a7136da
 +    // rebuilt on demand in the new context on the next frame.
 +    if (p->cuda_ref) {
 +        CUcontext old = p->cuda_ref->ctx;
-+        if (old) cuCtxPushCurrent(old);
++        // Only pop what we actually pushed: a failed push means the caller's
++        // context is still current, and cuCtxPopCurrent(NULL) would pop that.
++        CUresult pcr = old ? cuCtxPushCurrent(old) : CUDA_SUCCESS;
++        if (pcr != CUDA_SUCCESS)
++            MP_ERR(f, "vsr: cuCtxPushCurrent(old) failed (%d)\n", pcr);
 +        if (p->vsr_configured) {
 +            vsr_destroy(&p->vsr);
 +            p->vsr_configured = false;
@@ -7124,7 +7247,7 @@ index 0000000000..e04a7136da
 +            p->cuda_stream = NULL;
 +            p->cuda_init_done = false;
 +        }
-+        if (old) cuCtxPopCurrent(NULL);
++        if (old && pcr == CUDA_SUCCESS) cuCtxPopCurrent(NULL);
 +        mp_cuda_ctx_ref_release(p->cuda_ref);
 +        p->cuda_ref = NULL;
 +        MP_VERBOSE(f, "vsr: CUDA context changed — engine/converter reset\n");
@@ -7141,6 +7264,10 @@ index 0000000000..e04a7136da
 +        // hwdec frame (opaque is not this chain's shared struct): build our own
 +        // borrower struct + ctx_holder
 +        p->cuda_ref = calloc(1, sizeof(*p->cuda_ref));
++        if (!p->cuda_ref) {
++            MP_ERR(f, "vsr: out of memory for the CUDA context ref\n");
++            return false;
++        }
 +        p->cuda_ref->magic = MP_CUDA_CTX_REF_MAGIC;
 +        p->cuda_ref->ctx = borrow;
 +        p->cuda_ref->owned = false;
@@ -7163,7 +7290,13 @@ index 0000000000..e04a7136da
 +        return false;
 +    }
 +
-+    cuCtxPushCurrent(p->cuda_ref->ctx);
++    cr = cuCtxPushCurrent(p->cuda_ref->ctx);
++    if (cr != CUDA_SUCCESS) {
++        MP_ERR(f, "vsr: cuCtxPushCurrent failed (%d)\n", cr);
++        mp_cuda_ctx_ref_release(p->cuda_ref);
++        p->cuda_ref = NULL;
++        return false;
++    }
 +    // It must be a **blocking stream** (the default cudaStreamCreate semantics
 +    // laid down by the official "Setting Up the CUDA Stream";
 +    // NvVFX_CudaStreamCreate is visibly just one cudaStreamCreate in
@@ -7211,7 +7344,7 @@ index 0000000000..e04a7136da
 +    // supported").
 +    // Both are 4 bytes/px with the same stride, so the buffer semantics agree;
 +    // the 10-bit **real format** is carried by the frame parameter
-+    // hw_subfmt=IMGFMT_X2RGB10 (the VO's CUDA interop picks the VkFormat by
++    // hw_subfmt=IMGFMT_X2BGR10 (the VO's CUDA interop picks the VkFormat by
 +    // hw_subfmt and uses pixel_size=4 for the copy width — hwdec_cuda.c:255
 +    // "plane_w * format->pixel_size", independent of sw_format).
 +    // The only affected case is the hwdownload software path (this application
@@ -7640,7 +7773,8 @@ index 0000000000..e04a7136da
 +                                  mpi->planes[1], mpi->stride[1],
 +                                  video_w, video_h,
 +                                  p->vsr.in_pixels, vsr_in_pitch,
-+                                  p->cuda_stream);
++                                  p->cuda_stream,
++                                  mpi->params.chroma_location);
 +        }
 +        if (!conv_ok) {
 +            MP_ERR(f, "vsr: yuv_to_rgba_convert failed\n");
@@ -7665,7 +7799,7 @@ index 0000000000..e04a7136da
 +    // ── VSR process ──────────────────────────────────────────────────────
 +    void *vsr_out_ptr = NULL;
 +    int vsr_out_w = 0, vsr_out_h = 0, vsr_out_pitch = 0;
-+    if (!vsr_process(&p->vsr, p->cuda_stream,
++    if (!vsr_process(&p->vsr,
 +                      &vsr_out_ptr, &vsr_out_w, &vsr_out_h, &vsr_out_pitch)) {
 +        MP_ERR(f, "vsr: vsr_process failed\n");
 +        mp_frame_unref(&frame); mp_filter_internal_mark_failed(f); cuCtxPopCurrent(NULL); return;
@@ -7719,7 +7853,6 @@ index 0000000000..e04a7136da
 +    }
 +    mp_image_setfmt(out, IMGFMT_CUDA);
 +    mp_image_sethwfmt(out, IMGFMT_CUDA, vfx_imgfmt_from_bits(bits));
-+    mp_image_params_guess_csp(&out->params);
 +    out->params.color = mpi->params.color; // preserve HDR metadata
 +    // dovi_to_rgb produced BT.2020 PQ RGB. A DoVi source's VUI carries UNKNOWN
 +    // primaries/transfer (P5, IPTPQc2) or HLG (P8.4), so copying the input tags
@@ -7740,6 +7873,11 @@ index 0000000000..e04a7136da
 +    out->params.no_enhancement_layer = true;
 +    out->w = vsr_out_w; out->h = vsr_out_h;
 +    out->params.w = vsr_out_w; out->params.h = vsr_out_h;
++    out->params.repr.sys    = PL_COLOR_SYSTEM_RGB;
++    out->params.repr.levels = PL_COLOR_LEVELS_FULL;
++    out->params.repr.alpha  = PL_ALPHA_NONE;
++    out->params.repr.dovi   = NULL;
++    mp_image_params_guess_csp(&out->params);
 +    out->planes[0] = (uint8_t*)p->out_buf;
 +    out->stride[0] = vsr_out_pitch;
 +    out->num_planes = 1;
@@ -7887,7 +8025,12 @@ index 0000000000..e04a7136da
 +    else if (!strcmp(arg, "medium"))   *out = 9;
 +    else if (!strcmp(arg, "high"))     *out = 10;
 +    else if (!strcmp(arg, "ultra"))    *out = 11;
-+    else *out = atoi(arg);
++    else {
++        char *end = NULL;
++        long n = strtol(arg, &end, 10);
++        if (end == arg || *end) return false;   // "1abc" is not a level
++        *out = (int)n;
++    }
 +    return *out == -1 || (*out >= 8 && *out <= 11);
 +}
 +
@@ -7897,7 +8040,12 @@ index 0000000000..e04a7136da
 +    else if (!strcmp(arg, "medium"))   *out = 2;
 +    else if (!strcmp(arg, "high"))     *out = 3;
 +    else if (!strcmp(arg, "ultra"))    *out = 4;
-+    else *out = atoi(arg);
++    else {
++        char *end = NULL;
++        long n = strtol(arg, &end, 10);
++        if (end == arg || *end) return false;
++        *out = (int)n;
++    }
 +    return *out >= 1 && *out <= 4;
 +}
 +
@@ -7963,13 +8111,18 @@ index 0000000000..e04a7136da
 +        }
 +    }
 +    if (strcmp(cmd->cmd, "dump-both") == 0 && cmd->arg) {
-+        // arg: "input_path|output_path"
-+        char *sep = strchr((char *)cmd->arg, '|');
-+        if (!sep)
++        // arg: "input_path|output_path". Split a copy: cmd->arg is mpv's const
++        // command buffer, and writing the '\0' into it was undefined behaviour.
++        char *arg = talloc_strdup(NULL, cmd->arg);
++        char *sep = strchr(arg, '|');
++        if (!sep) {
++            talloc_free(arg);
 +            return false;
++        }
 +        *sep = '\0';
-+        bool ok_in  = vsr_dump_frame(f, p, cmd->arg, false);
++        bool ok_in  = vsr_dump_frame(f, p, arg, false);
 +        bool ok_out = vsr_dump_frame(f, p, sep + 1, true);
++        talloc_free(arg);
 +        return ok_in && ok_out;
 +    }
 +    return false;
@@ -8116,10 +8269,10 @@ index 0000000000..e04a7136da
 +};
 diff --git a/video/filter/vfg_proc.c b/video/filter/vfg_proc.c
 new file mode 100644
-index 0000000000..7f7f72c589
+index 0000000000..9ef98da027
 --- /dev/null
 +++ b/video/filter/vfg_proc.c
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,351 @@
 +// src/mpv/video/filter/vfg_proc.c
 +// VFG (VideoFrameGeneration) engine wrapper implementation (interface in
 +// vfg_proc.h).
@@ -8219,7 +8372,10 @@ index 0000000000..7f7f72c589
 +        c->stream = stream;
 +        c->own_stream = false;
 +    } else {
-+        cuStreamCreate(&c->stream, CU_STREAM_NON_BLOCKING);
++        // Blocking stream, same as every other filter here: VFX 1.3 has a
++        // stage on the legacy default stream, which does not synchronise with
++        // a non-blocking stream.
++        cuStreamCreate(&c->stream, CU_STREAM_DEFAULT);
 +        c->own_stream = true;
 +    }
 +
@@ -8235,14 +8391,18 @@ index 0000000000..7f7f72c589
 +    // before giving up, then report which mode actually loaded. Without this a
 +    // transient squeeze silently drops VFG out of the chain — and with it the
 +    // generated frames the beam sweep is built on.
-+    int try_modes[3] = { mode, VFG_MODE_HIGH, VFG_MODE_LOW };
++    // Cheaper modes first: low -> medium -> high is the cost order of the
++    // engine's buffers, so a VRAM squeeze is most likely to be survivable in
++    // the lowest mode that has not been tried yet.
++    int try_modes[3] = { mode, VFG_MODE_LOW, VFG_MODE_MEDIUM };
 +    int n_modes = 3;
-+    if (mode == VFG_MODE_HIGH) {
-+        try_modes[1] = VFG_MODE_LOW;
++    if (mode == VFG_MODE_LOW) {
++        try_modes[1] = VFG_MODE_MEDIUM;
 +        n_modes = 2;
-+    } else if (mode == VFG_MODE_LOW) {
-+        try_modes[1] = VFG_MODE_HIGH;
-+        n_modes = 2;
++    } else if (mode == VFG_MODE_HIGH) {
++        try_modes[1] = VFG_MODE_MEDIUM;
++        try_modes[2] = VFG_MODE_LOW;
++        n_modes = 3;
 +    }
 +
 +    int ret = 0;
@@ -8331,17 +8491,6 @@ index 0000000000..7f7f72c589
 +        fprintf(stderr, "VFG: init ok (%dx%d mode=%d%s timestep shot-change=off)\n",
 +                in_w, in_h, c->mode, c->mode != mode ? " fallback" : "");
 +    return true;
-+}
-+
-+// ── vfg_reconfig ─────────────────────────────────────────────────────────
-+// Input size or Mode change: destroy + rebuild + Load again (reasoning in
-+// vfg_proc.h).
-+
-+bool vfg_reconfig(struct vfg_context *c, int in_w, int in_h, int mode,
-+                  int multiplier, int bits, CUstream stream)
-+{
-+    vfg_destroy(c);
-+    return vfg_init(c, in_w, in_h, mode, multiplier, bits, stream);
 +}
 +
 +// ── vfg_set_multiplier ───────────────────────────────────────────────────
@@ -8477,10 +8626,10 @@ index 0000000000..7f7f72c589
 +}
 diff --git a/video/filter/vfg_proc.h b/video/filter/vfg_proc.h
 new file mode 100644
-index 0000000000..695069b91d
+index 0000000000..55efa9657f
 --- /dev/null
 +++ b/video/filter/vfg_proc.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,76 @@
 +// src/mpv/video/filter/vfg_proc.h
 +// VFG (NVIDIA VFX SDK VideoFrameGeneration) engine wrapper — isomorphic to
 +// the VSR wrapper in vsr_internal.h: engine handle + per-context NvCVImage
@@ -8535,14 +8684,6 @@ index 0000000000..695069b91d
 +bool vfg_init(struct vfg_context *c, int in_w, int in_h, int mode,
 +              int multiplier, int bits, CUstream stream);
 +
-+// Input size / Mode change: destroy effect + rebuild + Load again.
-+// Basis: the official nvvfx wrapper marks Mode / InputWidth / InputHeight
-+// all as requires_reload (changing these after Load requires a re-load);
-+// the probe only set Mode **before** Load, whether a post-Load change takes
-+// effect is unverified → always rebuild, do not gamble.
-+bool vfg_reconfig(struct vfg_context *c, int in_w, int in_h, int mode,
-+                  int multiplier, int bits, CUstream stream);
-+
 +// FrameMultiplier update (no rebuild needed: the official wrapper's run()
 +// SetU32 this parameter every time, and it is not marked requires_reload).
 +bool vfg_set_multiplier(struct vfg_context *c, int multiplier);
@@ -8567,10 +8708,10 @@ index 0000000000..695069b91d
 +void vfg_destroy(struct vfg_context *c);
 diff --git a/video/filter/vfx_loader.c b/video/filter/vfx_loader.c
 new file mode 100644
-index 0000000000..aede4d61ae
+index 0000000000..9f8d2a5672
 --- /dev/null
 +++ b/video/filter/vfx_loader.c
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,298 @@
 +// src/mpv/video/filter/vfx_loader.c
 +// VFX library locator/loader layer, sole implementation (interface in
 +// vfx_loader.h) — a pure move out of vsr_proc.c: search order, log text,
@@ -8607,6 +8748,44 @@ index 0000000000..aede4d61ae
 +
 +// ── Library loading ──────────────────────────────────────────────────────
 +
++// Handles of the preloaded dependency chain, kept so a failed load can drop
++// them again: RTLD_GLOBAL objects opened here stay resident otherwise, and the
++// next attempt would pile another copy on top of a half-initialised SDK.
++static void *g_preload[32];
++static int   g_npreload;
++
++// Drop every handle opened so far and clear the symbol table. A failed load
++// must not leave pfn_* pointing into a library that was closed again.
++static void vfx_reset_all(void)
++{
++    pfn_NvVFX_CreateEffect  = NULL;
++    pfn_NvVFX_DestroyEffect = NULL;
++    pfn_NvVFX_SetU32        = NULL;
++    pfn_NvVFX_SetF32        = NULL;
++    pfn_NvVFX_SetImage      = NULL;
++    pfn_NvVFX_GetImage      = NULL;
++    pfn_NvVFX_SetCudaStream = NULL;
++    pfn_NvVFX_Load          = NULL;
++    pfn_NvVFX_Run           = NULL;
++    pfn_NvCVImage_Alloc     = NULL;
++    pfn_NvCVImage_Dealloc   = NULL;
++    pfn_NvCVImage_Transfer  = NULL;
++    for (int i = 0; i < g_npreload; i++)
++        if (g_preload[i])
++            dlclose(g_preload[i]);
++    g_npreload = 0;
++    if (g_vfx_lib)  dlclose(g_vfx_lib);
++    if (g_nvcv_lib) dlclose(g_nvcv_lib);
++    g_vfx_lib = NULL;
++    g_nvcv_lib = NULL;
++}
++
++static void vfx_remember(void *h)
++{
++    if (h && g_npreload < (int)(sizeof(g_preload) / sizeof(g_preload[0])))
++        g_preload[g_npreload++] = h;
++}
++
 +#define LOAD_SYM(LIB, NAME)                                      \
 +    do {                                                          \
 +        pfn_##NAME = (PFN_##NAME)dlsym(LIB, #NAME);             \
@@ -8614,8 +8793,7 @@ index 0000000000..aede4d61ae
 +            fprintf(stderr, "VSR: dlsym(" #NAME ") failed: %s\n", \
 +                    dlerror());                                   \
 +            /* A half-loaded library must not look loaded on the next call: */ \
-+            dlclose(g_vfx_lib); dlclose(g_nvcv_lib);              \
-+            g_vfx_lib = NULL; g_nvcv_lib = NULL;                  \
++            vfx_reset_all();                                      \
 +            return false;                                         \
 +        }                                                         \
 +    } while (0)
@@ -8706,6 +8884,8 @@ index 0000000000..aede4d61ae
 +            void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 +            if (!h)
 +                fprintf(stderr, "VSR: dlopen(%s): %s\n", trt10[i], dlerror());
++            else
++                vfx_remember(h);
 +        }
 +    }
 +
@@ -8754,6 +8934,8 @@ index 0000000000..aede4d61ae
 +        if (!h) {
 +            fprintf(stderr, "VSR: dlopen(%s): %s\n", libs[i], dlerror());
 +            // Continue — some libs might be missing but others work
++        } else {
++            vfx_remember(h);
 +        }
 +    }
 +
@@ -8765,10 +8947,7 @@ index 0000000000..aede4d61ae
 +    g_nvcv_lib = dlopen(path, RTLD_NOW);
 +    if (!g_vfx_lib || !g_nvcv_lib) {
 +        fprintf(stderr, "VSR: core libs failed\n");
-+        if (g_vfx_lib) dlclose(g_vfx_lib);
-+        if (g_nvcv_lib) dlclose(g_nvcv_lib);
-+        g_vfx_lib = NULL;
-+        g_nvcv_lib = NULL;
++        vfx_reset_all();
 +        return false;
 +    }
 +
@@ -8941,7 +9120,7 @@ index 0000000000..0b218fa552
 +#endif
 diff --git a/video/filter/vsr_internal.h b/video/filter/vsr_internal.h
 new file mode 100644
-index 0000000000..c69d353077
+index 0000000000..3f04bac457
 --- /dev/null
 +++ b/video/filter/vsr_internal.h
 @@ -0,0 +1,45 @@
@@ -8959,8 +9138,7 @@ index 0000000000..c69d353077
 +    // semantics unchanged.
 +    void   *in_pixels;    // allocated RGB GPU buffer
 +    void   *out_pixels;   // allocated RGB GPU buffer
-+    void   *tmp_pixels;   // temp transfer buffer
-+    int     in_pitch, out_pitch, tmp_pitch;
++    int     in_pitch, out_pitch;
 +    CUstream stream;      // stream handed to engine: must be a **blocking stream** (see vsr_init)
 +    bool    own_stream;
 +    bool    ready;
@@ -8969,7 +9147,7 @@ index 0000000000..c69d353077
 +    int     bits;         // 8 / 10 (engine ImageEncodingMode = bits==10)
 +    // ── per-context image buffers (rebuilt on demand with size during
 +    // engine lifetime)
-+    struct NvCVImage in_img, out_img, tmp_img;
++    struct NvCVImage in_img, out_img;
 +};
 +
 +bool vsr_init(struct vsr_context *c, int in_w, int in_h,
@@ -8984,18 +9162,19 @@ index 0000000000..c69d353077
 +// warmup).
 +bool vsr_set_quality(struct vsr_context *c, int quality);
 +bool vsr_set_output(struct vsr_context *c, int out_w, int out_h);
-+// Caller writes RGBA into c->in_pixels before calling vsr_process.
-+bool vsr_process(struct vsr_context *c, CUstream stream,
++// Caller writes RGBA into c->in_pixels before calling vsr_process; the engine
++// runs on c->stream (set once in vsr_init).
++bool vsr_process(struct vsr_context *c,
 +                 void **output_ptr, int *out_w, int *out_h, int *out_pitch);
 +// Destroy the engine; wait for in-flight stream work before destroying (so
 +// the GPU cannot write to an already-freed buffer).
 +void vsr_destroy(struct vsr_context *c);
 diff --git a/video/filter/vsr_proc.c b/video/filter/vsr_proc.c
 new file mode 100644
-index 0000000000..776ef74d62
+index 0000000000..ddc2a90711
 --- /dev/null
 +++ b/video/filter/vsr_proc.c
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,370 @@
 +#include "vsr_internal.h"
 +#include "vfx_loader.h"
 +
@@ -9018,7 +9197,7 @@ index 0000000000..776ef74d62
 +#define NVVFX_OUTPUT_IMAGE  "DstImage0"
 +#define NVVFX_CUDA_STREAM   "CudaStream"
 +
-+// Image buffers are per-context (vsr_context.in_img/out_img/tmp_img) — within
++// Image buffers are per-context (vsr_context.in_img/out_img) — within
 +// the engine's lifetime buffers are rebuilt on demand with size
 +// (vsr_set_output), the SDK engine's SetImage references each instance's own
 +// pixels address.
@@ -9123,15 +9302,11 @@ index 0000000000..776ef74d62
 +    c->in_pixels = c->in_img.pixels;
 +    c->in_pitch = (int)c->in_img.pitch;
 +
-+    // ── Temp buffer for NvCVImage_Transfer ────────────────────────────────
-+    {
-+        int max_dim = (out_w > in_w) ? out_w : in_w;
-+        int max_h = (out_h > in_h) ? out_h : in_h;
-+        if (!ensure_img(&c->tmp_img, max_dim, max_h, c->bits, "temp"))
-+            memset(&c->tmp_img, 0, sizeof(c->tmp_img));   // not fatal
-+    }
-+    c->tmp_pixels = c->tmp_img.pixels;
-+    c->tmp_pitch = (int)c->tmp_img.pitch;
++    // No temp image: NvCVImage_Transfer is not used by this filter (all
++    // transfers are cuMemcpy2D on c->stream), so the full-frame buffer that used
++    // to be allocated here at max(in,out) resolution was never read — it only
++    // cost VRAM (at 2560x1440 RGB10A2 that is ~14 MB per context) and could
++    // turn a tight allocation into a Load failure.
 +
 +    // ── CUDA stream ───────────────────────────────────────────────────────
 +    // What is handed to the engine must be a **blocking stream** (official
@@ -9177,9 +9352,12 @@ index 0000000000..776ef74d62
 +
 +bool vsr_warmup(struct vsr_context *c, CUstream stream)
 +{
-+    // Temporarily set stream for warmup, restore after
++    // Run the warmup frames on the requested stream: swapping c->stream alone
++    // left the engine still pointed at the old stream (SetCudaStream is only
++    // read when it is called), and the upload went through the legacy stream 0.
 +    CUstream saved = c->stream;
 +    c->stream = stream;
++    pfn_NvVFX_SetCudaStream(c->handle, NVVFX_CUDA_STREAM, c->stream);
 +
 +    size_t in_bytes = (size_t)c->in_pitch * c->in_h;
 +    unsigned char *random_rgba = (unsigned char*)malloc(in_bytes);
@@ -9211,7 +9389,14 @@ index 0000000000..776ef74d62
 +            random_rgba[i + 3] = 255;
 +        }
 +    }
-+    cuMemcpyHtoD((CUdeviceptr)c->in_pixels, random_rgba, in_bytes);
++    if (cuMemcpyHtoDAsync((CUdeviceptr)c->in_pixels, random_rgba, in_bytes,
++                          c->stream) != CUDA_SUCCESS) {
++        fprintf(stderr, "VSR: warmup upload failed\n");
++        free(random_rgba);
++        c->stream = saved;
++        pfn_NvVFX_SetCudaStream(c->handle, NVVFX_CUDA_STREAM, c->stream);
++        return false;
++    }
 +    free(random_rgba);
 +
 +    for (int wu = 0; wu < 3; wu++) {
@@ -9219,10 +9404,14 @@ index 0000000000..776ef74d62
 +        if (wr != 0) {
 +            fprintf(stderr, "VSR: warmup[%d] Run -> %d\n", wu, wr);
 +            c->stream = saved;
++            pfn_NvVFX_SetCudaStream(c->handle, NVVFX_CUDA_STREAM, c->stream);
 +            return false;
 +        }
 +    }
++    // "Blocks until complete": actually wait for this stream before restoring.
++    cuStreamSynchronize(c->stream);
 +    c->stream = saved;
++    pfn_NvVFX_SetCudaStream(c->handle, NVVFX_CUDA_STREAM, c->stream);
 +    fprintf(stderr, "VSR: warmup complete (3 frames with random data)\n");
 +    return true;
 +}
@@ -9235,7 +9424,7 @@ index 0000000000..776ef74d62
 +// **The output must be read back on the same stream**; cross-stream read-back
 +// needs its own synchronisation.
 +
-+bool vsr_process(struct vsr_context *c, CUstream stream,
++bool vsr_process(struct vsr_context *c,
 +                 void **output_ptr, int *out_w, int *out_h, int *out_pitch) {
 +    if (!c->ready) return false;
 +
@@ -9348,10 +9537,6 @@ index 0000000000..776ef74d62
 +        pfn_NvCVImage_Dealloc(&c->in_img);
 +        memset(&c->in_img, 0, sizeof(c->in_img));
 +    }
-+    if (c->tmp_img.pixels) {
-+        pfn_NvCVImage_Dealloc(&c->tmp_img);
-+        memset(&c->tmp_img, 0, sizeof(c->tmp_img));
-+    }
 +    if (c->own_stream && c->stream) {
 +        cuStreamDestroy(c->stream);
 +        c->stream = NULL;
@@ -9362,10 +9547,10 @@ index 0000000000..776ef74d62
 +}
 diff --git a/video/filter/yuv_to_rgba.c b/video/filter/yuv_to_rgba.c
 new file mode 100644
-index 0000000000..532afa3288
+index 0000000000..9fa03a1971
 --- /dev/null
 +++ b/video/filter/yuv_to_rgba.c
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,317 @@
 +// yuv_to_rgba.c — CUDA YUV(NV12/P010/P016)→chunky U8 RGBA via NVRTC
 +// Parameterized color matrix + range, compiled into kernel as #defines.
 +
@@ -9384,6 +9569,8 @@ index 0000000000..532afa3288
 +"    int y_pitch,\n"
 +"    const unsigned char* __restrict__ uv_plane,\n"
 +"    int uv_pitch,\n"
++"    float chroma_x,\n"
++"    float chroma_y,\n"
 +"    unsigned char* __restrict__ rgba_output,\n"
 +"    int rgba_pitch,\n"
 +"    int width,\n"
@@ -9395,23 +9582,51 @@ index 0000000000..532afa3288
 +"\n"
 +"    float Y, U, V;\n"
 +"    if (BIT_DEPTH <= 8) {\n"
-+"        Y = (float)y_plane[y * y_pitch + x];\n"
++"        Y = (float)y_plane[(long long)y * y_pitch + x];\n"
 +"    } else {\n"
 +"        const unsigned short* y16 = (const unsigned short*)y_plane;\n"
-+"        Y = (float)y16[y * y_pitch / 2 + x];\n"
++"        Y = (float)y16[((long long)y * y_pitch) / 2 + x];\n"
 +"    }\n"
 +"\n"
-+"    int uv_x = x & ~1;\n"
-+"    int uv_y = y / 2;\n"
-+"    if (BIT_DEPTH <= 8) {\n"
-+"        U = (float)uv_plane[uv_y * uv_pitch + uv_x];\n"
-+"        V = (float)uv_plane[uv_y * uv_pitch + uv_x + 1];\n"
-+"    } else {\n"
-+"        const unsigned short* uv16 = (const unsigned short*)uv_plane;\n"
-+"        int idx = uv_y * (uv_pitch / 2) + uv_x;\n"
-+"        U = (float)uv16[idx];\n"
-+"        V = (float)uv16[idx + 1];\n"
++"    // Bilinear chroma upsampling at the source's siting. Nearest-neighbour\n"
++"    // (x >> 1, y >> 1) ignored chroma_location: it is only correct for\n"
++"    // horizontally co-sited chroma and, for 4:2:0, shifts every colour edge\n"
++"    // by half a luma sample horizontally and half a line vertically\n"
++"    // (unequal R/B edges on saturated text and on 4:2:2-style colour bars).\n"
++"    //\n"
++"    // Sample position: chroma sample i is centred on luma coordinate\n"
++"    // 1.0 + 2i + chroma_x (luma-pixel units, chroma_x from\n"
++"    // pl_chroma_location_offset: -0.5 for LEFT/MPEG-2, 0 for CENTER/JPEG).\n"
++"    // Inverting for luma pixel centre x + 0.5 gives the fractional chroma\n"
++"    // index below. Edges clamp to the sampling grid.\n"
++"    int cw = (width + 1) / 2, ch = (height + 1) / 2;\n"
++"    float fx = ((float)x - 0.5f - chroma_x) * 0.5f;\n"
++"    float fy = ((float)y - 0.5f - chroma_y) * 0.5f;\n"
++"    int ix0 = (int)floorf(fx), iy0 = (int)floorf(fy);\n"
++"    float tx = fx - (float)ix0, ty = fy - (float)iy0;\n"
++"    int ix1 = ix0 + 1, iy1 = iy0 + 1;\n"
++"    ix0 = min(max(ix0, 0), cw - 1); ix1 = min(max(ix1, 0), cw - 1);\n"
++"    iy0 = min(max(iy0, 0), ch - 1); iy1 = min(max(iy1, 0), ch - 1);\n"
++"    float ua = 0.0f, va = 0.0f;\n"
++"    for (int j = 0; j < 2; j++) {\n"
++"        for (int i = 0; i < 2; i++) {\n"
++"            int cx = i ? ix1 : ix0, cy = j ? iy1 : iy0;\n"
++"            float wgt = (i ? tx : 1.0f - tx) * (j ? ty : 1.0f - ty);\n"
++"            if (wgt <= 0.0f) continue;\n"
++"            if (BIT_DEPTH <= 8) {\n"
++"                const unsigned char* row = uv_plane + (long long)cy * uv_pitch;\n"
++"                ua += (float)row[cx * 2] * wgt;\n"
++"                va += (float)row[cx * 2 + 1] * wgt;\n"
++"            } else {\n"
++"                const unsigned short* row = (const unsigned short*)\n"
++"                    (uv_plane + (long long)cy * uv_pitch);\n"
++"                ua += (float)row[cx * 2] * wgt;\n"
++"                va += (float)row[cx * 2 + 1] * wgt;\n"
++"            }\n"
++"        }\n"
 +"    }\n"
++"    U = ua;\n"
++"    V = va;\n"
 +"\n"
 +"    // BIT_DEPTH = sample storage bits (mpv imgfmt_desc.bpp[0]).\n"
 +"    // P010/P016 (16): 10bit data is MSB-aligned (lower 6 bits cleared; see\n"
@@ -9446,20 +9661,27 @@ index 0000000000..532afa3288
 +"        U = (U - uv_mid) / uv_span;\n"
 +"        V = (V - uv_mid) / uv_span;\n"
 +"    } else {\n"
++"        // Full range: neutral chroma is exactly half scale -- 128 for 8-bit,\n"
++"        // 512 for packed 10-bit, 32768 for the 16-bit-storage (P010/P016)\n"
++"        // MSB-aligned layouts. Subtracting uv_max/2 instead (127.5, 511.5,\n"
++"        // 32767.5) tinted neutral greys by +0.00196, which is +0.5 LSB of\n"
++"        // chroma once re-multiplied by the matrix coefficients.\n"
++"        float uv_mid = (BIT_DEPTH <= 8) ? 128.0f\n"
++"                       : (BIT_DEPTH >= 16) ? 32768.0f : 512.0f;\n"
 +"        Y = Y / y_max;\n"
-+"        U = U / uv_max - 0.5f;\n"
-+"        V = V / uv_max - 0.5f;\n"
++"        U = (U - uv_mid) / uv_max;\n"
++"        V = (V - uv_mid) / uv_max;\n"
 +"    }\n"
 +"\n"
 +"    float r = __saturatef(Y + K_RV * V);\n"
 +"    float g = __saturatef(Y - K_GU * U - K_GV * V);\n"
 +"    float b = __saturatef(Y + K_BU * U);\n"
 +"\n"
-+"    int out_idx = y * rgba_pitch + x * 4;\n"
++"    long long out_idx = (long long)y * rgba_pitch + (long long)x * 4;\n"
 +"#if OUT_BITS == 10\n"
 +"    // packed RGB10A2 (little-endian u32): R bit0-9 / G bit10-19 / B bit20-29 / A bit30-31.\n"
-+"    // Same bit order as mpv IMGFMT_X2RGB10, VK_FORMAT_A2B10G10R10_UNORM_PACK32\n"
-+"    // (measured basis in the VFX_BITS_10 comment in yuv_to_rgba.h).\n"
++"    // Same bit order as mpv IMGFMT_X2BGR10 (NOT X2RGB10 -- the names differ\n"
++"    // by one letter and that swaps R/B), VK_FORMAT_A2B10G10R10_UNORM_PACK32\n"    // (measured basis in the VFX_BITS_10 comment in yuv_to_rgba.h).\n"
 +"    unsigned int r10 = (unsigned int)(r * 1023.0f + 0.5f);\n"
 +"    unsigned int g10 = (unsigned int)(g * 1023.0f + 0.5f);\n"
 +"    unsigned int b10 = (unsigned int)(b * 1023.0f + 0.5f);\n"
@@ -9549,8 +9771,14 @@ index 0000000000..532afa3288
 +    if (res != NVRTC_SUCCESS) {
 +        size_t log_size;
 +        nvrtcGetProgramLogSize(prog, &log_size);
-+        char *log = (char *)malloc(log_size);
++        char *log = (char *)malloc(log_size + 1);
++        if (!log) {
++            fprintf(stderr, "yuv_to_rgba: out of memory (NVRTC log)\n");
++            nvrtcDestroyProgram(&prog);
++            return false;
++        }
 +        nvrtcGetProgramLog(prog, log);
++        log[log_size] = '\0';
 +        fprintf(stderr, "yuv_to_rgba: NVRTC compile failed:\n%s\n", log);
 +        free(log);
 +        nvrtcDestroyProgram(&prog);
@@ -9560,6 +9788,11 @@ index 0000000000..532afa3288
 +    size_t ptx_size;
 +    nvrtcGetPTXSize(prog, &ptx_size);
 +    char *ptx = (char *)malloc(ptx_size);
++    if (!ptx) {
++        fprintf(stderr, "yuv_to_rgba: out of memory (PTX, %zu bytes)\n", ptx_size);
++        nvrtcDestroyProgram(&prog);
++        return false;
++    }
 +    nvrtcGetPTX(prog, ptx);
 +    nvrtcDestroyProgram(&prog);
 +
@@ -9591,9 +9824,15 @@ index 0000000000..532afa3288
 +                          void *uv_plane,  int uv_pitch,
 +                          int width, int height,
 +                          void *rgba_output, int rgba_pitch,
-+                          CUstream stream)
++                          CUstream stream, enum pl_chroma_location chroma)
 +{
 +    if (!c->ready) return false;
++
++    // Siting of the chroma samples in luma pixels (-0.5,-0.5 … 0,+0.5).
++    // UNKNOWN falls back to LEFT inside libplacebo, which is what every
++    // MPEG-2/4 and H.264/HEVC stream means.
++    float chroma_x = 0.0f, chroma_y = 0.0f;
++    pl_chroma_location_offset(chroma, &chroma_x, &chroma_y);
 +
 +    int block_x = 16, block_y = 16;
 +    int grid_x = (width  + block_x - 1) / block_x;
@@ -9631,10 +9870,10 @@ index 0000000000..532afa3288
 +}
 diff --git a/video/filter/yuv_to_rgba.h b/video/filter/yuv_to_rgba.h
 new file mode 100644
-index 0000000000..6d4fc5f329
+index 0000000000..d2a676103b
 --- /dev/null
 +++ b/video/filter/yuv_to_rgba.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,145 @@
 +// src/mpv/video/filter/yuv_to_rgba.h
 +#pragma once
 +
@@ -9731,9 +9970,9 @@ index 0000000000..6d4fc5f329
 +    return bits == VFX_BITS_10 ? IMGFMT_X2BGR10 : IMGFMT_RGBA;
 +}
 +
-+/// Whether this subfmt is already RGB (RGBA/BGRA/X2RGB10) — if so copy D2D
-+/// directly, do not run the matrix conversion as YUV (otherwise the R plane
-+/// would be read as Y and the G plane as chroma).
++/// Whether this subfmt is already RGB in the layout a raw D2D copy produces
++/// (IMGFMT_RGBA or IMGFMT_X2BGR10) — if so copy directly, do not run the matrix
++/// conversion as YUV (otherwise the R plane would be read as Y and G as chroma).
 +static inline bool vfx_imgfmt_is_rgb(int imgfmt)
 +{
 +    // Only the two layouts a direct D2D copy lands in unchanged: NVCV_RGBA and
@@ -9770,10 +10009,13 @@ index 0000000000..6d4fc5f329
 +bool yuv_to_rgba_init(struct yuv_to_rgba *c, int bit_depth,
 +                       enum yuv_matrix matrix, enum yuv_range range,
 +                       int out_bits);
++/// `chroma` is the source's chroma siting (mpi->params.chroma_location): the
++/// kernel upsamples chroma bilinearly at that siting instead of
++/// nearest-neighbour, which was only correct horizontally co-sited 4:2:0.
 +bool yuv_to_rgba_convert(struct yuv_to_rgba *c,
 +                          void *y_plane,   int y_pitch,
 +                          void *uv_plane,  int uv_pitch,
 +                          int width, int height,
 +                          void *rgba_output, int rgba_pitch,
-+                          CUstream stream);
++                          CUstream stream, enum pl_chroma_location chroma);
 +void yuv_to_rgba_destroy(struct yuv_to_rgba *c);

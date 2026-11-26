@@ -210,8 +210,14 @@ vec4 hook()
     // Current position of the simulated beam, 0 = start of the sweep.
     // Use integer modulo when k is integral so long playback sessions do not
     // accumulate 24-bit float phase drift for non-power-of-two k (e.g. 3, 5).
-    float phase = is_int_k ? (float(int(frame) % int(rk)) / rk)
-                           : (mod(float(frame), k) / k);
+    // int(frame) wraps at 2^31, so past that point fall back to float mod
+    // instead of producing a negative phase.
+    float frame_f = float(frame);
+    float phase;
+    if (is_int_k && frame_f < 2147483000.0)
+        phase = float(int(frame) % int(rk)) / rk;
+    else
+        phase = mod(frame_f, k) / k;
     float raster = fract(phase + raster_mod);
 
     // The refresh window covers exactly one refresh of raster travel, which is
@@ -234,10 +240,12 @@ vec4 hook()
     float tube_frame = tube_pos * k;
 
     // Sum the overlap of this pixel's emission intervals with the current
-    // window. Because f_start < k and k >= 2, f_end < k + 1 < 2*k, so only
-    // copies at n in {-1, 0, 1} can overlap [f_start, f_end].
+    // window. Because f_start < k and k >= 2, f_end <= k, so only the copies at
+    // n = -1 and n = 0 can overlap [f_start, f_end]: the n = +1 copy starts at
+    // tube_frame + k >= k >= f_end, i.e. at or past the window's end (a measure
+    // -zero touch at most). The old n <= 1 loop iteration was dead work.
     vec3 lit = vec3(0.0);
-    for (int n = -1; n <= 1; n++) {
+    for (int n = -1; n <= 0; n++) {
         float start = tube_frame + float(n) * k;
         lit += clamp(min(start + budget, vec3(f_end)) - max(vec3(start), vec3(f_start)),
                      vec3(0.0), vec3(1.0));

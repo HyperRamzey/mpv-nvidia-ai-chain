@@ -50,6 +50,8 @@ owners.discard("")
 # a word followed by ':'; continuation lines are indented.
 field_re = re.compile(r"^([A-Z][A-Za-z ]*?)\s*:\s*(.*)$")
 graph = {}
+provides = {}          # pkg -> set of unversioned names it provides
+provided_by = {}       # name -> set of packages providing it
 name = None
 field = None
 for line in subprocess_get_lines(["pacman", "--query", "--info"]):
@@ -65,18 +67,39 @@ for line in subprocess_get_lines(["pacman", "--query", "--info"]):
             graph.setdefault(name, set())
         elif field == "Depends On" and name:
             graph[name].update(v for v in value.split() if v and v != "None")
+        elif field == "Provides" and name:
+            for tok in value.split():
+                if tok and tok != "None":
+                    pname = re.split(r"[<>=]", tok, maxsplit=1)[0]
+                    provides.setdefault(name, set()).add(pname)
+                    provided_by.setdefault(pname, set()).add(name)
         continue
     if field == "Depends On" and name:  # wrapped continuation line
         graph[name].update(v for v in line.split() if v and v != "None")
 
-def deps_of(pkg):
+def dep_names(pkg):
+    """Unversioned dependency names of pkg.
+
+    `pacman -Qi` writes soname dependencies as `libfoo.so=1-64 (pkg)`; the
+    parenthesised owner and the version constraint are not package names.
+    """
     d = set()
     for tok in graph.get(pkg, ()):
+        tok = re.sub(r"\(.*\)", "", tok)          # drop the owner hint
+        tok = tok.strip()
+        if not tok:
+            continue
         d.add(re.split(r"[<>=]", tok, maxsplit=1)[0])
     return d
 
 # Everything reachable from another owner is redundant: pacman pulls it in
 # anyway. That is what pactree --unique used to prune.
+#
+# A dependency is satisfied either by a package of that name or by any package
+# that Provides it (jack2/pipewire-jack provide `jack`, and every shared library
+# dependency is satisfied by a `libfoo.so=...` provide), so both edges must be
+# walked. Pruning on literal names alone reported virtual dependencies as
+# missing and dragged in the wrong provider.
 def closure(start):
     seen = set()
     stack = list(start)
@@ -85,11 +108,15 @@ def closure(start):
         if pkg in seen:
             continue
         seen.add(pkg)
-        stack.extend(deps_of(pkg))
+        for dep in dep_names(pkg):
+            if dep in graph:
+                stack.append(dep)
+            elif dep in provided_by:
+                stack.extend(provided_by[dep])
     return seen
 
 needed = set(owners)
 for pkg in owners:
-    needed.difference_update(closure(deps_of(pkg)) - {pkg})
+    needed.difference_update(closure(dep_names(pkg)) - {pkg})
 
 print(" ".join(sorted(needed)))

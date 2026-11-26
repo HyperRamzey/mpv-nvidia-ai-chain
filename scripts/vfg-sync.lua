@@ -4,6 +4,10 @@ local FALLBACK_FPS = 60
 local MAX_FPS = 1000
 local last_cap
 local last_chain
+-- Retry budget: a failing vf-command (VFG not initialised yet, or a rejected
+-- value) must not be re-issued on every display-fps / file-loaded event.
+-- Count attempts per (chain, cap) and give up after a few.
+local attempts, attempt_key = 0, nil
 
 local function current_cap()
     local hz = mp.get_property_number("display-fps", 0)
@@ -37,12 +41,21 @@ local function apply(force)
     if not force and cap == last_cap then
         return
     end
+    local key = tostring(last_chain) .. "|" .. tostring(cap)
+    if key ~= attempt_key then
+        attempt_key, attempts = key, 0
+    end
+    if attempts >= 3 then
+        return
+    end
+    attempts = attempts + 1
 
     local _, err = mp.command_native({
         "vf-command", "vfg", "max-fps", string.format("%.17g", cap),
     })
     if err == nil then
         last_cap = cap
+        attempts = 0
     end
 end
 
