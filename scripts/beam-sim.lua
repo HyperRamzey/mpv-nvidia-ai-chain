@@ -22,8 +22,9 @@
 --     scanout. If the compositor does not present one rendered frame per
 --     refresh (desktop effects, a scaled window, a dropped frame), the beam
 --     stalls or skips. Fullscreen direct scanout is what makes it exact.
---   * HDR sources are handled on raw PQ code values (gamma=1), which is an
---     approximation; the reference recommends SDR for exactly this reason.
+--   * HDR PQ sources and TrueHDR output use the ST.2084 EOTF/OETF path
+--     (transfer=pq) normalised to peak_nits; HLG and SDR-tonemapped output
+--     fall back to the SDR power curve.
 --   * anti-retention is an LCD concern. OLED does not need it, and enabling it
 --     decouples the sweep phase from the content, so it defaults to off here.
 
@@ -205,9 +206,9 @@ local function source_fps()
     return fps
 end
 
-local function is_hdr()
+local function is_pq_source()
     local gamma = mp.get_property("video-params/gamma", "")
-    return gamma == "pq" or gamma == "hlg"
+    return gamma == "pq"
 end
 
 -- Frames the renderer actually draws per second: the VF chain output rate when
@@ -219,29 +220,39 @@ local function render_fps()
     return fps
 end
 
+local function is_truthy(v)
+    if v == true or v == 1 then return true end
+    if type(v) ~= "string" then return false end
+    local s = v:lower()
+    return s == "yes" or s == "1" or s == "true" or s == "on"
+end
+
 -- The shader cannot tell what the output stage did to the frame: TrueHDR emits
 -- PQ (ST.2084) even for SDR sources and video-params/gamma keeps reporting the
--- *source* curve, so detection reads the filter chain, not the source.
+-- *source* curve, so detection reads both the source transfer and the filter
+-- chain. Native HDR passes through TrueHDR unchanged, so check it first.
 local function detect_output()
-    local vf = (type(mp.get_property_native) == "function")
-               and mp.get_property_native("vf", nil) or nil
-    local peak = nil
-    if type(vf) == "table" then
-        for _, entry in ipairs(vf) do
-            local name = entry.name
-            if name == "truehdr" and entry.enabled ~= false then
-                local params = entry.params or {}
-                local lum = tonumber(params.luminance)
-                if lum and lum > 0 then peak = lum end
-                return "pq", peak or 700
-            end
-        end
+    if mp.get_property("target-colorspace-hint", "") == "no" then
+        return "sdr", 700
     end
-    if is_hdr() then
+    if is_pq_source() then
         local tp = mp.get_property_number("target-peak", 0)
         return "pq", (tp and tp > 0) and tp or 1000
     end
-    return "sdr", peak or 700
+    local vf = (type(mp.get_property_native) == "function")
+               and mp.get_property_native("vf", nil) or nil
+    if type(vf) == "table" then
+        for _, entry in ipairs(vf) do
+            if entry.name == "truehdr" and entry.enabled ~= false then
+                local params = entry.params or {}
+                if is_truthy(params.enable) then
+                    local lum = tonumber(params.luminance)
+                    return "pq", (lum and lum > 0) and lum or 700
+                end
+            end
+        end
+    end
+    return "sdr", 700
 end
 
 local function shader_present()
@@ -256,7 +267,7 @@ end
 
 -- Pick subframes, gain and gamma from the current display and source.
 local function recompute()
-    local refresh, fps = refresh_hz(), source_fps()
+    local refresh, fps = refresh_hz(), render_fps()
     if state.subframes_auto then
         state.subframes = subframes_for(refresh, state.sweep_hz)
     end
@@ -266,15 +277,12 @@ local function recompute()
     local transfer, peak = detect_output()
     state.transfer = transfer
     state.peak_nits = peak
-    -- gamma is unused on the PQ path (ST.2084 replaces it), kept for the
-    -- SDR path and for the anti-retention slew.
-    if transfer == "sdr" then state.gamma = 2.2 end
     return refresh, fps
 end
 
 local function restore_property(name)
     local value = saved[name]
-    if value ~= nil and value ~= "" then
+    if value ~= nil then
         mp.set_property(name, value)
     end
 end
@@ -290,7 +298,14 @@ local function vfg_entry()
     end
     -- Fallback for the plain string property (and for the test harness).
     local chain = mp.get_property("vf", "") or ""
-    if chain:find("vfg", 1, true) then return { name = "vfg", chain = chain } end
+    for item in chain:gmatch("[^,]+") do
+        if item:sub(1, 1) ~= "!" then
+            local body = item:gsub("^@[^:]+:", "")
+            if body == "vfg" or body:sub(1, 4) == "vfg:" or body:sub(1, 4) == "vfg=" then
+                return { name = "vfg", chain = item }
+            end
+        end
+    end
     return nil
 end
 
@@ -364,7 +379,9 @@ local function enable()
     -- leaving it there would keep a later beam-less playback at that rate.
     -- 0 means "no timestep target" (integer multiplier mode), which is what a
     -- chain that only sets fps/max-fps reports.
-    saved.vfg_out_fps = saved.vfg_out_fps or configured_vfg_out_fps()
+    if vfg_entry() and saved.vfg_out_fps == nil then
+        saved.vfg_out_fps = configured_vfg_out_fps()
+    end
     if not shader_present() then
         mp.commandv("change-list", "glsl-shaders", "append", SHADER_PATH)
     end
@@ -408,9 +425,15 @@ end
 
 -- Live tuning. Every knob only rewrites glsl-shader-opts: libplacebo re-applies
 -- the parameters to the already-parsed hook, so nothing is recompiled.
-local function tuned(message)
-    if state.on then apply_opts() end
-    osd(message .. "\n" .. status_line(refresh_hz(), source_fps()), 2.5)
+local function tuned(message, retarget)
+    if state.on then
+        if retarget then
+            apply_targets()
+        else
+            apply_opts()
+        end
+    end
+    osd(message .. "\n" .. status_line(refresh_hz(), render_fps()), 2.5)
 end
 
 -- User-selectable sweep rate: the beam frequency is the primary knob, k is
@@ -418,13 +441,13 @@ end
 local function set_sweep_hz(hz)
     local refresh = refresh_hz()
     if not refresh then return false end
+    if hz < MIN_SWEEP_HZ then hz = MIN_SWEEP_HZ end
     local k = clamp(math.floor(refresh / hz + 0.5), 2, MAX_AUTO_SUBFRAMES)
     state.sweep_hz = refresh / k
     state.subframes_auto = false
     state.subframes = k + 0.0
-    local refresh2 = apply_targets()
     tuned(string.format("Beam sweep: %.1f Hz (k=%s of %.1f Hz)",
-        (refresh2 or refresh) / k, fmt_subframes(k), refresh2 or refresh))
+        refresh / k, fmt_subframes(k), refresh), true)
     return true
 end
 
@@ -438,15 +461,15 @@ local function cycle_subframes()
         end
     end
     state.subframes = clamp(next_k, 2, MAX_SUBFRAMES) + 0.0
-    tuned("Beam subframes: " .. fmt_subframes(state.subframes))
+    tuned("Beam subframes: " .. fmt_subframes(state.subframes), true)
 end
 
 local function toggle_subframes_auto()
     state.subframes_auto = not state.subframes_auto
     if state.subframes_auto then
-        state.subframes = subframes_for(refresh_hz(), source_fps())
+        state.subframes = subframes_for(refresh_hz(), state.sweep_hz)
     end
-    tuned("Beam subframes: " .. (state.subframes_auto and "auto" or "manual"))
+    tuned("Beam subframes: " .. (state.subframes_auto and "auto" or "manual"), true)
 end
 
 local function adjust_gain(delta)
@@ -488,7 +511,7 @@ end
 local function show_status()
     recompute()
     if state.on then apply_opts() end
-    osd(status_line(refresh_hz(), source_fps()), 3.0)
+    osd(status_line(refresh_hz(), render_fps()), 3.0)
 end
 
 -- Recompute on the events that change the answer. A profile switch rebuilds the
@@ -500,9 +523,6 @@ local function on_video_change()
     end
     ensure_subframes_rendered()
     recompute()
-    if state.subframes_auto then
-        state.subframes = subframes_for(refresh_hz(), state.sweep_hz)
-    end
     apply_targets()
 end
 
@@ -545,15 +565,14 @@ mp.register_script_message("beam", function(cmd, arg1)
         if k then
             state.subframes_auto = false
             state.subframes = clamp(math.floor(k + 0.5), 2, MAX_AUTO_SUBFRAMES) + 0.0
-            apply_targets()
-            tuned("Beam subframes: " .. fmt_subframes(state.subframes))
+            tuned("Beam subframes: " .. fmt_subframes(state.subframes), true)
         end
     elseif cmd == "subframes" then
         local k = tonumber(arg1)
         if k then
             state.subframes_auto = false
             state.subframes = clamp(k, 2, MAX_SUBFRAMES) + 0.0
-            tuned("Beam subframes: " .. fmt_subframes(state.subframes))
+            tuned("Beam subframes: " .. fmt_subframes(state.subframes), true)
         else
             cycle_subframes()
         end

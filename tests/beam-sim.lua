@@ -54,6 +54,12 @@ local function new_player(initial)
         if v == nil then return default end
         return v
     end
+    function mp.get_property_native(name, default)
+        if player.native and player.native[name] ~= nil then
+            return player.native[name]
+        end
+        return default
+    end
     function mp.set_property(name, value)
         player.props[name] = value
         player.calls[#player.calls + 1] = { "set", name, value }
@@ -330,7 +336,7 @@ do
 
     player.bindings["beam-subframes-auto"]()
     equal(api.state.subframes_auto, true, "tuning: auto subframes back on")
-    equal(api.state.subframes, 4, "tuning: auto subframes recomputed")
+    equal(api.state.subframes, 3, "tuning: auto subframes recomputed from target sweep (72 Hz)")
 
     player.bindings["beam-direction-cycle"]()
     equal(api.state.scan_direction, "bottom2top", "tuning: direction advances")
@@ -385,6 +391,58 @@ do
     player.events["file-loaded"]()
     equal(player.count("change-list", "glsl-shaders", "append", "~~/shaders/crt-beam-sim.glsl"), 2,
         "file-loaded: present shader not appended twice")
+end
+
+-- ---------------------------------------------------------------------------
+-- regression checks: empty opt restore, VFG retarget on manual k, sweep floor,
+-- detect_output (truehdr enable=no & native HDR), render_fps pacing
+-- ---------------------------------------------------------------------------
+do
+    local player = new_player(sdr(165, 24, {
+        ["estimated-vf-fps"] = 82.5,
+        ["vf"] = "@hwup:hwup,@vfg:vfg:fps=auto:max-fps=165",
+    }))
+    local api = player.api
+    api.enable()
+    contains(player.osd, "pacing locked", "status: uses render_fps (82.5 on 165 Hz)")
+    player.bindings["beam-subframes-cycle"]()
+    equal(api.state.subframes, 3, "cycle: 2 -> 3")
+    equal(player.count("vf-command", "vfg", "out-fps", "55"), 1,
+        "cycle: retargets VFG to 165/3 = 55")
+    player.messages["beam"]("subframes", "5")
+    equal(player.count("vf-command", "vfg", "out-fps", "33"), 1,
+        "message subframes: retargets VFG to 165/5 = 33")
+    player.bindings["beam-subframes-auto"]()
+    equal(api.state.subframes, 2, "auto: restores k=2 from sweep_hz (72 Hz), not source_fps")
+    equal(player.count("vf-command", "vfg", "out-fps", "82.5"), 2,
+        "auto: retargets VFG back to 82.5")
+    api.set_sweep_hz(10)
+    equal(api.state.subframes, 3, "set_sweep_hz: clamped to 48 Hz floor (165/48 -> k=3)")
+    api.disable()
+    equal(player.props["glsl-shader-opts"], "", "disable: clears previously empty glsl-shader-opts")
+end
+
+do
+    local player = new_player(sdr(165, 24))
+    player.native = {
+        vf = {
+            { name = "truehdr", enabled = true, params = { enable = "no", luminance = "630" } },
+        },
+    }
+    local tr, peak = player.api.detect_output()
+    equal(tr, "sdr", "detect_output: truehdr enable=no is SDR")
+    equal(peak, 700, "detect_output: SDR default peak")
+
+    player.native.vf[1].params.enable = "yes"
+    tr, peak = player.api.detect_output()
+    equal(tr, "pq", "detect_output: truehdr enable=yes is PQ")
+    equal(peak, 630, "detect_output: truehdr luminance used for SDR->HDR")
+
+    player.props["video-params/gamma"] = "pq"
+    player.props["target-peak"] = 1000
+    tr, peak = player.api.detect_output()
+    equal(tr, "pq", "detect_output: native PQ stays PQ")
+    equal(peak, 1000, "detect_output: native PQ ignores TrueHDR luminance")
 end
 
 print("beam-sim tests passed")

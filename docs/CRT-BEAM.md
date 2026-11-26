@@ -130,7 +130,7 @@ re-derived and VFG is retargeted to `display/k`) and `beam k 3` (pin k directly,
 which also retargets VFG). Both print the resulting sweep, VFG rate and pacing
 verdict in the OSD, so it is obvious when a refresh cannot be divided evenly.
 
-To load it without a keybind, add `script=beam-sim` to `mpv.conf`; to have it on
+To load it without a keybind, add `script=~~/scripts/beam-sim.lua` to `mpv.conf` (or place it in `~/.config/mpv/scripts/` to auto-load); to have it on
 by default, `script-opts` are not needed — call `script-message beam on` from a
 startup hook or press the bind.
 

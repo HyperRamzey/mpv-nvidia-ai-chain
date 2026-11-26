@@ -89,7 +89,7 @@ detected and re-Loads the engine, because the multiplier *mode* is part of it).
 detected shot change the engine emits the current frame as-is and silently drops
 generated frames.
 
-`fps=auto` picks the largest integer K in 2..4 that fits under `max-fps=110`:
+`fps=auto` picks the largest integer K in 2..4 that fits under `max-fps` (updated dynamically to the active display refresh by `scripts/vfg-sync.lua`, 60 Hz fallback):
 48→2 (96), 24→4 (96), 120→passthrough (`reason=max-fps`). The cap is 110, not the
 panel's 165, because 2-pass NR + VFG tops out near 96–100 fps presented
 (measurements in `DLSS5-NR-PLAN.md` §6).

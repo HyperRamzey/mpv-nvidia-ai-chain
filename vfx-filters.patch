@@ -104,10 +104,10 @@ index f2c31ef66b..5c61c138bf 100644
  extern const struct mp_user_filter_entry vf_sub;
  extern const struct mp_user_filter_entry vf_vapoursynth;
 diff --git a/meson.build b/meson.build
-index 90b261d8d5..9ea1bdaa3e 100644
+index 90b261d8d5..5193f00590 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -420,6 +420,43 @@ if get_option('fuzzers')
+@@ -420,6 +420,47 @@ if get_option('fuzzers')
      link_flags += ['-fsanitize=address,undefined,fuzzer', '-fno-omit-frame-pointer']
  endif
  
@@ -115,8 +115,12 @@ index 90b261d8d5..9ea1bdaa3e 100644
 +# Needs the CUDA toolkit (cuda.h driver API) and NVRTC (runtime kernel JIT
 +# used by yuv_to_rgba.c). Missing toolkit = filters simply not built; mpv
 +# itself is unaffected.
-+cuda_inc = '/opt/cuda/include'
-+cuda_lib_dir = '/opt/cuda/lib64'
++cuda_root = '/opt/cuda'
++if not cc.has_header('cuda.h', args: '-I' + cuda_root / 'include')
++    cuda_root = '/usr/local/cuda'
++endif
++cuda_inc = cuda_root / 'include'
++cuda_lib_dir = cuda_root / 'lib64'
 +cuda_h = cc.has_header('cuda.h', args: '-I' + cuda_inc)
 +nvrtc_h = cc.has_header('nvrtc.h', args: '-I' + cuda_inc)
 +cuda_lib = cuda_h ? cc.find_library('cuda', required: false) : dependency('', required: false)
@@ -5262,10 +5266,10 @@ index 0000000000..588ccc11d7
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 0000000000..56f8e48694
+index 0000000000..42505acd2e
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1417 @@
+@@ -0,0 +1,1426 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -5416,6 +5420,11 @@ index 0000000000..56f8e48694
 +// gives k = 2 exactly).
 +#define VFG_FPS_OPT_MIN 2
 +#define VFG_FPS_OPT_MAX 8
++// fps=auto keeps the ceiling it always had. It picks the largest multiplier that
++// fits under max-fps, so raising the *explicit* range to 8 must not silently turn
++// a 24p source on a 165 Hz panel into 6x/144 fps (the auto answer is 4x/96, as
++// ai.conf, README and docs/DLSS5-NR-PLAN.md all state).
++#define VFG_AUTO_MAX 4
 +// Internal sentinel for fps=auto (the option parser accepts the string
 +// "auto" and stores 0). Resolve to the largest feasible multiplier from
 +// src_fps and max-fps. 0 can never be an explicit multiplier (2..4).
@@ -6254,7 +6263,7 @@ index 0000000000..56f8e48694
 +    } else if (k == VFG_FPS_AUTO) {
 +        if (p->opts->max_fps > 0 && p->src_fps > 0) {
 +            k = -1;
-+            for (int t = VFG_FPS_OPT_MAX; t >= VFG_FPS_OPT_MIN; t--) {
++            for (int t = VFG_AUTO_MAX; t >= VFG_FPS_OPT_MIN; t--) {
 +                if (t * p->src_fps <= p->opts->max_fps) {
 +                    k = t;
 +                    break;
@@ -6262,19 +6271,23 @@ index 0000000000..56f8e48694
 +            }
 +        } else {
 +            // No cap, or the source fps is unknown: use the old default.
-+            k = VFG_FPS_OPT_MAX;
++            k = VFG_AUTO_MAX;
 +        }
 +    }
 +
 +    const char *reason = NULL;
-+    if (p->opts->out_fps > 0)                        ;   // enabled by out-fps
-+    else if (p->opts->fps == -1)                     reason = "off";
-+    else if (k < VFG_FPS_OPT_MIN)                    reason = "max-fps";
++    // Timestep mode only owns the *rate* (k = 0, no max-fps gate). The three
++    // guards below are about the frame and the engine, so they must run in both
++    // modes: a software frame cannot reach the engine at all, a failed engine
++    // must not be retried (a Load is 218 MB of VFX models, per frame), and a
++    // frame without pts cannot anchor the timestep grid.
++    if (p->opts->fps == -1 && p->opts->out_fps <= 0)  reason = "off";
++    else if (k > 0 && k < VFG_FPS_OPT_MIN)           reason = "max-fps";
 +    else if (p->opts->fps > VFG_FPS_OPT_MAX)         reason = "k-range";
 +    // Output cap (user-set, not an automatic downgrade; see the file header).
 +    // Landing exactly on the cap (30x2=60, cap=60) still interpolates, and an
 +    // unknown src_fps skips the test. For auto this is already satisfied.
-+    else if (p->opts->max_fps > 0 && p->src_fps > 0 &&
++    else if (k > 0 && p->opts->max_fps > 0 && p->src_fps > 0 &&
 +             k * p->src_fps > p->opts->max_fps)
 +                                                     reason = "max-fps";
 +    else if (sw_input)                               reason = "sw";
@@ -6511,7 +6524,7 @@ index 0000000000..56f8e48694
 +        // that one sweep maps 1:1 onto one frame.
 +        char *end = NULL;
 +        double v = strtod(cmd->arg, &end);
-+        if (!end || *end || !(v >= 0) || v > 1000)
++        if (end == cmd->arg || *end || !(v >= 0) || v > 1000)
 +            return false;
 +        if (p->opts->out_fps != v) {
 +            MP_INFO(f, "vfg: out-fps %.17g -> %.17g (vf-command)\n",

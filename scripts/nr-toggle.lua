@@ -47,10 +47,9 @@ local state = {
     intensity      = 1.00,
     localtone      = 0.90,
     localstructure = 1.50,
-    skin           = -1.0,
+    skin           = 1.0,
     sharpness      = 0.00,
     automask       = 1,
-    style          = 2,
     vfg            = "auto",
 }
 
@@ -84,7 +83,11 @@ local function is_me(pid)
     return tostring(tonumber(pid) or pid) == PID
 end
 
-utils.subprocess({ args = { "mkdir", "-p", USERS }, cancellable = false })
+mp.command_native({
+    name          = "subprocess",
+    args          = { "mkdir", "-p", USERS },
+    playback_only = false,
+})
 
 local function mark_active()
     write_all(USERS .. "/" .. PID, "")
@@ -120,12 +123,16 @@ end
 
 local function helper(verb, opts, cb)
     opts = opts or {}
+    local capture = opts.capture == true
+    local args = capture
+        and { HELPER, verb }
+        or  { "/bin/sh", "-c", 'exec "$0" "$1" >/dev/null 2>&1', HELPER, verb }
     local t = {
         name           = "subprocess",
-        args           = { "/bin/sh", "-c", 'exec "$0" "$1" >/dev/null 2>&1', HELPER, verb },
+        args           = args,
         playback_only  = false,
-        capture_stdout = opts.capture == true,
-        capture_stderr = opts.capture == true,
+        capture_stdout = capture,
+        capture_stderr = capture,
         detach         = opts.detach == true,
     }
     if opts.detach then
@@ -136,7 +143,7 @@ local function helper(verb, opts, cb)
     mp.command_native_async(t, function(ok, res)
         local code = res and res.status or -1
         local out = ""
-        if opts.capture then
+        if capture then
             out = (res and res.stdout or "") .. (res and res.stderr or "")
         end
         if cb then cb(ok and code == 0, out) end
@@ -175,14 +182,21 @@ local function enable(passes_target)
     if busy then return end
 
     if nr_on then
-        helper("start", {}, function(ok)
-            if ok then
-                send_dlssnr("passes", current_passes)
-                sync_all_settings()
+        busy = true
+        helper("start", { capture = true }, function(ok, out)
+            if not ok then
+                busy = false
+                osd("DLSS 5 NR: helper failed to start", 3)
+                msg.error(out)
+                return
             end
+            send_dlssnr("passes", current_passes, function()
+                sync_all_settings()
+                busy = false
+                osd(string.format("DLSS 5 NR: ON (%d pass%s)", current_passes, current_passes > 1 and "es" or ""))
+                refresh_if_paused()
+            end)
         end)
-        osd(string.format("DLSS 5 NR: ON (%d pass%s)", current_passes, current_passes > 1 and "es" or ""))
-        refresh_if_paused()
         return
     end
 
@@ -193,11 +207,11 @@ local function enable(passes_target)
 
     busy = true
     osd("DLSS 5 NR: starting helper...", 0)
-    helper("start", {}, function(ok, out)
+    helper("start", { capture = true }, function(ok, out)
         if not ok then
             busy = false
             osd("DLSS 5 NR: helper failed to start", 3)
-            msg.err(out)
+            msg.error(out)
             return
         end
         mark_active()
@@ -211,7 +225,7 @@ local function enable(passes_target)
     end)
 end
 
-local function disable()
+local function disable(force_stop)
     if busy then return end
     local was_on = nr_on
     nr_on = false
@@ -223,8 +237,8 @@ local function disable()
     end
 
     local others = other_users()
-    if was_on and others == 0 then
-        osd("DLSS 5 NR: OFF")
+    if (was_on or force_stop) and others == 0 then
+        osd(force_stop and "DLSS 5 NR: OFF (stopping helper)" or "DLSS 5 NR: OFF")
         refresh_if_paused()
         helper("stop", {}, function()
             busy = false
@@ -266,7 +280,6 @@ local function set_profile(name)
         return
     end
     state.profile = n
-    state.style = def.style
     state.intensity = def.intensity
     state.localtone = def.localtone
     state.localstructure = def.localstructure
@@ -305,7 +318,7 @@ local function adjust_work_scale(dir)
     if nr_on then
         send_dlssnr("work_scale", state.work_scale)
     end
-    local label = state.work_scale == 1.0 and "100% (Native)" or string.format("%d%% (Boost)", math.floor(state.work_scale * 100))
+    local label = state.work_scale == 1.0 and "100% (Native)" or string.format("%d%% (Boost)", math.floor(state.work_scale * 100 + 0.5))
     osd(string.format("DLSS 5 Working Scale: %s", label))
     refresh_if_paused()
 end
@@ -386,7 +399,7 @@ end
 
 local function show_status()
     local nr_status = nr_on and string.format("ON (%d pass%s)", current_passes, current_passes > 1 and "es" or "") or "OFF"
-    local scale_str = state.work_scale == 1.0 and "100% (Native)" or string.format("%d%% (Boost)", math.floor(state.work_scale * 100))
+    local scale_str = state.work_scale == 1.0 and "100% (Native)" or string.format("%d%% (Boost)", math.floor(state.work_scale * 100 + 0.5))
     local skin_str  = state.skin < 0 and "Off" or string.format("%.1f", state.skin)
 
     local txt = string.format(
@@ -443,7 +456,11 @@ mp.register_event("shutdown", function()
     if busy then
         mp.command_native({
             name          = "subprocess",
-            args          = { "/bin/sh", "-c", 'sleep 2; exec "$0" stop >/dev/null 2>&1', HELPER },
+            args          = {
+                "/bin/sh", "-c",
+                'sleep 2; for f in "$1"/*; do [ -f "$f" ] && [ -r "/proc/${f##*/}/stat" ] && exit 0; done; exec "$0" stop >/dev/null 2>&1',
+                HELPER, USERS,
+            },
             playback_only = false,
             detach        = true,
             capture_stdout = false,
@@ -458,7 +475,8 @@ end)
 mp.add_key_binding(nil, "dlssnr-toggle", toggle)
 mp.add_key_binding(nil, "dlssnr-on", function() enable(1) end)
 mp.add_key_binding(nil, "dlssnr-on-2pass", function() enable(2) end)
-mp.add_key_binding(nil, "dlssnr-off", disable)
+mp.add_key_binding(nil, "dlssnr-off", function() disable(false) end)
+mp.add_key_binding(nil, "dlssnr-force-off", function() disable(true) end)
 mp.add_key_binding(nil, "dlssnr-passes-cycle", cycle_passes)
 mp.add_key_binding(nil, "dlssnr-profile-cycle", cycle_profile)
 mp.add_key_binding(nil, "dlssnr-scale-up", function() adjust_work_scale(1) end)
@@ -477,14 +495,14 @@ mp.add_key_binding(nil, "vfg-toggle", toggle_vfg)
 mp.add_key_binding(nil, "dlssnr-status", show_status)
 
 -- Script messages (console support)
-mp.register_script_message("dlssnr", function(cmd, arg1, arg2)
+mp.register_script_message("dlssnr", function(cmd, arg1)
     cmd = (cmd or ""):lower()
     if cmd == "toggle" then
         toggle()
     elseif cmd == "on" then
         enable(tonumber(arg1) or 2)
     elseif cmd == "off" then
-        disable()
+        disable(false)
     elseif cmd == "profile" or cmd == "preset" then
         if arg1 and arg1 ~= "" then
             set_profile(arg1)
@@ -496,11 +514,12 @@ mp.register_script_message("dlssnr", function(cmd, arg1, arg2)
         if p and p > 0 then
             enable(p)
         else
-            disable()
+            disable(false)
         end
     elseif cmd == "scale" or cmd == "work_scale" then
         local s = tonumber(arg1)
         if s then
+            s = math.max(0.25, math.min(1.0, s))
             state.work_scale = s
             if nr_on then send_dlssnr("work_scale", s) end
             osd(string.format("DLSS 5 Work Scale: %.2f", s))
@@ -509,6 +528,7 @@ mp.register_script_message("dlssnr", function(cmd, arg1, arg2)
     elseif cmd == "intensity" then
         local v = tonumber(arg1)
         if v then
+            v = math.max(0.0, math.min(1.0, v))
             state.intensity = v
             if nr_on then send_dlssnr("intensity", v) end
             osd(string.format("DLSS 5 Intensity: %.2f", v))
@@ -526,7 +546,8 @@ end)
 mp.register_script_message("dlssnr-toggle", toggle)
 mp.register_script_message("dlssnr-on", function(p) enable(tonumber(p) or 1) end)
 mp.register_script_message("dlssnr-on-2pass", function() enable(2) end)
-mp.register_script_message("dlssnr-off", disable)
+mp.register_script_message("dlssnr-off", function() disable(false) end)
+mp.register_script_message("dlssnr-force-off", function() disable(true) end)
 mp.register_script_message("dlssnr-profile", set_profile)
 mp.register_script_message("dlssnr-profile-cycle", cycle_profile)
 mp.register_script_message("dlssnr-status", show_status)
@@ -534,5 +555,5 @@ mp.register_script_message("vfg-toggle", toggle_vfg)
 mp.register_script_message("refresh", refresh_if_paused)
 
 -- Default direct hotkeys
-mp.add_key_binding("Ctrl+Alt+n", "dlssnr-on-default", function() enable(1) end)
-mp.add_key_binding("Ctrl+Alt+Shift+n", "dlssnr-off-default", disable)
+mp.add_key_binding("Ctrl+Alt+n", "dlssnr-toggle-default", toggle)
+mp.add_key_binding("Ctrl+Alt+Shift+n", "dlssnr-off-default", function() disable(true) end)

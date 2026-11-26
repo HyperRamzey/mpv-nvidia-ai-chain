@@ -5,7 +5,7 @@ in-chain filter, driven by a profile set that picks the right chain per source.
 
 **Experimental:** the new Dolby Vision reconstruction path has not yet been
 validated on an NVIDIA GPU with P5, P8.1 or P7 FEL/MEL samples. The project
-currently targets Linux; Windows gpu-next builds have not been verified. // seem to work so far for p8.1 and 5
+currently targets Linux; Windows gpu-next builds have not been verified.
 
 Built for an Arch / KDE Wayland desktop with an RTX 5070 and a 2560×1440 165 Hz
 panel. Nothing here is Windows-specific; the only Wine dependency is the NR
@@ -120,10 +120,12 @@ mpv movie.mkv           # untouched player, Dolby Vision as before
 Install the configs and helper scripts:
 
 ```sh
-install -Dm644 ai.conf               ~/.config/mpv/ai.conf
-install -Dm644 input.conf            ~/.config/mpv/input.conf
-install -Dm644 scripts/vfg-sync.lua  ~/.config/mpv/scripts/vfg-sync.lua
-install -Dm644 scripts/nr-toggle.lua ~/.config/mpv/scripts/nr-toggle.lua
+install -Dm644 ai.conf                   ~/.config/mpv/ai.conf
+install -Dm644 input.conf                ~/.config/mpv/input.conf
+install -Dm644 scripts/vfg-sync.lua      ~/.config/mpv/scripts/vfg-sync.lua
+install -Dm644 scripts/nr-toggle.lua     ~/.config/mpv/scripts/nr-toggle.lua
+install -Dm644 scripts/beam-sim.lua      ~/.config/mpv/scripts/beam-sim.lua
+install -Dm644 shaders/crt-beam-sim.glsl ~/.config/mpv/shaders/crt-beam-sim.glsl
 ```
 
 ### 60% Keyboard Controls (No Numpad Required)
@@ -135,9 +137,9 @@ All shortcuts use standard alphanumeric keys with `Ctrl+Alt+...` or `Ctrl+Alt+Sh
 | `Ctrl+Alt+n` | `dlssnr-toggle` | Toggle DLSS 5 Neural Render on / off |
 | `Ctrl+Alt+1` | `dlssnr-on` | Enable DLSS 5 NR with 1 pass |
 | `Ctrl+Alt+2` | `dlssnr-on-2pass` | Enable DLSS 5 NR with 2 passes (high quality) |
-| `Ctrl+Alt+c` | `dlssnr-passes-cycle` | Cycle passes (1 pass ↔ 2 passes) |
+| `Ctrl+Alt+c` | `dlssnr-passes-cycle` | Cycle passes (OFF → 1 → 2 → OFF) |
 | `Ctrl+Alt+0` | `dlssnr-off` | Turn off DLSS 5 NR |
-| `Ctrl+Alt+Shift+n` | `dlssnr-off` | Turn off DLSS 5 NR & stop helper process |
+| `Ctrl+Alt+Shift+n` | `dlssnr-force-off` | Turn off DLSS 5 NR & stop helper process |
 | `Ctrl+Alt+p` | `dlssnr-profile-cycle` | Cycle profiles (`faithful` → `natural` → `cinematic` → `extreme`) |
 | `Ctrl+Alt+]` / `[` | `dlssnr-scale-up/down` | Adjust work scale / boost (25% → 50% → 65% → 75% → 100%) |
 | `Ctrl+Alt+i` / `Shift+i` | `dlssnr-intensity` | Denoising intensity (±0.05) |
@@ -281,9 +283,9 @@ The anchor is never replaced, so text and edges keep full resolution.
 2. **Dolby Vision reconstruction is experimental.** FEL composition, profile 5
    and dynamic metadata need verification against real sample playback. Use the
    native mpv/libplacebo path when a verified Dolby Vision picture is required.
-4. **1080p48 with VSR is the stress case** (~310–340 dropped frames / 18 s).
+3. **1080p48 with VSR is the stress case** (~310–340 dropped frames / 18 s).
    `dlssnr:passes=1` there restores 144 fps.
-5. **The NR answer buffer is allocated per frame** (14.7 MB `cuMemAlloc`, freed
+4. **The NR answer buffer is allocated per frame** (14.7 MB `cuMemAlloc`, freed
    on the VO thread). Within budget, but a persistent buffer is the obvious next
    optimisation.
 
@@ -314,5 +316,5 @@ The second pass added:
 
 `vfx-filters.patch` modifies mpv and is distributed under the same terms as mpv
 (GPLv2 or later). `PKGBUILD` and the docs are provided as-is, no warranty.
-Dolby Vision handling relies on libplacebo 7.392 with libdovi; NGX itself is
+Dolby Vision handling relies on libplacebo 7.399 with libdovi; NGX itself is
 NVIDIA's, shipped with the driver.

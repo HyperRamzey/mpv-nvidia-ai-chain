@@ -23,7 +23,7 @@ import os
 import re
 import sys
 
-SPEC = re.compile(r'%(?:[-+ #0]*\d*(?:\.\d+)?(?:hh|h|ll|l|j|z|t|L)?[diouxXeEfgGaAcspn%])')
+SPEC = re.compile(r'%(?:[-+ #0]*(?:\*|\d*)(?:\.(?:\*|\d*))?(?:hh|h|ll|l|j|z|t|L)?[diouxXeEfgGaAcspn%])')
 
 
 def tokens(src):
@@ -39,8 +39,17 @@ def tokens(src):
         c = src[i]
         if c == '/' and i + 1 < n and src[i + 1] == '/':
             flush()
-            j = src.find('\n', i)
-            i = n if j < 0 else j
+            while True:
+                j = src.find('\n', i)
+                if j < 0:
+                    i = n
+                    break
+                # C line continuation extends a // comment onto the next line.
+                end = j - 1 if j > i and src[j - 1] == '\r' else j
+                i = j + 1
+                if end > 0 and src[end - 1] == '\\':
+                    continue
+                break
         elif c == '/' and i + 1 < n and src[i + 1] == '*':
             flush()
             j = src.find('*/', i + 2)
@@ -78,8 +87,10 @@ def main(argv):
     ok = True
     for f in files:
         bp, cp = os.path.join(base, f), os.path.join(cur, f)
-        old = open(bp, encoding='utf-8', errors='replace').read()
-        new = open(cp, encoding='utf-8', errors='replace').read()
+        with open(bp, encoding='utf-8', errors='replace') as fh:
+            old = fh.read()
+        with open(cp, encoding='utf-8', errors='replace') as fh:
+            new = fh.read()
         a, b = tokens(old), tokens(new)
 
         ca = [norm_code(t) for k, t in a if k == 'code' and norm_code(t)]

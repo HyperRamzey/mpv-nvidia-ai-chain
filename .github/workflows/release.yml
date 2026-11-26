@@ -37,7 +37,7 @@ concurrency:
 
 env:
   # Pinned upstream commit the patch was written against (also in PKGBUILD).
-  MPV_COMMIT: fe753a78246151a2489b472dabcb04f2edd61d50
+  MPV_COMMIT: 7f505de186ddcaeff6dabf48db79c9b8f8adc309
 
 jobs:
   # --------------------------------------------------------------------------
@@ -84,6 +84,33 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           luac5.1 -p scripts/vfg-sync.lua
           lua5.1 tests/vfg-sync-refresh.lua
+          luac5.1 -p scripts/beam-sim.lua
+          lua5.1 tests/beam-sim.lua
+          luac5.1 -p scripts/nr-toggle.lua
+
+      - name: Beam shader headers are well formed
+        run: |
+          set -euo pipefail
+          shader=shaders/crt-beam-sim.glsl
+          known='//!(HOOK|BIND|PARAM|DESC|TYPE|MINIMUM|MAXIMUM)([[:space:]]|$)'
+          stray="$(grep -n '//!' "$shader" | grep -vE "$known" || true)"
+          if [ -n "$stray" ]; then
+            echo "$stray"
+            echo "::error::header marker on a non-header line"
+            exit 1
+          fi
+          first_hook="$(grep -n '//!HOOK' "$shader" | head -1 | cut -d: -f1)"
+          last_param="$(grep -n '//!PARAM' "$shader" | tail -1 | cut -d: -f1)"
+          if [ -n "$last_param" ] && [ "$last_param" -gt "$first_hook" ]; then
+            echo "::error::PARAM block after HOOK is rejected by libplacebo"
+            exit 1
+          fi
+          for name in subframes gain_vs_blur gamma scan_direction \
+                      raster_mod anti_retention slew transfer peak_nits; do
+            grep -q "^//!PARAM $name$" "$shader" \
+              || { echo "::error::missing PARAM $name"; exit 1; }
+          done
+          echo "beam shader headers ok"
 
       - name: ai.conf is a valid mpv config
         run: |
@@ -108,7 +135,8 @@ jobs:
         run: |
           set -euo pipefail
           pacman -Syu --noconfirm --needed git sudo ccache
-          sed -i 's/^!ccache/ccache/' /etc/makepkg.conf
+          sed -i 's/!ccache/ccache/' /etc/makepkg.conf
+          grep -Eq 'BUILDENV=.*\bccache\b' /etc/makepkg.conf
           df -h / | tail -1
 
       - name: Restore ccache
@@ -163,9 +191,10 @@ jobs:
           ver="${pkgver}-${pkgrel}"
           mkdir -p dist
           cp mpv-dovi-vfx-git-*.pkg.tar.zst dist/
-          cp vfx-filters.patch PKGBUILD mpv.install find-deps.py ai.conf dist/
-          mkdir -p dist/scripts
-          cp scripts/vfg-sync.lua dist/scripts/
+          cp vfx-filters.patch PKGBUILD mpv.install find-deps.py ai.conf input.conf dist/
+          mkdir -p dist/scripts dist/shaders
+          cp scripts/vfg-sync.lua scripts/nr-toggle.lua scripts/beam-sim.lua dist/scripts/
+          cp shaders/crt-beam-sim.glsl dist/shaders/
           cat > dist/RELEASE_NOTES.md <<EOF
           ## mpv-dovi-vfx-git ${ver}
 
@@ -174,17 +203,21 @@ jobs:
 
           | Component | Pin |
           | --- | --- |
-          | mpv | \`${MPV_COMMIT}\` |
-          | libplacebo | \`58dfee73db8139d825306b638c844f6908517164\` (PL_API_VER 392, libdovi) |
-          | FFmpeg | 9.0.2, static |
+          | mpv | \`${_mpvcommit}\` |
+          | libplacebo | \`${_lpcommit}\` (static, libdovi) |
+          | FFmpeg | ${_ffmpegver}, static |
           | VFX patch | \`$(sha256sum vfx-filters.patch | cut -d' ' -f1)\` |
 
           ### Install
 
           \`\`\`sh
           sudo pacman -U mpv-dovi-vfx-git-*.pkg.tar.zst
-          install -Dm644 ai.conf              ~/.config/mpv/ai.conf
-          install -Dm644 scripts/vfg-sync.lua ~/.config/mpv/scripts/vfg-sync.lua
+          install -Dm644 ai.conf                   ~/.config/mpv/ai.conf
+          install -Dm644 input.conf                ~/.config/mpv/input.conf
+          install -Dm644 scripts/vfg-sync.lua      ~/.config/mpv/scripts/vfg-sync.lua
+          install -Dm644 scripts/nr-toggle.lua     ~/.config/mpv/scripts/nr-toggle.lua
+          install -Dm644 scripts/beam-sim.lua      ~/.config/mpv/scripts/beam-sim.lua
+          install -Dm644 shaders/crt-beam-sim.glsl ~/.config/mpv/shaders/crt-beam-sim.glsl
           \`\`\`
 
           Noise reduction is off by default (\`dlssnr:passes=0\` is a true
@@ -247,9 +280,10 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          tag='${{ steps.tag.outputs.tag }}'
+          tag="$RELEASE_TAG"
           # Every file in dist/ is an asset, including scripts/vfg-sync.lua;
           # dist/scripts itself must not be passed (gh tries to upload the
           # directory and fails). SHA256SUMS goes last so the list stays sorted.

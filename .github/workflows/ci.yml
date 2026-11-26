@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  MPV_COMMIT: fe753a78246151a2489b472dabcb04f2edd61d50
+  MPV_COMMIT: 7f505de186ddcaeff6dabf48db79c9b8f8adc309
 
 jobs:
   validate:
@@ -61,6 +61,7 @@ jobs:
           lua5.1 tests/vfg-sync-refresh.lua
           luac5.1 -p scripts/beam-sim.lua
           lua5.1 tests/beam-sim.lua
+          luac5.1 -p scripts/nr-toggle.lua
 
       # libplacebo aborts a whole user shader on an unknown header, and rejects
       # a PARAM that follows the HOOK block. Both mistakes are silent at

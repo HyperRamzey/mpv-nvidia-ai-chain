@@ -18,7 +18,7 @@
 #     linked statically instead.  Nothing in the system is replaced.
 #
 # mpv is pinned to the exact commit the VFX patch was written against.  The
-# patch is surgical (19 files: 5 modified + 14 new), not a whole-file overlay,
+# patch is surgical (24 files: 6 modified + 18 new), not a whole-file overlay,
 # so the DoVi path and the upstream ra_pl x2bgr10 mapping stay untouched.
 #
 # Runtime: the NVIDIA VFX SDK libraries are dlopen()ed, never linked.  They are
@@ -138,7 +138,7 @@ sha256sums=(
   'SKIP'
   'SKIP'
   '7dbf0282eb1f5a46b8d4935daba5566d18b7ec7ad9d487430a78f992c99a8e63'
-  'f790044016d2252c2798404d6f01e7b5a56e7e3e2de7f6b5b8c59b88c35aa8fa'
+  '56fbaaf374b23543e800d9c2af41fb9dd6e52bbb10f2f4591db0ba585f8b8c28'
 )
 
 pkgver() {
@@ -215,7 +215,7 @@ build() {
     CFLAGS=$(_strip_polly "$CFLAGS")
     CXXFLAGS=$(_strip_polly "$CXXFLAGS")
     export CFLAGS CXXFLAGS
-    [[ "$CFLAGS" == *LLVMPolly* || "$CFLAGS" == *'-mllvm -polly'* ]] && {
+    [[ "$CFLAGS$CXXFLAGS" == *LLVMPolly* || "$CFLAGS$CXXFLAGS" == *'-mllvm -polly'* ]] && {
       error 'Polly flags survived the strip'
       return 1
     }
@@ -301,7 +301,11 @@ build() {
   # `pkg-config --static` link test fails with
   #   undefined reference to std::to_chars(char*, char*, double)
   # and FFmpeg's configure reports "libplacebo >= 7.351.0 not found".
-  printf 'Libs.private: -lstdc++\n' >> "$prefix/lib/pkgconfig/libplacebo.pc"
+  if grep -q '^Libs\.private:' "$prefix/lib/pkgconfig/libplacebo.pc"; then
+    sed -i 's/^Libs\.private:.*/& -lstdc++/' "$prefix/lib/pkgconfig/libplacebo.pc"
+  else
+    printf 'Libs.private: -lstdc++\n' >> "$prefix/lib/pkgconfig/libplacebo.pc"
+  fi
 
   # These two asserts are the whole point of the package.  Fail loudly if a
   # future libplacebo drops the FEL API instead of silently shipping a player
@@ -314,7 +318,7 @@ build() {
     || { error "libplacebo built without libdovi"; return 1; }
   msg "libplacebo PL_API_VER=$pl_api (FEL: yes)"
 
-  msg 'Building FFmpeg (static, 9.0.2)'
+  msg "Building FFmpeg (static, ${_ffmpegver})"
   cd "$srcdir/ffmpeg-${_ffmpegver}"
   # -fno-lto is required: libswscale/x86/rgb2rgb.c defines constants that are
   # only referenced from inline asm constraints.  With makepkg's -flto=auto the
@@ -436,9 +440,6 @@ package() {
   install -Dm644 LICENSE.GPL "$pkgdir/usr/share/licenses/$pkgname/LICENSE.GPL"
   install -Dm644 LICENSE.LGPL "$pkgdir/usr/share/licenses/$pkgname/LICENSE.LGPL"
   install -Dm644 Copyright "$pkgdir/usr/share/licenses/$pkgname/Copyright"
-
-  # Drop the unversioned .so symlink; nothing in the package links against it.
-  rm -f "$pkgdir/usr/lib/libmpv.so"
 
   local detected
   detected=$(python3 "$srcdir/find-deps.py" \

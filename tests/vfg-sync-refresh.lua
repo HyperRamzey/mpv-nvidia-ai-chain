@@ -105,4 +105,11 @@ retry.observe("display-fps", 120)
 equal(#retry.calls, 2, "failed command is retried")
 check_cap(retry.calls[2], 120)
 
+local absent = new_player(165)
+absent.observe("vf", "")
+absent.events["file-loaded"]()
+absent.set_fps(120)
+absent.observe("vf", "@hwup:hwup,!@vfg:vfg:fps=auto")
+equal(#absent.calls, 0, "no commands emitted when vfg is absent or disabled")
+
 print("vfg-sync refresh tests passed")

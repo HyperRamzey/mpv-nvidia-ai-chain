@@ -14,9 +14,9 @@ NOTE: mpv-dovi-vfx-git carries five extra filters that are dlopen()-based,
       when it is missing, mpv still runs normally and the filters just error
       out on first use.
 
-      Required runtime pieces, none of which are hard package dependencies:
-        - the proprietary NVIDIA driver (libcuda.so.1)
-        - the 'cuda' package (libnvrtc.so.13, used to JIT the YUV->RGBA kernel)
+      Required runtime pieces:
+        - 'nvidia-utils' (libcuda.so.1) and 'cuda' (libnvrtc.so.13) — hard
+          package dependencies linked into mpv
         - an RTX GPU with the NGX models for VSR / TrueHDR / VFG
 
       The AI chain must decode through NVDEC (--hwdec=nvdec). With

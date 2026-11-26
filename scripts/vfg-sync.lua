@@ -14,7 +14,25 @@ local function current_cap()
     return hz
 end
 
+local function has_vfg(chain)
+    if type(chain) ~= "string" or chain == "" then
+        return false
+    end
+    for item in chain:gmatch("[^,]+") do
+        if item:sub(1, 1) ~= "!" then
+            local body = item:gsub("^@[^:]+:", "")
+            if body == "vfg" or body:sub(1, 4) == "vfg:" or body:sub(1, 4) == "vfg=" then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function apply(force)
+    if not has_vfg(last_chain) then
+        return
+    end
     local cap = current_cap()
     if not force and cap == last_cap then
         return

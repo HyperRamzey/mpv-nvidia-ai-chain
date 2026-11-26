@@ -200,11 +200,19 @@ vec4 hook()
         return src;
 
     // LCD anti-retention: keep an even subframe count off the inversion pattern.
-    if (anti_retention == 1 && abs(k - floor(k)) < 1e-4 && mod(floor(k), 2.0) == 0.0)
+    float rk = floor(k + 0.5);
+    bool is_int_k = abs(k - rk) < 1e-4;
+    if (anti_retention == 1 && is_int_k && mod(rk, 2.0) == 0.0) {
         k += clamp(slew, 0.0, 0.02);
+        is_int_k = false;
+    }
 
     // Current position of the simulated beam, 0 = start of the sweep.
-    float raster = fract(fract(float(frame) / k) + raster_mod);
+    // Use integer modulo when k is integral so long playback sessions do not
+    // accumulate 24-bit float phase drift for non-power-of-two k (e.g. 3, 5).
+    float phase = is_int_k ? (float(int(frame) % int(rk)) / rk)
+                           : (mod(float(frame), k) / k);
+    float raster = fract(phase + raster_mod);
 
     // The refresh window covers exactly one refresh of raster travel, which is
     // why one sweep takes `k` refreshes and only 1/k of the screen is lit.
@@ -212,9 +220,10 @@ vec4 hook()
     float f_end   = f_start + 1.0;
 
     // Where this pixel sits along the raster.
+    // mpv/libplacebo HOOKED_pos has (0, 0) at top-left and (1, 1) at bottom-right.
     float tube_pos;
-    if (scan_direction == 0)      tube_pos = 1.0 - HOOKED_pos.y;  // top to bottom
-    else if (scan_direction == 1) tube_pos = HOOKED_pos.y;        // bottom to top
+    if (scan_direction == 0)      tube_pos = HOOKED_pos.y;        // top to bottom
+    else if (scan_direction == 1) tube_pos = 1.0 - HOOKED_pos.y;  // bottom to top
     else if (scan_direction == 2) tube_pos = 0.0;                 // global (BFI)
     else if (scan_direction == 3) tube_pos = HOOKED_pos.x;        // left to right
     else                          tube_pos = 1.0 - HOOKED_pos.x;  // right to left
@@ -225,10 +234,10 @@ vec4 hook()
     float tube_frame = tube_pos * k;
 
     // Sum the overlap of this pixel's emission intervals with the current
-    // window. The reference walks three trailing refresh cycles; the emission
-    // intervals repeat every `k`, so copies at -1..2 cover every window.
+    // window. Because f_start < k and k >= 2, f_end < k + 1 < 2*k, so only
+    // copies at n in {-1, 0, 1} can overlap [f_start, f_end].
     vec3 lit = vec3(0.0);
-    for (int n = -1; n <= 2; n++) {
+    for (int n = -1; n <= 1; n++) {
         float start = tube_frame + float(n) * k;
         lit += clamp(min(start + budget, vec3(f_end)) - max(vec3(start), vec3(f_start)),
                      vec3(0.0), vec3(1.0));
