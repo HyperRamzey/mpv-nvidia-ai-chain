@@ -97,6 +97,12 @@
 //   beam_headroom   PQ only: how far above peak_nits the beam may flash. 1.0
 //                   never exceeds the tone-mapped peak; 1.5 flashes at up to
 //                   1.5x for 2/3 of the persistence. SDR is pinned to 1.0.
+//   chroma_balance  1 (default): one emission window per pixel, set by its
+//                   brightest channel, with each channel emitting at its own
+//                   intensity inside it -- hue is identical in every refresh, no
+//                   chroma ghosting. 0: per-channel windows, which gives the
+//                   bright channel the shortest persistence but separates the
+//                   channels in time (temporal colour fringing).
 //   gamma           display gamma for the linear-light budget: 2.2 for a
 //                   standard sRGB SDR output, 2.4 recommended by the reference,
 //                   1.0 to work on raw code values (PQ/HLG, approximate).
@@ -178,6 +184,12 @@ pq
 //!MINIMUM 1.0
 //!MAXIMUM 8.0
 1.0
+//!PARAM chroma_balance
+//!DESC 1 = one emission window for the pixel (no chroma ghosting), 0 = per channel
+//!TYPE int
+//!MINIMUM 0
+//!MAXIMUM 1
+1
 
 //!HOOK OUTPUT
 //!BIND HOOKED
@@ -294,7 +306,31 @@ vec4 hook()
     float headroom = (transfer == 1) ? clamp(beam_headroom, 1.0, 8.0) : 1.0;
     headroom *= clamp(gain_vs_blur, 0.01, 1.0);
     headroom = max(headroom, 1.0);
-    vec3 emit = clamp(p * k / headroom, vec3(0.0), vec3(k));
+
+    // Colour-balanced (chroma_balance = 1, default): one emission window for the
+    // whole pixel, driven by its brightest channel, with each channel emitting
+    // at its own intensity inside that window. The ratios between the channels
+    // are then identical in every refresh, so the hue is preserved exactly and
+    // there is no chroma ghosting -- the artefact that makes the picture look
+    // dulled/washed when each channel is given its own persistence (the
+    // reference added "colour balanced variable MPRT" for the same reason).
+    //
+    // chroma_balance = 0: per-channel windows, i.e. maximum blur reduction for
+    // the bright channel at the cost of temporal colour separation.
+    float p_max = max(max(p.r, p.g), p.b);
+    vec3 emit;
+    vec3 intensity = vec3(0.0);
+    float window;
+    if (chroma_balance == 1) {
+        window = clamp(p_max * k / headroom, 0.0, k);
+        emit = vec3(window);
+        if (window > 1e-6)
+            intensity = clamp(p * k / window, vec3(0.0), vec3(headroom));
+    } else {
+        emit = clamp(p * k / headroom, vec3(0.0), vec3(k));
+        intensity = vec3(headroom);
+        window = 0.0;
+    }
 
     float tube_frame = tube_pos * k;
 
@@ -310,7 +346,9 @@ vec4 hook()
                      vec3(0.0), vec3(1.0));
     }
     // Overlap is emission time; scale it to the intensity that flashes for it.
-    lit *= headroom;
+    // In colour-balanced mode the three overlaps are identical (one window), so
+    // the per-channel intensity alone sets the colour, exactly as in the source.
+    lit *= intensity;
 
     return vec4(bbs_encode(lit.r), bbs_encode(lit.g), bbs_encode(lit.b), src.a);
 }

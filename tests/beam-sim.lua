@@ -355,6 +355,16 @@ do
     player.messages["beam"]("headroom", "0.1")
     near(api.state.beam_headroom, 1.0, "headroom: clamped at 1.0x")
 
+    -- Colour balance: one emission window per pixel (default) so the channels
+    -- keep their ratios in every refresh; off gives per-channel persistence.
+    equal(api.state.chroma_balance, 1, "chroma: balanced by default")
+    contains(opts_of(player), "crt-beam-sim/chroma_balance=1", "chroma: pushed")
+    player.messages["beam"]("chroma", "0")
+    equal(api.state.chroma_balance, 0, "chroma: message turns it off")
+    contains(opts_of(player), "crt-beam-sim/chroma_balance=0", "chroma: off pushed")
+    player.messages["beam"]("chroma")
+    equal(api.state.chroma_balance, 1, "chroma: bare message toggles back")
+
     player.bindings["beam-gain-auto"]()
     equal(api.state.gain_auto, true, "tuning: auto gain back on")
     near(api.state.gain_vs_blur, 1.0, "tuning: auto gain is 1.0 (brightness kept)")

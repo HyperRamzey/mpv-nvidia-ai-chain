@@ -32,7 +32,7 @@ local SHADER_PATH  = "~~/shaders/crt-beam-sim.glsl"
 local SHADER_NAME  = "crt-beam-sim"
 local PARAMS       = { "subframes", "gain_vs_blur", "gamma", "scan_direction",
                        "raster_mod", "anti_retention", "slew", "transfer",
-                       "peak_nits", "beam_headroom" }
+                       "peak_nits", "beam_headroom", "chroma_balance" }
 local SUBFRAME_STEPS = { 2, 3, 4, 5, 6, 8, 10, 12 }
 local DIRECTIONS  = { "global", "top2bottom", "bottom2top", "left2right", "right2left" }
 local MAX_SUBFRAMES = 12
@@ -55,6 +55,7 @@ local state = {
     gain_vs_blur   = 1.0,
     gain_auto      = true,
     beam_headroom  = 1.0,
+    chroma_balance = 1,
     gamma          = 2.2,
     scan_direction = "top2bottom",
     raster_mod     = 0.0,
@@ -142,7 +143,7 @@ end
 -- its metadata brightness, so there is nothing to trade away and the automatic
 -- value is always 1.0 (use the full headroom). Lower it by hand only to reduce
 -- peak flash load (OLED ABL), never for brightness.
-local function gain_for(_refresh)
+local function gain_for(_)
     return 1.0
 end
 
@@ -171,6 +172,7 @@ local function merge_opts(existing, st)
         transfer       = (st.transfer == "pq") and "pq" or "sdr",
         peak_nits      = fmt(st.peak_nits or 700, 1),
         beam_headroom  = fmt(st.beam_headroom or 1.0, 2),
+        chroma_balance = tostring(math.floor((st.chroma_balance or 1) + 0.5)),
     }
     local out = {}
     local prefix = SHADER_NAME .. "/"
@@ -594,6 +596,17 @@ mp.register_script_message("beam", function(cmd, arg1)
             state.gain_auto = false
             state.gain_vs_blur = clamp(v, 0.01, 1.0)
             tuned(string.format("Beam gain vs blur: %.3f", state.gain_vs_blur))
+        end
+    elseif cmd == "chroma" or cmd == "chroma_balance" then
+        local v = tonumber(arg1)
+        if v ~= nil then
+            state.chroma_balance = (v >= 0.5) and 1 or 0
+            tuned("Beam chroma balance: " .. ((state.chroma_balance == 1)
+                and "on (one window, no colour fringing)"
+                or "off (per-channel windows, shortest MPRT)"))
+        else
+            state.chroma_balance = (state.chroma_balance == 1) and 0 or 1
+            tuned("Beam chroma balance: " .. ((state.chroma_balance == 1) and "on" or "off"))
         end
     elseif cmd == "headroom" or cmd == "beam_headroom" then
         local v = tonumber(arg1)

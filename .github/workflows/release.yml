@@ -112,7 +112,7 @@ jobs:
           fi
           for name in subframes gain_vs_blur gamma scan_direction \
                       raster_mod anti_retention slew transfer peak_nits \
-                      beam_headroom; do
+                      beam_headroom chroma_balance; do
             grep -q "^//!PARAM $name$" "$shader" \
               || { echo "::error::missing PARAM $name"; exit 1; }
           done
@@ -243,11 +243,18 @@ jobs:
           ### CRT beam simulator
 
           \`scripts/beam-sim.lua\` and \`shaders/crt-beam-sim.glsl\` render a
-          phosphor beam with a per-pixel photon budget at the end of the filter
-          chain. Enabling it retargets VFG to \`display_hz / k\` through the
-          float-timestep engine, so the presented rate divides the panel
-          exactly (165 Hz / 2 = 82.5) instead of being forced to an integer;
-          disabling it restores every property it touched.
+          phosphor beam at the end of the filter chain. Enabling it retargets
+          VFG to \`display_hz / k\` through the float-timestep engine, so the
+          presented rate divides the panel exactly (240/3 = 80, 165/2 = 82.5)
+          instead of being forced to an integer; disabling it restores every
+          property it touched.
+
+          Brightness is conserved (Talbot-Plateau): the beam splits each pixel's
+          light into an intensity and an emission window so the sweep average
+          equals the source, which is what an HDR chain requires. Sharpness
+          comes from \`beam_headroom\` (flash above the tone-mapped peak)
+          instead of from dimming, and \`chroma_balance\` keeps one emission
+          window per pixel so colours do not fringe in motion.
 
           | Key | Message | Effect |
           | --- | --- | --- |
