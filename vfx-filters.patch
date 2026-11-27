@@ -4315,7 +4315,7 @@ new file mode 100644
 index 0000000000..09cbb2e7b2
 --- /dev/null
 +++ b/video/filter/vf_truehdr.c
-@@ -0,0 +1,1139 @@
+@@ -0,0 +1,1160 @@
 +// src/mpv/video/filter/vf_truehdr.c
 +// VFX TrueHDR (SDR → HDR10 up-conversion) — the VFX SDK's AI up-conversion
 +// effect, attached **after** `vf_vsr` (approach in
@@ -4476,6 +4476,11 @@ index 0000000000..09cbb2e7b2
 +    double status_cost_ms;
 +    int    status_emit;
 +    double last_peak_nit, last_med_nit;
++    // Whole-row D2H staging for sample_output_nits(): O(eng_w) bytes, grown on
++    // resolution change. Must never be a fixed-size stack array -- the copy
++    // covers the full row (eng_w * 4 bytes).
++    unsigned int *sample_row;
++    int    sample_row_len;
 +};
 +
 +// ── CUDA context binding (trimmed isomorphic copy of vf_vsr.c ensure_cuda) ─
@@ -4902,26 +4907,41 @@ index 0000000000..09cbb2e7b2
 +static void sample_output_nits(struct priv *p, double *med, double *peak)
 +{
 +    const int n = 32;
-+    unsigned int words[32] = {0};
 +    double nits[32];
 +    int y = p->eng_h / 2, w = p->eng_w;
++
++    *med = *peak = 0;
++    if (w <= 0 || !p->out_img.pixels)
++        return;
 +    // One strided copy for the whole row of samples, not 32 separate 4-byte
-+    // D2H transfers: each was a full PCIe round-trip, and this runs every
-+    // frame for a status line that is only printed every 30th.
++    // D2H transfers: each was a full PCIe round-trip. The staging buffer must
++    // hold the full row (w * 4 bytes); a fixed 32-word stack array overflows
++    // for any real width (3840 * 4 = 15360 bytes at 2160p).
++    if (p->sample_row_len < w) {
++        unsigned int *row = talloc_realloc(p, p->sample_row, unsigned int, w);
++        if (!row)
++            return;
++        p->sample_row = row;
++        p->sample_row_len = w;
++    }
++
 +    CUDA_MEMCPY2D cp = {0};
 +    cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
 +    cp.srcDevice     = (CUdeviceptr)p->out_img.pixels + (size_t)y * p->out_img.pitch;
 +    cp.srcPitch      = (size_t)p->out_img.pitch;
 +    cp.dstMemoryType = CU_MEMORYTYPE_HOST;
-+    cp.dstHost       = words;
-+    cp.dstPitch      = 4;
++    cp.dstHost       = p->sample_row;
++    // Pitch must be at least WidthInBytes (CUDA rejects dstPitch=4 with a
++    // 5120-byte row as CUDA_ERROR_INVALID_VALUE, which silently zeroed the
++    // status for every frame).
++    cp.dstPitch      = (size_t)w * 4;
 +    cp.WidthInBytes  = (size_t)w * 4;
 +    cp.Height        = 1;
 +
 +    bool ok = cuMemcpy2D(&cp) == CUDA_SUCCESS;
 +    for (int i = 0; i < n; i++) {
 +        int x = ok ? (int)((double)i / (n - 1) * (w - 1)) : 0;
-+        unsigned int wd = ok ? words[x] : 0;
++        unsigned int wd = ok ? p->sample_row[x] : 0;
 +        double r = (wd & 0x3FF) / 1023.0, g = ((wd >> 10) & 0x3FF) / 1023.0,
 +               b = ((wd >> 20) & 0x3FF) / 1023.0;
 +        // BT.2020 luminance weights, not (R+G+B)/3: an equal-channel average
@@ -4946,6 +4966,10 @@ index 0000000000..09cbb2e7b2
 +    p->status_emit = 0;
 +    double el = p->status_t0 > 0 ? (truehdr_now_ms() - p->status_t0) / 1000.0 : 0;
 +    if (strcmp(mode, "active") == 0 && el > 0) {
++        // Numeric evidence for the status line, sampled only when it is about
++        // to print: a full-row D2H readback every frame for a line shown every
++        // 30th is wasted PCIe traffic (and was where the overflow lived).
++        sample_output_nits(p, &p->last_med_nit, &p->last_peak_nit);
 +        mp_msg(f->log, MSGL_STATUS,
 +               "truehdr-status: mode=active cost=%.1fms fps=%.0f luminance=%d "
 +               "peak=%.0fnit med=%.0fnit\n",
@@ -5232,9 +5256,6 @@ index 0000000000..09cbb2e7b2
 +        cuStreamSynchronize(p->cuda_stream);
 +    }
 +
-+    // numeric evidence for status (read back 32 points, PQ → nit)
-+    sample_output_nits(p, &p->last_med_nit, &p->last_peak_nit);
-+
 +    struct mp_image *out = make_output(f, p, mpi, w, h);
 +    if (!out) {
 +        mp_frame_unref(&frame);
@@ -5457,10 +5478,10 @@ index 0000000000..09cbb2e7b2
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 0000000000..2f2bf72935
+index 0000000000..697602940c
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1477 @@
+@@ -0,0 +1,1608 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -5528,20 +5549,39 @@ index 0000000000..2f2bf72935
 + * The cap is judged **before engine initialisation**, so when limited neither an
 + * engine is created nor CUDA consumed.
 + *
-+ * fps=auto (2026-10-24): pick the largest integer multiplier in 2..4 whose
-+ * output fits under max-fps; passthrough (reason=max-fps) only if none fits.
-+ * This complements the "cap means passthrough" rule above rather than
-+ * replacing it: an explicit fps=2|3|4 still gates or passes exactly as
-+ * before. The motivation is measured on a 165 Hz panel: a 48 fps source at
-+ * x4 is 192 fps, and the panel simply discards the excess (drop climbed to
-+ * 3490 in --term-status-msg), while the same file at x3 is 144 fps and
-+ * frame-perfect. The multiplier is a function of source fps AND panel
-+ * refresh, so hardcoding it in a config is necessarily wrong for some
-+ * inputs; it belongs in the filter. With no cap set, or with src_fps
-+ * unknown (live streams), auto behaves like the old default and uses x4.
++ * fps=auto (2026-10-24; revised 2026-11-27 with auto-cap):
++ * pick the largest integer multiplier in 2..auto-max whose output fits under
++ * min(max-fps, auto-cap); passthrough (reason=max-fps) only if none fits.
++ * This complements the "cap means passthrough" rule above rather than replacing
++ * it: an explicit fps=2..8 still gates or passes exactly as before. The
++ * motivation is measured on a 165 Hz panel: a 48 fps source at x4 is 192 fps,
++ * and the panel simply discards the excess (drop climbed to 3490 in
++ * --term-status-msg), while the same file at x3 is 144 fps and frame-perfect.
++ * The multiplier is a function of source fps AND panel refresh, so hardcoding
++ * it in a config is necessarily wrong for some inputs; it belongs in the
++ * filter. auto-max defaults to 4: that is the ceiling every measurement in
++ * ai.conf/README/docs used. Raise it (2..8) per file/profile or with
++ * `vf-command vfg auto-max N` when the GPU budget allows; explicit fps=5..8 is
++ * independent of it. With no cap set, or with src_fps unknown (live streams),
++ * auto uses auto-max.
++ *
++ * Two limits, not one (2026-11-27). max-fps is the display refresh, but the
++ * refresh is not the budget: measured on a 240 Hz panel, 2160p48 DV at auto
++ * x4 = 192 fps presented 150-153 with 63 frames dropped in 12 s, while x3 =
++ * 144 presented 0 drops (and 2160p60 at x2 = 120 dropped 1 in 14 s). auto-cap
++ * (default 144) is that measured wall; auto takes the largest multiplier that
++ * fits under min(max-fps, auto-cap). A cadence-divisor preference was tried
++ * and removed the same day — the measured drop counts beat the rational
++ * cadence (see the note at the resolution site).
++ *
++ * A rate-driven passthrough keeps the engine loaded (an explicit fps=off
++ * destroys it): a dynamic auto commonly crosses into "no multiplier fits"
++ * on a panel-mode change, and a re-Load is 218 MB of models.
 + *
 + * Filter options:
-+ *   fps:  off | auto | 2 | 3 | 4         (default: off)  integer multiplier K
++ *   fps:  off | auto | 2..8              (default: off)  integer multiplier K
++ *   auto-max: 2..8                       (default: 4)   ceiling for fps=auto
++ *   auto-cap: 0..1000                    (default: 144) output-rate ceiling for fps=auto
 + *   mode: low | medium | high            (default: medium)
 + *   max-fps: 0..1000                     (default: 0 = no cap) output fps cap
 + *
@@ -5603,7 +5643,7 @@ index 0000000000..2f2bf72935
 +// vfg-status cadence (output frames)
 +#define VFG_STATUS_EVERY 30
 +// Multiplier range exposed by the option layer (frozen interface:
-+// fps=off|2|3|4). Deliberately separate from the SDK's
++// fps=off|2..8). Deliberately separate from the SDK's
 +// VFG_MULT_MIN..MAX (2..8): the SDK's FrameMultiplier accepts 2..8 and really
 +// runs there (measured: fps=5 accepted, output 150 fps at k=5). 5..8 are
 +// exposed again because a beam simulator needs the multipliers that make
@@ -5611,14 +5651,26 @@ index 0000000000..2f2bf72935
 +// gives k = 2 exactly).
 +#define VFG_FPS_OPT_MIN 2
 +#define VFG_FPS_OPT_MAX 8
-+// fps=auto keeps the ceiling it always had. It picks the largest multiplier that
-+// fits under max-fps, so raising the *explicit* range to 8 must not silently turn
-+// a 24p source on a 165 Hz panel into 6x/144 fps (the auto answer is 4x/96, as
-+// ai.conf, README and docs/DLSS5-NR-PLAN.md all state).
-+#define VFG_AUTO_MAX 4
++// Default ceiling for fps=auto. The live value is the auto-max option; 4 is
++// the shipped default because every measurement in ai.conf/README/docs used
++// it and it is what 4K DoVi playback sustains. 5..8 stay reachable through
++// explicit fps=5..8 or auto-max=5..8 (the beam simulator's exact refresh
++// divisions need them), so raising the default is not required for x8 use.
++#define VFG_AUTO_MAX_DEFAULT 4
++// Default output-rate ceiling for fps=auto (auto-cap; 0 disables it). Kept
++// apart from max-fps on purpose: max-fps is the *display refresh* (the cadence
++// reference the multiplier is tested against), while this is what the whole
++// chain sustains. Measured 2026-11-27, 2160p48 DV (Charles_DV7.mkv), real VO,
++// mpv-ai, no audio, frame-drop-count over 12 s:
++//   k=3 -> 144.0 presented, drops 0        (165 Hz panel)
++//   k=4 -> 192 demanded, ~150-153 actual, drops 63  (240 Hz panel)
++// and 2160p60 (underverse reMASTER), k=2 -> 120.0 presented, drops 1 (14 s).
++// So ~150 output fps is the wall and 144 is the largest clean rate; auto must
++// not ask for 192 just because a 240 Hz panel could show it.
++#define VFG_AUTO_CAP_DEFAULT 144.0
 +// Internal sentinel for fps=auto (the option parser accepts the string
 +// "auto" and stores 0). Resolve to the largest feasible multiplier from
-+// src_fps and max-fps. 0 can never be an explicit multiplier (2..4).
++// src_fps and max-fps. 0 can never be an explicit multiplier (2..8).
 +#define VFG_FPS_AUTO 0
 +// Output frame rate cap (max-fps): 0 = unlimited (the default, so the old
 +// plain --vf usage is unaffected); supports fractional refresh rates and
@@ -5637,7 +5689,12 @@ index 0000000000..2f2bf72935
 +// ── Options ────────────────────────────────────────────────────────────────
 +
 +struct vf_vfg_opts {
-+    int fps;      // -1 = off, 0 = auto, 2/3/4 = integer multiplier K
++    int fps;      // -1 = off, 0 = auto, 2..8 = integer multiplier K
++    int auto_max; // fps=auto ceiling (2..8, default 4); ignored unless fps=auto
++    // fps=auto output-rate ceiling (default 144, 0 = only max-fps limits it).
++    // max-fps is the display refresh (the cadence reference); this is the rate
++    // the chain actually sustains. See VFG_AUTO_CAP_DEFAULT.
++    double auto_cap;
 +    int mode;     // 0=low, 1=medium, 2=high (default 1=medium, no auto)
 +    double max_fps; // output frame rate cap (0=unlimited); above it means passthrough
 +    // out-fps > 0 selects float-timestep mode (SDK FrameMultiplier=0 + Timestep)
@@ -5649,10 +5706,9 @@ index 0000000000..2f2bf72935
 +
 +#define OPT_BASE_STRUCT struct vf_vfg_opts
 +
-+// fps option type (mirrors vf_rife.c's rife_fps_type): "off"→-1, integers only
-+// accept 2..4 (the SDK's FrameMultiplier supports 2..8, the frozen interface
-+// only exposes 2/3/4), anything out of range gives M_OPT_INVALID with a clear
-+// message.
++// fps option type (mirrors vf_rife.c's rife_fps_type): "off"→-1, integers
++// accept 2..8 (the SDK's FrameMultiplier supports 2..8), anything out of range
++// gives M_OPT_INVALID with a clear message.
 +static int vfg_fps_parse(struct mp_log *log, const m_option_t *opt,
 +                         struct bstr name, struct bstr param, void *dst)
 +{
@@ -5739,6 +5795,10 @@ index 0000000000..2f2bf72935
 +
 +static const struct m_option vf_opts_fields[] = {
 +    {"fps",  OPT_VFG_FPS(fps)},
++    // Ceiling for fps=auto; explicit fps values are not clamped by this.
++    {"auto-max", OPT_INT(auto_max), M_RANGE(VFG_FPS_OPT_MIN, VFG_FPS_OPT_MAX)},
++    // fps=auto output-rate ceiling: 0 = only max-fps limits it.
++    {"auto-cap", OPT_DOUBLE(auto_cap), M_RANGE(0, VFG_MAX_FPS_LIMIT_MAX)},
 +    {"mode", OPT_CHOICE(mode,
 +        {"low", 0}, {"medium", 1}, {"high", 2}),
 +        M_RANGE(0, 2)},
@@ -5750,10 +5810,12 @@ index 0000000000..2f2bf72935
 +};
 +
 +static const struct vf_vfg_opts vf_vfg_opts_def = {
-+    .fps     = -1,
-+    .mode    = VFG_MODE_MEDIUM,
-+    .max_fps = 0,
-+    .out_fps = 0,
++    .fps      = -1,
++    .auto_max = VFG_AUTO_MAX_DEFAULT,
++    .auto_cap = VFG_AUTO_CAP_DEFAULT,
++    .mode     = VFG_MODE_MEDIUM,
++    .max_fps  = 0,
++    .out_fps  = 0,
 +};
 +
 +// ── Filter private state ───────────────────────────────────────────────────
@@ -6334,18 +6396,40 @@ index 0000000000..2f2bf72935
 +            p->grid_n = 1;
 +            p->grid_init = true;
 +        }
++        // A PTS discontinuity (VFR splice, dropped packet, stream join) would
++        // otherwise walk the grid one step at a time across the hole: a 3 s
++        // jump at 82.5 fps is ~247 full VFG inferences back to back. Re-anchor
++        // the timeline at the new frame and emit that frame itself.
++        if (t_cur - t_prev <= 0 || t_cur - t_prev > 0.5) {
++            p->grid_t0 = t_cur;
++            p->grid_n = 1;
++            src = p->vfg.in_pixels[1];
++            src_pitch = (size_t)p->vfg.in_pitch[1];
++            pts = t_cur;
++            is_copy = true;
++        } else {
 +        double next = p->grid_t0 + (double)p->grid_n / p->out_fps_eff;
 +        if (next < t_cur - 1e-9) {
-+            double tval = (t_cur > t_prev) ? (next - t_prev) / (t_cur - t_prev) : 0.5;
-+            // SDK: Timestep is exclusive (0.0, 1.0).
-+            if (tval < 1e-4) tval = 1e-4;
-+            if (tval > 1.0 - 1e-4) tval = 1.0 - 1e-4;
-+            void *vfg_out = NULL;
-+            int vfg_pitch = 0;
-+            if (!vfg_process_timestep(&p->vfg, (float)tval, &vfg_out, &vfg_pitch))
-+                return false;
-+            src = vfg_out;
-+            src_pitch = (size_t)vfg_pitch;
++            double tval = (next - t_prev) / (t_cur - t_prev);
++            // Grid points within 1e-4 of a source frame are that frame: copy
++            // the staged source instead of running the network on a ~0 phase.
++            // Exact matches (out_fps an integer multiple of src_fps) land here
++            // as tval == 0 -- the grid anchors on t_prev, so the source
++            // frame's own grid point is the first point of the *next* pair.
++            if (tval <= 1e-4) {
++                src = p->vfg.in_pixels[0];
++                src_pitch = (size_t)p->vfg.in_pitch[0];
++            } else if (tval >= 1.0 - 1e-4) {
++                src = p->vfg.in_pixels[1];
++                src_pitch = (size_t)p->vfg.in_pitch[1];
++            } else {
++                void *vfg_out = NULL;
++                int vfg_pitch = 0;
++                if (!vfg_process_timestep(&p->vfg, (float)tval, &vfg_out, &vfg_pitch))
++                    return false;
++                src = vfg_out;
++                src_pitch = (size_t)vfg_pitch;
++            }
 +            pts = next;
 +            p->grid_n++;
 +        } else {
@@ -6358,6 +6442,7 @@ index 0000000000..2f2bf72935
 +            mp_filter_internal_mark_progress(f);
 +            return true;
 +        }
++        } // !pts discontinuity
 +    } else if (p->emit_i < k) {
 +        // ── integer multiplier mode (original path) ───────────────────────
 +        void *vfg_out = NULL;
@@ -6485,25 +6570,46 @@ index 0000000000..2f2bf72935
 +    // rate" in the file header. A live stream's nominal_fps=0 is no longer
 +    // downgraded to passthrough.
 +    // Resolve the multiplier before gating. fps=auto (VFG_FPS_AUTO) is not a
-+    // real K: it asks for the largest K in 2..4 whose output fits under
-+    // max-fps. An explicit 2..4 passes through unchanged and still gates
++    // real K: it asks for the largest K in 2..auto-max whose output fits under
++    // max-fps. An explicit 2..8 passes through unchanged and still gates
 +    // exactly as it did before this option existed.
 +    int k = p->opts->fps;
 +    // Timestep mode owns the rate: no integer multiplier, no max-fps gate.
 +    if (p->opts->out_fps > 0) {
 +        k = 0;
 +    } else if (k == VFG_FPS_AUTO) {
-+        if (p->opts->max_fps > 0 && p->src_fps > 0) {
++        int ceil = p->opts->auto_max;
++        if (ceil < VFG_FPS_OPT_MIN) ceil = VFG_FPS_OPT_MIN;
++        if (ceil > VFG_FPS_OPT_MAX) ceil = VFG_FPS_OPT_MAX;
++        // Two separate limits. max-fps is the display refresh and stays the
++        // cadence reference for the divisor test; auto-cap is what the chain
++        // actually sustains (see VFG_AUTO_CAP_DEFAULT for the 2026-11-27
++        // measurements: 192 fps at k=4 on a 240 Hz panel dropped 63 frames in
++        // 12 s, 144 at k=3 dropped none).
++        double lim = p->opts->max_fps;
++        if (p->opts->auto_cap > 0 && (lim <= 0 || p->opts->auto_cap < lim))
++            lim = p->opts->auto_cap;
++        if (lim > 0 && p->src_fps > 0) {
++            // Pass 1: the largest multiplier under the limit (the baseline).
++            // Relative epsilon: nominal_fps is container-quantised (this file
++            // reports 48.000001, so 3x = 144.000003), and an absolute 1e-6
++            // rejected the k=3 that lands exactly on a 144 auto-cap.
 +            k = -1;
-+            for (int t = VFG_AUTO_MAX; t >= VFG_FPS_OPT_MIN; t--) {
-+                if (t * p->src_fps <= p->opts->max_fps) {
++            for (int t = ceil; t >= VFG_FPS_OPT_MIN; t--) {
++                if (t * p->src_fps <= lim * (1.0 + 1e-6)) {
 +                    k = t;
 +                    break;
 +                }
 +            }
++            // A cadence-exact preference (output dividing the refresh) was
++            // tried here and removed the same day: measured 2026-11-27 on the
++            // 23.976 FEL clip at 240 Hz, the "exact" x5 = 119.88 (2.002:1)
++            // dropped 6 frames in 10 s while x4 = 95.90 (2.5:1) dropped 0-1.
++            // The rational cadence is not the dominant term — the rate that
++            // fits under the cap is. Keep the selection purely rate-based.
 +        } else {
-+            // No cap, or the source fps is unknown: use the old default.
-+            k = VFG_AUTO_MAX;
++            // No cap, or the source fps is unknown: use the auto ceiling.
++            k = ceil;
 +        }
 +    }
 +
@@ -6514,6 +6620,14 @@ index 0000000000..2f2bf72935
 +    // must not be retried (a Load is 218 MB of VFX models, per frame), and a
 +    // frame without pts cannot anchor the timestep grid.
 +    if (p->opts->fps == -1 && p->opts->out_fps <= 0)  reason = "off";
++    // k < 0 is the "auto resolved nothing" sentinel: 2*src_fps already exceeds
++    // max-fps. It must pass through, not reach the engine: vfg_init() rejects
++    // multiplier -1 (range check), and the failure latches engine_failed for
++    // the rest of the file. Measured on 2160p48 DV: the first frame arrives
++    // before vfg-sync.lua raises the cap from its 60 Hz fallback to the real
++    // refresh, so 2x48 > 60 -> k=-1 -> engine init failed -> passthrough for
++    // the whole playback even though the cap allows k=3 one second later.
++    else if (k < 0)                                  reason = "max-fps";
 +    else if (k > 0 && k < VFG_FPS_OPT_MIN)           reason = "max-fps";
 +    else if (p->opts->fps > VFG_FPS_OPT_MAX)         reason = "k-range";
 +    // Output cap (user-set, not an automatic downgrade; see the file header).
@@ -6530,7 +6644,12 @@ index 0000000000..2f2bf72935
 +    if (reason) {
 +        p->passthrough = true;
 +        snprintf(p->pt_reason, sizeof(p->pt_reason), "%s", reason);
-+        if (p->vfg_configured) {
++        // Keep a loaded engine across rate-driven passthrough. A re-Load is
++        // 218 MB of VFX models plus fresh buffers, and with dynamic auto this
++        // path runs every time the multiplier no longer fits (a 240->60 Hz
++        // panel switch makes k unrepresentable, then the switch back needs the
++        // engine again). Only an explicit fps=off tears it down.
++        if (p->vfg_configured && strcmp(reason, "off") == 0) {
 +            cuCtxPushCurrent(p->cuda_ref->ctx);
 +            vfg_destroy(&p->vfg);
 +            cuCtxPopCurrent(NULL);
@@ -6688,8 +6807,8 @@ index 0000000000..2f2bf72935
 +    }
 +}
 +
-+// ── vfg_command (vf-command vfg fps X / mode Y; modelled on vf_rife.c
-+//    rife_command) ───────────────────────────────────────────────────────
++// ── vfg_command (vf-command vfg fps X / auto-max N / auto-cap R / mode Y /
++//    out-fps R / max-fps C; modelled on vf_rife.c rife_command) ──────────
 +
 +static bool parse_fps_arg(const char *arg, int *out)
 +{
@@ -6742,9 +6861,42 @@ index 0000000000..2f2bf72935
 +        if (p->opts->fps != v) {
 +            MP_INFO(f, "vfg: fps %d -> %d (vf-command)\n", p->opts->fps, v);
 +            p->opts->fps = v;
++            if (p->opts->out_fps > 0) {
++                // Timestep mode owns the rate (k is forced to 0); without
++                // this the user sets fps=4 and cannot see why nothing changed.
++                MP_WARN(f, "vfg: out-fps=%.17g is active (timestep mode); "
++                           "fps is ignored until out-fps is 0\n",
++                        p->opts->out_fps);
++            }
 +            // continuity broken: reset the scheduling state (engine kept), the
 +            // next frame restarts on the new multiplier
 +            f_reset(f);
++        }
++        return true;
++    }
++    if (strcmp(cmd->cmd, "auto-max") == 0) {
++        char *end = NULL;
++        long v = strtol(cmd->arg, &end, 10);
++        if (end == cmd->arg || *end ||
++            v < VFG_FPS_OPT_MIN || v > VFG_FPS_OPT_MAX)
++            return false;
++        if (p->opts->auto_max != v) {
++            MP_INFO(f, "vfg: auto-max %d -> %ld (vf-command)\n",
++                    p->opts->auto_max, v);
++            p->opts->auto_max = (int)v;
++            // Re-resolved per frame; no scheduling reset needed.
++        }
++        return true;
++    }
++    if (strcmp(cmd->cmd, "auto-cap") == 0) {
++        double v;
++        if (!parse_max_fps_arg(cmd->arg, &v))
++            return false;
++        if (p->opts->auto_cap != v) {
++            MP_INFO(f, "vfg: auto-cap %.17g -> %.17g (vf-command)\n",
++                    p->opts->auto_cap, v);
++            p->opts->auto_cap = v;
++            // Re-resolved per frame; no scheduling reset needed.
 +        }
 +        return true;
 +    }
