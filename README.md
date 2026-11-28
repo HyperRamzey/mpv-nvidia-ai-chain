@@ -164,18 +164,19 @@ changing `passes=0` to `passes=2` in the three `vf=` lines, or for one run:
 vf-command dlssnr passes 2
 ```
 
-Frame generation follows the panel and the measured budget: `scripts/vfg-sync.lua`
-watches `display-fps` and issues `vf-command vfg max-fps <refresh>` (the cadence
-reference), while the filter's own `auto-cap` (default 144) is what the chain
-sustains. `fps=auto` picks the largest integer multiplier (2..auto-max, default
-4) that fits under min(max-fps, auto-cap). On the 165 Hz mode that is 96 fps for
-24 fps sources, 120 for 60 fps, 144 for 48 fps; on a 240 Hz panel it stays at
-144 for 48 fps instead of asking for 192, which measured 63 drops in 12 s.
-Measured with NR off, 10 s each, drop = `frame-drop-count`: 1080p60+VSR → 120
-fps / 1 drop, 2160p60 → 120 fps / 0 drops, 1080p48 → 144 fps / 4 drops,
-2160p24 → 96 fps / 0 drops; real 4K DV, mpv-ai, 12 s: 2160p48 k=3 → 144 fps /
-0 drops, 2160p60 k=2 → 120 fps / 0 drops. A rate-driven passthrough keeps the
-engine loaded; only `fps=off` frees it, so a panel-mode change resumes without
+Frame generation follows the panel: `scripts/vfg-sync.lua` watches
+`display-fps` and issues `vf-command vfg max-fps <refresh>`, and `fps=auto`
+picks the largest integer multiplier (2..auto-max, default 4) that fits under
+it. On the 165 Hz mode that is 96 fps for 24 fps sources, 120 for 60 fps,
+144 for 48 fps; on a 240 Hz panel it asks for 192 at 48 fps (x4), which measured
+150–153 delivered and 63 drops in 12 s. `auto-cap` holds auto below the refresh
+when the chain cannot sustain it: `vf-command vfg auto-cap 144` gave 0 drops on
+the same file. Measured with NR off, 10 s each, drop = `frame-drop-count`:
+1080p60+VSR → 120 fps / 1 drop, 2160p60 → 120 fps / 0 drops, 1080p48 → 144
+fps / 4 drops, 2160p24 → 96 fps / 0 drops; real 4K DV, mpv-ai, 12 s:
+2160p48 k=3 → 144 fps / 0 drops, 2160p60 k=2 → 120 fps / 0 drops. A
+rate-driven passthrough keeps the engine loaded; only `fps=off` frees it, so a
+panel-mode change resumes without
 a re-Load. Fractional refresh rates are retained. If mpv cannot report the
 current display's rate, the cap falls back to 60 fps rather than guessing the
 monitor.
@@ -196,13 +197,14 @@ Three different limits, and raising the wrong one looks like "it is still x4":
 | --- | --- | --- |
 | `vf-command vfg auto-max N` | the multiplier K that `fps=auto` may pick (2..8) | 4 |
 | `vf-command vfg max-fps R` | the output *rate* (normally the display refresh) | 0 (script sets refresh) |
-| `vf-command vfg auto-cap R` | the output rate auto may ask for — the measured chain wall | 144 |
+| `vf-command vfg auto-cap R` | an optional lower output ceiling for auto (0 / `max-fps` = follow max-fps) | 0 |
 
-`max-fps 240` on a 240 Hz panel does **not** raise K: auto already fit under the
-refresh, and `auto-max` stops it at 4. Raise `auto-max` for more generated
-frames (24 fps on 240 Hz: x6 = 143.9 with `auto-max 8`), and `auto-cap 0` or an
-explicit `fps=7/8` only if you accept what 192 fps measured (63 drops in 12 s).
-Explicit `fps=` ignores `auto-cap` entirely; `max-fps` still gates it.
+`max-fps 240` on a 240 Hz panel does **not** raise K by itself: `auto-max`
+stops it at 4. Raise `auto-max` for more generated frames (24 fps on 240 Hz:
+x8 = 191.8 with `auto-max 8`), and remember what that measured — 192 fps
+delivered 150–153 with 63 drops in 12 s; `vf-command vfg auto-cap 144` gives
+144 fps and 0 drops on 48 fps content. Explicit `fps=` ignores `auto-cap`
+entirely; `max-fps` still gates it.
 
 ### Console Commands (`~` interactive console)
 
@@ -275,8 +277,9 @@ The reconstructed output is HDR PQ RGB, not Dolby Vision passthrough. EL
 composition and scene metadata need validation on real hardware and samples.
 
 **Frame generation:** `vfg:fps=auto`; `vfg-sync.lua` supplies the current
-display refresh as the cap, and the filter caps auto at `auto-cap` (default 144
-— the measured 4K DoVi ceiling). VFG only does integer
+display refresh as the cap, and `auto-cap` (default 0 = follow max-fps) can
+hold auto below it (144 was the largest rate measured clean at 4K DoVi). VFG
+only does integer
 multipliers, and the right K is a function of source fps *and* panel refresh, so
 the filter picks the largest K in 2..auto-max that fits under both and passes
 through only when none does. Processing performance can be lower than display

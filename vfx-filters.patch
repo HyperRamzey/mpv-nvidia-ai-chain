@@ -5478,10 +5478,10 @@ index 0000000000..09cbb2e7b2
 +};
 diff --git a/video/filter/vf_vfg.c b/video/filter/vf_vfg.c
 new file mode 100644
-index 0000000000..697602940c
+index 0000000000..eeebc864f1
 --- /dev/null
 +++ b/video/filter/vf_vfg.c
-@@ -0,0 +1,1608 @@
+@@ -0,0 +1,1615 @@
 +/*
 + * vf_vfg.c -- AI frame interpolation via NVIDIA VFX SDK VideoFrameGeneration
 + *
@@ -5565,14 +5565,16 @@ index 0000000000..697602940c
 + * independent of it. With no cap set, or with src_fps unknown (live streams),
 + * auto uses auto-max.
 + *
-+ * Two limits, not one (2026-11-27). max-fps is the display refresh, but the
-+ * refresh is not the budget: measured on a 240 Hz panel, 2160p48 DV at auto
-+ * x4 = 192 fps presented 150-153 with 63 frames dropped in 12 s, while x3 =
-+ * 144 presented 0 drops (and 2160p60 at x2 = 120 dropped 1 in 14 s). auto-cap
-+ * (default 144) is that measured wall; auto takes the largest multiplier that
-+ * fits under min(max-fps, auto-cap). A cadence-divisor preference was tried
-+ * and removed the same day — the measured drop counts beat the rational
-+ * cadence (see the note at the resolution site).
++ * Two limits (2026-11-27). By default max-fps alone bounds auto, and the
++ * multiplier is the largest one that fits under it. auto-cap is an optional
++ * extra ceiling below the refresh, because the refresh is not the budget:
++ * measured on a 240 Hz panel, 2160p48 DV at auto x4 = 192 fps presented
++ * 150-153 with 63 frames dropped in 12 s, while x3 = 144 presented 0 drops
++ * (and 2160p60 at x2 = 120 dropped 1 in 14 s). `auto-cap 144` opts into that
++ * measured wall; `auto-cap 0` (or the literal `max-fps`) ties it back to
++ * max-fps. A cadence-divisor preference was tried and removed the same day —
++ * the measured drop counts beat the rational cadence (see the note at the
++ * resolution site).
 + *
 + * A rate-driven passthrough keeps the engine loaded (an explicit fps=off
 + * destroys it): a dynamic auto commonly crosses into "no multiplier fits"
@@ -5581,7 +5583,7 @@ index 0000000000..697602940c
 + * Filter options:
 + *   fps:  off | auto | 2..8              (default: off)  integer multiplier K
 + *   auto-max: 2..8                       (default: 4)   ceiling for fps=auto
-+ *   auto-cap: 0..1000                    (default: 144) output-rate ceiling for fps=auto
++ *   auto-cap: 0..1000                    (default: 0 = follow max-fps) ceiling for fps=auto
 + *   mode: low | medium | high            (default: medium)
 + *   max-fps: 0..1000                     (default: 0 = no cap) output fps cap
 + *
@@ -5657,17 +5659,17 @@ index 0000000000..697602940c
 +// explicit fps=5..8 or auto-max=5..8 (the beam simulator's exact refresh
 +// divisions need them), so raising the default is not required for x8 use.
 +#define VFG_AUTO_MAX_DEFAULT 4
-+// Default output-rate ceiling for fps=auto (auto-cap; 0 disables it). Kept
-+// apart from max-fps on purpose: max-fps is the *display refresh* (the cadence
-+// reference the multiplier is tested against), while this is what the whole
-+// chain sustains. Measured 2026-11-27, 2160p48 DV (Charles_DV7.mkv), real VO,
-+// mpv-ai, no audio, frame-drop-count over 12 s:
++// Default output-rate ceiling for fps=auto: 0 = follow max-fps (the display
++// refresh), which is what `vf-command vfg max-fps` and vfg-sync.lua drive.
++// Kept as a separate option so auto can be held below the refresh when the
++// chain cannot sustain the refresh; measured 2026-11-27, 2160p48 DV
++// (Charles_DV7.mkv), real VO, mpv-ai, no audio, frame-drop-count over 12 s:
 +//   k=3 -> 144.0 presented, drops 0        (165 Hz panel)
 +//   k=4 -> 192 demanded, ~150-153 actual, drops 63  (240 Hz panel)
 +// and 2160p60 (underverse reMASTER), k=2 -> 120.0 presented, drops 1 (14 s).
-+// So ~150 output fps is the wall and 144 is the largest clean rate; auto must
-+// not ask for 192 just because a 240 Hz panel could show it.
-+#define VFG_AUTO_CAP_DEFAULT 144.0
++// ~150 output fps is the wall; `vf-command vfg auto-cap 144` opts into the
++// largest clean rate, `auto-cap max-fps` (or 0) ties it back to max-fps.
++#define VFG_AUTO_CAP_DEFAULT 0.0
 +// Internal sentinel for fps=auto (the option parser accepts the string
 +// "auto" and stores 0). Resolve to the largest feasible multiplier from
 +// src_fps and max-fps. 0 can never be an explicit multiplier (2..8).
@@ -5691,9 +5693,9 @@ index 0000000000..697602940c
 +struct vf_vfg_opts {
 +    int fps;      // -1 = off, 0 = auto, 2..8 = integer multiplier K
 +    int auto_max; // fps=auto ceiling (2..8, default 4); ignored unless fps=auto
-+    // fps=auto output-rate ceiling (default 144, 0 = only max-fps limits it).
-+    // max-fps is the display refresh (the cadence reference); this is the rate
-+    // the chain actually sustains. See VFG_AUTO_CAP_DEFAULT.
++    // fps=auto output-rate ceiling (default 0 = follow max-fps). Set it to hold
++    // auto below the refresh when the chain cannot sustain the refresh; see
++    // VFG_AUTO_CAP_DEFAULT for the measured rates.
 +    double auto_cap;
 +    int mode;     // 0=low, 1=medium, 2=high (default 1=medium, no auto)
 +    double max_fps; // output frame rate cap (0=unlimited); above it means passthrough
@@ -5797,7 +5799,7 @@ index 0000000000..697602940c
 +    {"fps",  OPT_VFG_FPS(fps)},
 +    // Ceiling for fps=auto; explicit fps values are not clamped by this.
 +    {"auto-max", OPT_INT(auto_max), M_RANGE(VFG_FPS_OPT_MIN, VFG_FPS_OPT_MAX)},
-+    // fps=auto output-rate ceiling: 0 = only max-fps limits it.
++    // fps=auto output-rate ceiling: 0 = follow max-fps.
 +    {"auto-cap", OPT_DOUBLE(auto_cap), M_RANGE(0, VFG_MAX_FPS_LIMIT_MAX)},
 +    {"mode", OPT_CHOICE(mode,
 +        {"low", 0}, {"medium", 1}, {"high", 2}),
@@ -6581,11 +6583,11 @@ index 0000000000..697602940c
 +        int ceil = p->opts->auto_max;
 +        if (ceil < VFG_FPS_OPT_MIN) ceil = VFG_FPS_OPT_MIN;
 +        if (ceil > VFG_FPS_OPT_MAX) ceil = VFG_FPS_OPT_MAX;
-+        // Two separate limits. max-fps is the display refresh and stays the
-+        // cadence reference for the divisor test; auto-cap is what the chain
-+        // actually sustains (see VFG_AUTO_CAP_DEFAULT for the 2026-11-27
-+        // measurements: 192 fps at k=4 on a 240 Hz panel dropped 63 frames in
-+        // 12 s, 144 at k=3 dropped none).
++        // max-fps (the display refresh) bounds auto by default; auto-cap is an
++        // optional lower ceiling when the chain cannot sustain the refresh
++        // (see VFG_AUTO_CAP_DEFAULT for the 2026-11-27 measurements: 192 fps
++        // at k=4 on a 240 Hz panel dropped 63 frames in 12 s, 144 at k=3
++        // dropped none).
 +        double lim = p->opts->max_fps;
 +        if (p->opts->auto_cap > 0 && (lim <= 0 || p->opts->auto_cap < lim))
 +            lim = p->opts->auto_cap;
@@ -6890,8 +6892,13 @@ index 0000000000..697602940c
 +    }
 +    if (strcmp(cmd->cmd, "auto-cap") == 0) {
 +        double v;
-+        if (!parse_max_fps_arg(cmd->arg, &v))
++        // `auto-cap max-fps` (or maxfps) is the explicit form of 0: let
++        // max-fps, i.e. the display refresh, be the only ceiling.
++        if (!strcmp(cmd->arg, "max-fps") || !strcmp(cmd->arg, "maxfps")) {
++            v = 0;
++        } else if (!parse_max_fps_arg(cmd->arg, &v)) {
 +            return false;
++        }
 +        if (p->opts->auto_cap != v) {
 +            MP_INFO(f, "vfg: auto-cap %.17g -> %.17g (vf-command)\n",
 +                    p->opts->auto_cap, v);
