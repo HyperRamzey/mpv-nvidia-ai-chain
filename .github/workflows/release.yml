@@ -363,6 +363,7 @@ jobs:
             python3-jinja2 python3-markupsafe \
             libvulkan-dev libshaderc-dev liblcms2-dev libunwind-dev \
             libdav1d-dev libvpx-dev libssl-dev libxml2-dev \
+            libffi-dev libexpat1-dev \
             libluajit-5.1-dev libdvbv5-dev libwayland-dev wayland-protocols \
             libxkbcommon-dev libva-dev \
             libass-dev libdrm-dev libxinerama-dev libxss-dev libxv-dev \

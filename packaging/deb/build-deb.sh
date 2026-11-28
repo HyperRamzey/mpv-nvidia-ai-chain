@@ -7,6 +7,9 @@
 # Ubuntu 24.04 and stages the result as a .deb:
 #
 #   * libdovi 3.4.0 is built from source with cargo-c (noble has no libdovi).
+#   * wayland 1.23.1 is built for the compile step only: the pinned mpv
+#     requires wayland-client/scanner >= 1.23 and noble ships 1.22, but the
+#     APIs mpv calls exist in 1.22, so the package links the distro library.
 #   * libplacebo and FFmpeg are static and linked into mpv, exactly like the
 #     Arch package; check() asserts no dynamic libav*/libplacebo escapes.
 #   * The NVIDIA driver stub (libcuda.so) is placed on the link path. The
@@ -212,6 +215,36 @@ fi
 [ -f "$prefix/lib/pkgconfig/dovi.pc" ] || error 'libdovi was not installed'
 grep -q '^Version: 3\.4' "$prefix/lib/pkgconfig/dovi.pc" 2>/dev/null \
     || warning "dovi.pc does not report 3.4 (see $prefix/lib/pkgconfig/dovi.pc)"
+
+# ---------------------------------------------------------------------------
+# wayland 1.23.1 (noble ships 1.22; pinned mpv requires client/scanner >= 1.23)
+# ---------------------------------------------------------------------------
+# Only the build needs 1.23: mpv's meson gates wayland-client, wayland-cursor
+# and wayland-scanner on 1.23, while the API it actually uses exists in the
+# system 1.22 runtime, so the .deb links libwayland-client.so.0 and lets the
+# distro provide it.
+wayland_ver=1.23.1
+wayland_sha=864fb2a8399e2d0ec39d56e9d9b753c093775beadc6022ce81f441929a81e5ed
+wayland_dir=$srcdir/wayland-$wayland_ver
+if [ ! -f "$prefix/lib/pkgconfig/wayland-client.pc" ]; then
+    if [ ! -d "$wayland_dir" ]; then
+        msg "Fetching wayland $wayland_ver"
+        curl -fL --retry 3 --retry-delay 2 \
+            -o "$work/wayland-$wayland_ver.tar.xz" \
+            "https://gitlab.freedesktop.org/wayland/wayland/-/releases/$wayland_ver/downloads/wayland-$wayland_ver.tar.xz"
+        echo "$wayland_sha  $work/wayland-$wayland_ver.tar.xz" | sha256sum -c -
+        tar -xf "$work/wayland-$wayland_ver.tar.xz" -C "$srcdir"
+    fi
+    msg "Building wayland $wayland_ver"
+    meson setup "$wayland_dir/build" "$wayland_dir" \
+        --prefix="$prefix" --libdir=lib --buildtype=plain \
+        -Ddocumentation=false -Dtests=false -Ddtd_validation=false
+    meson compile -C "$wayland_dir/build"
+    meson install -C "$wayland_dir/build"
+fi
+[ -x "$prefix/bin/wayland-scanner" ] || error 'wayland-scanner was not installed'
+# Must precede /usr/bin so mpv's find_program(version: '>=1.23.0') sees it.
+export PATH="$prefix/bin:$PATH"
 
 # ---------------------------------------------------------------------------
 # Reuse the PKGBUILD build

@@ -28,7 +28,7 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.42.0_200_g7f505de186
-pkgrel=8
+pkgrel=9
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
@@ -282,6 +282,34 @@ build() {
   # slipped in.
   export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
   export PATH="$tools/bin:$PATH"
+
+  # mpv requires vulkan >= 1.4.309, which Ubuntu 24.04's libvulkan-dev does
+  # not provide (1.3.275). The pinned Vulkan-Headers submodule has exactly the
+  # headers libplacebo was written against, so expose it as vulkan.pc. Only
+  # headers and -lvulkan are advertised; the loader remains the system one.
+  local vk_inc="$srcdir/libplacebo/3rdparty/Vulkan-Headers/include"
+  if [[ -f "$vk_inc/vulkan/vulkan_core.h" ]]; then
+    local vk_header vk_api vk_version
+    vk_header=$(sed -n 's/^#define VK_HEADER_VERSION \([0-9]*\)$/\1/p' \
+                  "$vk_inc/vulkan/vulkan_core.h")
+    vk_api=$(sed -n 's/^#define VK_HEADER_VERSION_COMPLETE VK_MAKE_API_VERSION(0, \([0-9]*\), \([0-9]*\), VK_HEADER_VERSION)$/\1.\2/p' \
+               "$vk_inc/vulkan/vulkan_core.h")
+    [[ -n "$vk_header" ]] || { error "VK_HEADER_VERSION missing from $vk_inc"; return 1; }
+    vk_version="${vk_api:-1.4}.$vk_header"
+    mkdir -p "$prefix/lib/pkgconfig"
+    cat > "$prefix/lib/pkgconfig/vulkan.pc" <<EOF
+prefix=$prefix
+Name: Vulkan
+Description: Vulkan loader with the headers pinned by libplacebo
+Version: $vk_version
+Libs: -lvulkan
+Cflags: -I$vk_inc
+EOF
+    msg "vulkan.pc: $vk_version (headers from the pinned submodule)"
+  else
+    error "Vulkan-Headers submodule missing at $vk_inc"
+    return 1
+  fi
 
   # nasm is required for FFmpeg's x86 SIMD; not installed on the target box.
   cd "$srcdir/nasm-${_nasmver}"
