@@ -632,4 +632,22 @@ do
     equal(peak, 630, "detect_output: 10000 sentinel ignored, target-peak used")
 end
 
+do
+    -- Packaged install: mpv resolves ~~/shaders/crt-beam-sim.glsl relative to
+    -- the config dir, which may be a system path. The script must append the
+    -- resolved file, and remove that same entry rather than the constant.
+    local player = new_player(sdr(240, 24))
+    local shader = root .. "/shaders/crt-beam-sim.glsl"
+    mp.command_native = function(args)
+        if args[1] == "expand-path" then return shader end
+        error("unexpected command_native: " .. tostring(args[1]))
+    end
+    player.api.enable()
+    equal(player.count("change-list", "glsl-shaders", "append", shader), 1,
+        "packaged: the resolved shader path is appended")
+    player.api.disable()
+    equal(player.count("change-list", "glsl-shaders", "remove", shader), 1,
+        "packaged: disable removes the entry it appended")
+end
+
 print("beam-sim tests passed")

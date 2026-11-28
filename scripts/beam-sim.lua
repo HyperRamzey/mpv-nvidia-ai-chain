@@ -339,9 +339,42 @@ local function render_fps()
     return fps
 end
 
+local function file_exists(path)
+    local f = io.open(path, "r")
+    if f then f:close(); return true end
+    return false
+end
+
+-- The entry currently in glsl-shaders, whatever path it was loaded from. A
+-- packaged install puts the shader under the system config dir and the script
+-- under /etc/mpv/scripts, while a hand install uses ~~/shaders; removing the
+-- entry we actually appended (instead of the constant) keeps both working.
+local function present_shader_path()
+    local list = mp.get_property("glsl-shaders", ""):gsub("%s+$", "")
+    for item in list:gmatch("[^,]+") do
+        if item:find(SHADER_NAME, 1, true) then return item end
+    end
+    return nil
+end
+
 local function shader_present()
-    local list = mp.get_property("glsl-shaders", "") or ""
-    return list:find(SHADER_NAME, 1, true) ~= nil
+    return present_shader_path() ~= nil
+end
+
+-- Resolve the shader once per enable: the user config path first, then the
+-- system one, then the constant so a missing file still produces mpv's own
+-- error instead of a silent no-op.
+local active_shader_path = nil
+local function resolve_shader_path()
+    local expanded = SHADER_PATH
+    if type(mp.command_native) == "function" then
+        local ok, value = pcall(mp.command_native, { "expand-path", SHADER_PATH })
+        if ok and type(value) == "string" and value ~= "" then expanded = value end
+    end
+    if file_exists(expanded) then return expanded end
+    local system = "/etc/mpv/shaders/crt-beam-sim.glsl"
+    if file_exists(system) then return system end
+    return SHADER_PATH
 end
 
 local function apply_opts()
@@ -497,8 +530,9 @@ local function enable()
     if vfg_entry() and saved.vfg_out_fps == nil then
         saved.vfg_out_fps = configured_vfg_out_fps()
     end
+    active_shader_path = present_shader_path() or resolve_shader_path()
     if not shader_present() then
-        mp.commandv("change-list", "glsl-shaders", "append", SHADER_PATH)
+        mp.commandv("change-list", "glsl-shaders", "append", active_shader_path)
     end
     ensure_subframes_rendered()
 
@@ -526,9 +560,11 @@ end
 local function disable()
     if not state.on then return end
     state.on = false
-    if shader_present() then
-        mp.commandv("change-list", "glsl-shaders", "remove", SHADER_PATH)
+    local loaded = present_shader_path() or active_shader_path
+    if loaded then
+        mp.commandv("change-list", "glsl-shaders", "remove", loaded)
     end
+    active_shader_path = nil
     restore_property("glsl-shader-opts")
     restore_property("interpolation")
     restore_property("video-sync")
@@ -646,8 +682,9 @@ end
 -- filter chain and can drop our shader from glsl-shaders, so re-append there.
 local function on_video_change()
     if not state.on then return end
+    active_shader_path = active_shader_path or present_shader_path() or resolve_shader_path()
     if not shader_present() then
-        mp.commandv("change-list", "glsl-shaders", "append", SHADER_PATH)
+        mp.commandv("change-list", "glsl-shaders", "append", active_shader_path)
     end
     ensure_subframes_rendered()
     recompute()
