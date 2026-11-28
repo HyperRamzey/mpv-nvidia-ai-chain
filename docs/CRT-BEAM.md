@@ -63,11 +63,19 @@ So this port splits the two, and the split is why brightness survives:
   with a 630-nit tone-map target and ~1000-nit small-window peak, `1.5` is the
   useful setting. SDR is pinned to `1.0`: 8-bit output cannot represent anything
   above its own white.
-- `gain_vs_blur` (default `1.0`) — caps how much of that headroom is used. It no
-  longer dims anything; lowering it lengthens the emission window (less peak
-  flash load, which is what OLED ABL cares about) at the same average brightness.
+- `gain_vs_blur` (default `1.0`) — scales the intensity the beam is allowed to
+  use. Above `1.0` it caps how much of `beam_headroom` is spent, so with
+  `beam_headroom > 1` it lowers the peak flash load at unchanged average
+  brightness. Below `1.0` it takes the intensity *under* the tone-mapped peak:
+  pixels brighter than it emit at that level for the full sweep, so they dim and
+  their persistence grows to the sweep length. The value is deliberately not
+  clamped back up to `1.0`; that clamp made the knob a no-op whenever
+  `beam_headroom` was at its default.
 
-Persistence at headroom `H`: `MPRT = p * subframes / H` refreshes
+Persistence at headroom `H`: `MPRT = min(subframes, p * subframes / H)`
+refreshes. The time average equals the source while `p <= H`; `H >= 1` keeps
+that for every pixel, and `H < 1` (from `gain_vs_blur`) is the one deliberate
+dimming mode.
 
 ## One deliberate deviation
 
@@ -114,32 +122,69 @@ an aged ghost behind it.
 - **Fullscreen**, ideally direct scanout. Anything that makes the compositor skip
   or duplicate a present makes the beam stall or jump.
 
-- **Display refresh must be an integer multiple of what VFG emits**, with VRR
-  off: `fps_out = display / k`, `k >= 2` integer, then `interpolation=yes` +
-  `tscale=oversample` holds each generated frame for exactly `k` refreshes and
-  the beam advances once per refresh. `k = 1` (sweep = refresh = 165 Hz) is a
-  strobe, not a beam; `MIN_SWEEP_HZ = 48`.
+- **Display refresh must line up with what VFG emits**, with VRR off:
+  `fps_out = display / k`, and the script retargets VFG there. At or below 0.8
+  of the refresh `k` is an integer >= 2; above it the exact fractional ratio in
+  `(1, 2)` is kept. That second case is the generator running fast: VFG x6 on
+  23.976p emits 143.856 fps, so on a 165 Hz panel `k = 165/143.856 = 1.147` and
+  every generated frame gets one sweep. `interpolation=yes` +
+  `tscale=oversample` holds each frame `floor(k)` or `ceil(k)` refreshes either
+  way, and the beam advances once per refresh. `k = 1` exactly is a fixed raster
+  position (no beam), so it is never used; `MIN_SWEEP_HZ = 48`.
 
 Subframes come from a **target sweep rate**, not from the container fps: the
 renderer is fed `display/k` and nothing ties it to 24/30/60. Default target is
-`TARGET_SWEEP_HZ = 60`, so `k = round(display / 60)`, clamped to `2..32` and
-additionally capped by `floor(display / MIN_SWEEP_HZ)`:
+`TARGET_SWEEP_HZ = 72`; at or below 0.8 of the refresh the ratio is rounded to
+an integer clamped to `2..32` and capped by `floor(display / MIN_SWEEP_HZ)`:
 
 | display | 120 Hz | 144 Hz | 165 Hz | 240 Hz | 360 Hz |
 | --- | --- | --- | --- | --- | --- |
-| k | 2 | 3 | 3 | 4 | 6 |
-| sweep | 60 Hz | 48 Hz | 55 Hz | 60 Hz | 60 Hz |
-| VFG `out-fps` | 60 | 48 | 55 | 60 | 60 |
+| k | 2 | 2 | 2 | 3 | 5 |
+| sweep | 60 Hz | 72 Hz | 82.5 Hz | 80 Hz | 72 Hz |
+| VFG `out-fps` | 60 | 72 | 82.5 | 80 | 72 |
 
-**A subframe is one whole refresh, so `k = 2` is not a beam.** A row is either
-fully lit or fully dark in a given refresh, which means two subframes can only
-alternate the two halves of the screen: plain BFI churn, perceived as a
-flickering/rolling dark region rather than a sweep. Three is the first count
-that resolves a sweep, so the script takes a third subframe whenever the sweep
-still stays above `MIN_SWEEP_HZ` (this is what puts 144 Hz at 3 and leaves
-120 Hz at 2, where a third would be a 40 Hz strobe). More subframes at the same
-display = finer beam steps and a slower sweep; `Ctrl+Alt+Shift+b` cycles them by
-hand if you prefer a different trade.
+Above 0.8 of the refresh the rounding is dropped, so the generator can be asked
+for a rate between half and all of the panel rate. That is `beam sweep 144` on
+165 Hz, i.e. VFG x6 on 24p:
+
+| display | request | k | sweep | VFG `out-fps` |
+| --- | --- | --- | --- | --- |
+| 165 Hz | `beam sweep 144` | 1.1458 | 144 Hz | 144.0 (x6 at 23.976p: 143.856) |
+
+At `k` just above 1 the emission window covers most of the raster: the beam
+still advances once per refresh, but what moves is a narrow **dark** arc (13%
+of the frame at 1.147, backwards 12.8% of the screen per refresh -> a 21 Hz
+cycle), not a lit band edge. Brightness is conserved because the sweep integral
+is unchanged: over five phases at k = 1.147, mean nits were within 1.6% and the
+per-pixel absolute deviation was 2.9% of the unmodulated picture, with no
+clipping. Live at 143.85 fps: `frame-drop-count` stayed flat for 12 s, and a
+bright frame showed a ~10% dark arc with row p-p 0.069.
+
+**Two subframes are allowed.** An earlier version forced `k >= 3` on the theory
+that two "cannot draw a rolling beam", but at 165 Hz that silently turned a
+72 Hz target into a 55 Hz sweep whose three fixed raster positions the eye
+reads as three bands. `k = 2` at 165 Hz is an 82.5 Hz sweep, two positions
+above the panel's fusion limit, and it measured better. Fractional k *above* 2
+(the reference's 2.75 at 165 Hz) does rotate the positions, but the pattern
+repeats once per denominator sweeps (2.75 -> 15 Hz), which measured as flicker;
+it is available through `beam subframes <n>` and `beam k`, and is not chosen
+automatically. The sub-2 fractional case above is chosen automatically, because
+rounding it has no correct integer answer.
+
+### Modulation depth: `strength`
+
+The beam's sweep integral already equals the source, so blending the beam output
+toward the unmodulated picture keeps brightness and the time average exact and
+scales only how deeply the scan modulates. That is `strength` (0 = plain
+sample-and-hold, 1 = full rolling beam); the lua asks for **0.5 below ~220 Hz**
+and 1.0 above, because at 165 Hz the band edge is a single fixed boundary that
+some viewers latch onto as a line. The second full-depth case is a fast sub-two
+sweep: when the sweep rate is at least 0.8 of the refresh (x6: 144 of 165 Hz),
+the arc is narrow and moves most of the screen every refresh, so half depth only
+halves the gain; `strength_for` returns 1.0 there. Measured on the 165 Hz panel
+at k = 2, paused frame, row-profile peak-to-peak versus no shader: 34.1 code
+values at 1.0, 12.6 at 0.5, 0.01 at 0.0. At k = 1.147 the same measure is 0.224
+(normalized) at 1.0 and 0.055 at 0.5. `beam strength <0..1>` overrides it live.
 
 ### Two properties are forced while the beam is on
 
@@ -185,9 +230,11 @@ Script messages: `script-message beam toggle|on|off|status`,
 `beam subframes 4`, `beam gain 0.6`, `beam headroom 1.5`,
 `beam direction top2bottom`, `beam raster -0.2`,
 and the two that drive the pacing: `beam sweep 72` (target sweep rate in Hz; k is
-re-derived and VFG is retargeted to `display/k`) and `beam k 3` (pin k directly,
-which also retargets VFG). Both print the resulting sweep, VFG rate and pacing
-verdict in the OSD, so it is obvious when a refresh cannot be divided evenly.
+re-derived and VFG is retargeted to `display/k`; `beam sweep 144` on 165 Hz gives
+the fractional `k = 1.1458` above) and `beam k 3` (pin k directly, fractional
+values like `beam k 1.147` included, which also retargets VFG). Both print the
+resulting sweep, VFG rate and pacing verdict in the OSD, so it is obvious when a
+refresh cannot be divided evenly.
 
 To load it without a keybind, add `script=~~/scripts/beam-sim.lua` to `mpv.conf` (or place it in `~/.config/mpv/scripts/` to auto-load); to have it on
 by default, `script-opts` are not needed — call `script-message beam on` from a
@@ -243,6 +290,13 @@ state restore) and fails on all of them.
   `--glsl-shaders=~~/shaders/...` fails with `Failed to open shaders/...`.
 - `frame-step` renders two frames per invocation, so step-based measurements read
   2 beam steps at a time. Not a shader bug, but it will mislead a test.
+- The fork's `PREV` binding is not resolved at run time in the installed build:
+  libplacebo logs `Skipping hook due to no texture named 'PREV'` and drops the
+  whole pass, so a shader that binds it silently does nothing. The current
+  shader therefore reuses `HOOKED` for the previous-sweep interval (only cost:
+  the reference's bottom-edge correction on fast motion). Restore `PREV` when
+  the bind path is fixed; verify with `--msg-level=vo/gpu-next=trace` that no
+  `Skipping hook` line appears.
 
 ## Environment note
 

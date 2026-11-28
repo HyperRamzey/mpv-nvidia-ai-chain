@@ -389,6 +389,10 @@ end
 local function toggle_vfg()
     if state.vfg == "auto" then
         state.vfg = "off"
+        -- Beam Sim drives VFG through out-fps, and timestep mode owns the rate:
+        -- fps=off alone does not stop the engine while out-fps > 0, so the OSD
+        -- said "OFF" while VFG kept generating. Clear the target as well.
+        mp.command_native_async({ "vf-command", "vfg", "out-fps", "0" })
     else
         state.vfg = "auto"
     end

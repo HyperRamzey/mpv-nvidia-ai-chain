@@ -123,6 +123,15 @@ local function opts_of(player)
     return player.props["glsl-shader-opts"] or ""
 end
 
+local function last_out_fps(player)
+    for i = #player.calls, 1, -1 do
+        local c = player.calls[i]
+        if c[1] == "vf-command" and c[2] == "vfg" and c[3] == "out-fps" then
+            return tonumber(c[4])
+        end
+    end
+end
+
 local function sdr(refresh, fps, extra)
     local props = {
         ["display-fps"] = refresh,
@@ -159,30 +168,52 @@ do
          "mprt: gain caps the usable headroom")
     near(api.mprt({ subframes = 4, transfer = "sdr", beam_headroom = 4.0 }, 1.0, 4),
          4.0, "mprt: SDR pins headroom to 1.0")
+    -- gain_vs_blur must reach the shader unclamped: at the default
+    -- beam_headroom = 1.0 the old max(headroom, 1.0) made it a no-op, so
+    -- Ctrl+Alt+g changed the OSD and nothing else.
+    near(api.headroom_of({ transfer = "sdr", gain_vs_blur = 0.5 }), 0.5,
+         "headroom: SDR gain 0.5 is not clamped back to 1.0")
+    near(api.headroom_of({ transfer = "pq", beam_headroom = 2.0,
+                           gain_vs_blur = 0.5 }), 1.0,
+         "headroom: PQ gain caps beam_headroom")
+    near(api.headroom_of({ transfer = "pq", beam_headroom = 1.5 }), 1.5,
+         "headroom: PQ default gain uses the configured headroom")
 
-    -- k follows the wanted sweep rate (default 60 Hz), never the source rate:
-    -- the frame generator upstream supplies whatever rate is asked for.
-    -- Two subframes only ever light half the screen at a time, so a third is
-    -- taken whenever the sweep still stays above MIN_SWEEP_HZ.
-    equal(api.subframes_for(240), 4, "subframes: 240 Hz -> 60 Hz sweep")
-    equal(api.subframes_for(165), 3, "subframes: 165 Hz -> 55 Hz sweep")
-    equal(api.subframes_for(144), 3, "subframes: 144 Hz -> 48 Hz sweep")
-    equal(api.subframes_for(120), 2, "subframes: 120 Hz stays at 2 (3 would be 40 Hz)")
-    equal(api.subframes_for(60), 2, "subframes: never below 2")
+    -- k follows the wanted sweep rate (default 72 Hz), never the source rate:
+    -- the frame generator upstream supplies whatever rate is asked for. A target
+    -- at or below 0.8 of the refresh rounds to an integer (>= 2); a faster one
+    -- keeps the exact ratio, which is the VFG x6 case: 165 / 143.856 = 1.147.
+    -- Fractional k above 2 is manual-only (its rotating beam start repeats the
+    -- pattern once per denominator sweeps: 2.75 -> 15 Hz).
+    equal(api.subframes_for(240), 3, "subframes: 240 Hz -> 80 Hz sweep")
+    equal(api.subframes_for(165), 2, "subframes: 165 Hz -> 82.5 Hz sweep")
+    equal(api.subframes_for(144), 2, "subframes: 144 Hz -> 72 Hz sweep")
+    equal(api.subframes_for(120), 2, "subframes: 120 Hz -> 60 Hz sweep")
+    near(api.subframes_for(60), 1.001, "subframes: a 60 Hz panel runs one sweep per refresh",
+         1e-9)
+    near(api.subframes_for(165, 143.856), 165 / 143.856,
+         "subframes: x6 143.856 fps on 165 Hz -> k = 1.147", 1e-9)
+    near(api.subframes_for(120, 100), 1.2, "subframes: explicit fast target kept fractional", 1e-9)
     equal(api.subframes_for(240, 60), 4, "subframes: explicit 60 Hz target -> 4")
     equal(api.subframes_for(240, 48), 5, "subframes: explicit 48 Hz target -> 5")
     equal(api.subframes_for(240, 10), 5, "subframes: target clamped to the 48 Hz floor")
-    equal(api.subframes_for(240, 400), 3, "subframes: 2 never survives when 3 fits")
+    near(api.subframes_for(240, 400), 1.001,
+         "subframes: a target above the refresh caps at one sweep per refresh", 1e-9)
     equal(api.subframes_for(nil), 4, "subframes: unknown refresh falls back")
     -- the sweep rate that actually results, rounded to 0.1 Hz
-    near(240 / api.subframes_for(240), 60.0, "subframes: 240 Hz sweep", 0.05)
-    near(165 / api.subframes_for(165), 55.0, "subframes: 165 Hz sweep", 0.05)
+    near(240 / api.subframes_for(240), 80.0, "subframes: 240 Hz sweep", 0.05)
+    near(165 / api.subframes_for(165), 82.5, "subframes: 165 Hz sweep", 0.05)
     equal(api.pacing_ok(165, 82.5), true, "pacing: 82.5 fps on 165 Hz is locked 1:2")
     equal(api.pacing_ok(240, 80), true, "pacing: 80 fps on 240 Hz is locked 1:3")
     local _, why = api.pacing_ok(165, 96)
     equal(why, "noninteger", "pacing: 96 fps on 165 Hz is non-integer")
     local _, why_slow = api.pacing_ok(60, 30)
     equal(why_slow, "slow-sweep", "pacing: a 30 Hz beam is rejected as too slow")
+    -- pacing with k: the generator rate must be display/k, integer or not.
+    equal(api.pacing_ok(165, 82.5, 2), true, "pacing: 82.5 fps on 165 Hz locks k = 2")
+    equal(api.pacing_ok(165, 60, 2.75), true, "pacing: 60 fps on 165 Hz locks k = 2.75")
+    local _, why_mismatch = api.pacing_ok(165, 60, 2)
+    equal(why_mismatch, "mismatch", "pacing: 60 fps does not lock k = 2")
 
     -- The reference's per-refresh tiers are brightness trades; this chain keeps
     -- metadata brightness, so the automatic value is always the full headroom.
@@ -190,6 +221,18 @@ do
     near(api.gain_for(165), 1.0, "gain: 165 Hz keeps full brightness")
     near(api.gain_for(120), 1.0, "gain: 120 Hz keeps full brightness")
     near(api.gain_for(nil), 1.0, "gain: unknown refresh keeps full brightness")
+
+    -- Modulation depth: full only where the sweep is far above flicker fusion.
+    near(api.strength_for(240), 1.0, "strength: 240 Hz runs full depth")
+    near(api.strength_for(220), 1.0, "strength: 220 Hz is the floor for full depth")
+    near(api.strength_for(165), 0.5, "strength: 165 Hz runs half depth")
+    near(api.strength_for(120), 0.5, "strength: 120 Hz runs half depth")
+    near(api.strength_for(nil), 0.5, "strength: unknown refresh runs half depth")
+    -- A fast sub-two sweep is the second full-depth case: the arc is narrow and
+    -- moves most of the screen every refresh, so halving it only halves the gain.
+    near(api.strength_for(165, 143.856), 1.0, "strength: x6 sweep runs full depth")
+    near(api.strength_for(165, 132), 1.0, "strength: 0.8 of the refresh is the floor")
+    near(api.strength_for(165, 82.5), 0.5, "strength: k=2 at 165 Hz stays half depth")
 end
 
 -- ---------------------------------------------------------------------------
@@ -213,6 +256,7 @@ do
     contains(merged, "crt-beam-sim/custom=7", "merge: unknown key of ours kept")
     missing(merged, "crt-beam-sim/gain_vs_blur=1.0,", "merge: stale value dropped")
     contains(merged, "crt-beam-sim/beam_headroom=1.00", "merge: beam headroom written")
+    contains(merged, "crt-beam-sim/strength=1.000", "merge: strength written")
     missing(merged, ",,", "merge: no empty fields")
 
     st.subframes = 3.5
@@ -232,13 +276,14 @@ do
         "enable: shader appended once")
     equal(player.props["interpolation"], "yes", "enable: interpolation on")
     equal(player.props["video-sync"], "display-resample", "enable: display sync on")
-    equal(api.state.subframes, 3, "enable: 3 subframes for a 72 Hz sweep on 240 Hz")
+    equal(api.state.subframes, 3, "enable: 3 subframes for an 80 Hz sweep on 240 Hz")
     near(api.state.gain_vs_blur, 1.0, "enable: gain 1.0 (brightness is not traded)")
     contains(opts_of(player), "crt-beam-sim/subframes=3", "enable: subframes pushed")
     contains(opts_of(player), "crt-beam-sim/gain_vs_blur=1.000", "enable: gain pushed")
     contains(opts_of(player), "crt-beam-sim/gamma=2.200", "enable: SDR gamma pushed")
     contains(opts_of(player), "crt-beam-sim/transfer=sdr", "enable: SDR transfer pushed")
     contains(opts_of(player), "crt-beam-sim/peak_nits=", "enable: peak nits pushed")
+    contains(opts_of(player), "crt-beam-sim/strength=1.000", "enable: full depth on 240 Hz")
     contains(opts_of(player), "nlmeans/strength=2", "enable: foreign option kept")
     contains(player.osd, "Beam ON", "enable: OSD announces")
     contains(player.osd, "MPRT", "enable: OSD reports persistence")
@@ -253,6 +298,17 @@ do
     equal(player.props["interpolation"], "no", "disable: interpolation restored")
     equal(player.props["video-sync"], "audio", "disable: video-sync restored")
     equal(player.props["glsl-shader-opts"], "nlmeans/strength=2", "disable: options restored")
+end
+
+do
+    -- 165 Hz: two raster positions, 82.5 Hz sweep. The band edge is above the
+    -- panel's fusion but not always above the viewer's, so the automatic depth
+    -- is halved instead of pretending full-depth is artefact-free there.
+    local player = new_player(sdr(165, 24))
+    player.api.enable()
+    near(player.api.state.strength, 0.5, "enable: half depth on 165 Hz")
+    contains(opts_of(player), "crt-beam-sim/strength=0.500", "enable: half depth pushed")
+    contains(player.osd, "strength 0.50", "enable: OSD shows the depth")
 end
 
 do
@@ -282,7 +338,7 @@ do
     }))
     local api = player.api
     api.enable()
-    equal(api.state.subframes, 3, "vfg-configured: 240 Hz -> 72 Hz sweep, k=3")
+    equal(api.state.subframes, 3, "vfg-configured: 240 Hz -> 80 Hz sweep, k=3")
     equal(player.count("vf-command", "vfg", "out-fps", "80"), 1,
         "vfg-configured: retargeted to display/k = 80")
     api.disable()
@@ -324,7 +380,7 @@ do
     }))
     local api = player.api
     api.enable()
-    equal(api.state.subframes, 3, "tuning: 240 Hz starts at 3 (72 Hz sweep)")
+    equal(api.state.subframes, 3, "tuning: 240 Hz starts at 3 (80 Hz sweep)")
 
     player.bindings["beam-subframes-cycle"]()
     equal(api.state.subframes, 4, "tuning: cycle steps 3 -> 4")
@@ -370,6 +426,21 @@ do
     player.messages["beam"]("chroma")
     equal(api.state.chroma_balance, 1, "chroma: bare message toggles back")
 
+    -- Modulation depth: the knob that makes a latched band faint without
+    -- moving it and without changing brightness (the time average is exact).
+    equal(api.state.strength, 1.0, "strength: full depth by default on 240 Hz")
+    player.messages["beam"]("strength", "0.3")
+    near(api.state.strength, 0.3, "strength: set from a message")
+    equal(api.state.strength_auto, false, "strength: manual disables auto")
+    contains(opts_of(player), "crt-beam-sim/strength=0.300", "strength: pushed")
+    player.messages["beam"]("strength", "9")
+    near(api.state.strength, 1.0, "strength: clamps at 1.0")
+    player.messages["beam"]("strength", "-1")
+    near(api.state.strength, 0.0, "strength: clamps at 0.0")
+    player.messages["beam"]("strength")
+    equal(api.state.strength_auto, true, "strength: bare message returns to auto")
+    near(api.state.strength, 1.0, "strength: auto is full depth on 240 Hz")
+
     player.bindings["beam-gain-auto"]()
     equal(api.state.gain_auto, true, "tuning: auto gain back on")
     near(api.state.gain_vs_blur, 1.0, "tuning: auto gain is 1.0 (brightness kept)")
@@ -407,6 +478,16 @@ do
     player.messages["beam"]("raster", "-0.5")
     near(api.state.raster_mod, -0.5, "message: raster set")
 
+    -- The reference's band-fading offset: a slew on an even subframe count
+    -- rolls the phase boundary instead of latching it.
+    player.messages["beam"]("slew", "0.02")
+    near(api.state.slew, 0.02, "message: slew set")
+    equal(api.state.anti_retention, 1, "message: slew enables anti-retention")
+    contains(opts_of(player), "crt-beam-sim/slew=0.0200", "message: slew pushed")
+    contains(opts_of(player), "crt-beam-sim/anti_retention=1", "message: anti-retention pushed")
+    player.messages["beam"]("slew", "9")
+    near(api.state.slew, 0.02, "message: slew clamps at 0.02")
+
     player.bindings["beam-status"]()
     contains(player.osd, "subframes", "status: reports subframes")
     contains(player.osd, "MPRT", "status: reports persistence")
@@ -439,7 +520,7 @@ end
 -- ---------------------------------------------------------------------------
 do
     local player = new_player(sdr(165, 24, {
-        ["estimated-vf-fps"] = 55.0,
+        ["estimated-vf-fps"] = 82.5,
         ["vf"] = "@hwup:hwup,@vfg:vfg:fps=auto:max-fps=165",
         ["vo"] = "gpu",
         ["current-vo"] = "gpu",
@@ -447,23 +528,39 @@ do
     }))
     local api = player.api
     api.enable()
-    contains(player.osd, "pacing locked", "status: uses render_fps (55 on 165 Hz)")
-    equal(api.state.subframes, 3, "auto: 165 Hz lands on k=3 (55 Hz sweep)")
+    contains(player.osd, "pacing locked", "status: render_fps 82.5 on 165 Hz locks k=2")
+    equal(api.state.subframes, 2, "auto: 165 Hz lands on k=2 (82.5 Hz sweep)")
     player.bindings["beam-subframes-cycle"]()
-    equal(api.state.subframes, 4, "cycle: 3 -> 4")
-    equal(player.count("vf-command", "vfg", "out-fps", "41.25"), 1,
-        "cycle: retargets VFG to 165/4 = 41.25")
+    equal(api.state.subframes, 3, "cycle: 2 -> 3")
+    equal(player.count("vf-command", "vfg", "out-fps", "55"), 1,
+        "cycle: retargets VFG to 165/3 = 55")
     player.messages["beam"]("subframes", "5")
     equal(player.count("vf-command", "vfg", "out-fps", "33"), 1,
         "message subframes: retargets VFG to 165/5 = 33")
     player.bindings["beam-subframes-auto"]()
-    equal(api.state.subframes, 3, "auto: restores k=3 from sweep_hz (60 Hz), not source_fps")
-    equal(player.count("vf-command", "vfg", "out-fps", "55"), 2,
-        "auto: retargets VFG back to 55")
+    equal(api.state.subframes, 2, "auto: restores k=2 from sweep_hz (72 Hz), not source_fps")
+    equal(player.count("vf-command", "vfg", "out-fps", "82.5"), 2,
+        "auto: retargets VFG back to 82.5")
     api.set_sweep_hz(600)
-    equal(api.state.subframes, 2, "set_sweep_hz: absurd rate still clamps to k=2")
+    near(api.state.subframes, 1.001,
+         "set_sweep_hz: a rate above the refresh runs one sweep per refresh", 1e-9)
     api.set_sweep_hz(10)
     equal(api.state.subframes, 3, "set_sweep_hz: clamped to 48 Hz floor (165/48 -> k=3)")
+
+    -- x6: `beam sweep 144` on a 165 Hz panel must hold k = 165/144 = 1.1458,
+    -- not round to 2 (82.5 Hz) or 3 (55 Hz), and must run at full depth.
+    api.set_sweep_hz(144)
+    near(api.state.subframes, 165 / 144, "set_sweep_hz: x6 keeps the fractional ratio", 1e-9)
+    near(last_out_fps(player), 144, "set_sweep_hz: VFG retargeted to 144 fps", 1e-6)
+    near(api.state.strength, 1.0, "set_sweep_hz: full depth for the x6 sweep")
+    player.messages["beam"]("subframes", "1.147")
+    near(api.state.subframes, 1.147, "message subframes: fractional k accepted", 1e-9)
+    near(last_out_fps(player), 165 / 1.147,
+         "message subframes: retargets VFG to 165/1.147", 1e-6)
+    player.messages["beam"]("strength", "0.3")
+    player.messages["beam"]("strength")
+    near(api.state.strength, 1.0,
+         "message strength: auto follows the x6 sweep, not just the refresh", 1e-9)
 
     -- The phase counter is only trustworthy on vo=gpu-next, and the peak pass
     -- runs the hook twice; both are forced while the beam is on and restored
@@ -476,6 +573,21 @@ do
     equal(player.props["vo"], "gpu", "disable: vo restored")
     api.disable()
     equal(player.props["glsl-shader-opts"], "", "disable: clears previously empty glsl-shader-opts")
+end
+
+-- ---------------------------------------------------------------------------
+-- enable() reports the VFG rate it just requested, not the pre-retarget
+-- estimated-vf-fps (which made the startup OSD show a false mismatch)
+-- ---------------------------------------------------------------------------
+do
+    local player = new_player(sdr(165, 24, {
+        ["estimated-vf-fps"] = 96,   -- integer-multiplier rate, before out-fps lands
+        ["vf"] = "@hwup:hwup,@vfg:vfg:fps=auto:max-fps=165",
+    }))
+    player.api.enable()
+    contains(player.osd, "pacing locked",
+        "enable: status uses the requested 82.5 fps, not the stale 96")
+    assert(player.osd:find("82.5", 1, true), "enable: status shows the target rate")
 end
 
 do

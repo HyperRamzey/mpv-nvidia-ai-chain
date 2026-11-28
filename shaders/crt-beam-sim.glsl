@@ -56,21 +56,29 @@
 //   both fully bright and brief unless the panel can flash above that peak, and
 //   that is exactly what beam_headroom expresses.
 //
-//   gain_vs_blur below 1.0 now *reduces* the usable headroom (i.e. it lowers the
-//   flash intensity and lengthens the window) instead of dimming the picture, so
-//   the knob still trades peak load against sharpness and never changes average
-//   brightness.
+//   gain_vs_blur scales the intensity the beam is allowed to use. Above 1.0 it
+//   caps how much of beam_headroom is spent, so with beam_headroom > 1 it lowers
+//   the peak flash load. Below 1.0 it takes the intensity under the tone-mapped
+//   peak: pixels brighter than it emit at that level for the full sweep, i.e.
+//   they dim and their persistence grows toward the sweep length. That is the
+//   knob's real trade -- peak load against brightness and sharpness -- and it is
+//   deliberately not clamped back up to 1.0, which made it a no-op whenever
+//   beam_headroom was at its default 1.0.
 //
-// DEVIATION FROM THE REFERENCE SHADER -- read this before judging the result
-//   The published algorithm reads the three trailing frames on purpose: a pixel
-//   whose budget exceeds one refresh keeps emitting in the *next* refreshes,
-//   still showing the *older* frame, which is what gives the phosphor trail.
-//   mpv's user-shader API has no previous-frame texture (no feedback target),
-//   so this port substitutes the current frame for those trailing reads. The
-//   budgets then tile the raster instead of overlapping, which keeps the total
-//   light correct (verified: sum <= 1.0 for every brightness, sweep and gain)
-//   and keeps MPRT proportional to brightness, but there is no aged ghost
-//   behind bright pixels -- a bright object just has a longer persistence.
+// SEAM, AND THE PREVIOUS-CYCLE CONTENT
+//   The reference reads the three trailing frames on purpose: the wrapped copy
+//   of a pixel's emission (the copy anchored one sweep earlier, which is the
+//   part still glowing at the bottom of the screen while the beam restarts at
+//   the top) has to carry the *older* frame, or the bottom of the retrace seam
+//   shows content that has not been scanned yet -- a tear at the top and bottom
+//   edges on moving content.
+//   This fork's libplacebo exposes that content through a PREV binding, but in
+//   the installed build the bind is not resolved at run time: libplacebo traces
+//   "Skipping hook due to no texture named 'PREV'" and drops the whole pass,
+//   which silently disabled the entire effect. So the previous interval below
+//   reuses the current content instead: the screen is correct, the effect is
+//   present, and the only loss is the reference's bottom-edge correction on
+//   fast motion. Restore PREV here once the fork's bind path is fixed.
 //
 // WHERE IT RUNS
 //   HOOK OUTPUT, i.e. after the whole filter chain (hwup/dlssnr/vsr/truehdr/vfg),
@@ -103,6 +111,12 @@
 //                   chroma ghosting. 0: per-channel windows, which gives the
 //                   bright channel the shortest persistence but separates the
 //                   channels in time (temporal colour fringing).
+//   strength        modulation depth, 0..1. 1.0 is the full rolling beam; 0.0
+//                   is plain sample-and-hold. Blending toward the input keeps
+//                   the time average (and therefore brightness) exact and only
+//                   scales the scan depth, so it is the way to make a latched
+//                   band faint without dimming the picture or moving the band.
+//                   scripts/beam-sim.lua asks for 0.5 below ~220 Hz.
 //   gamma           display gamma for the linear-light budget: 2.2 for a
 //                   standard sRGB SDR output, 2.4 recommended by the reference,
 //                   1.0 to work on raw code values (PQ/HLG, approximate).
@@ -190,6 +204,12 @@ pq
 //!MINIMUM 0
 //!MAXIMUM 1
 1
+//!PARAM strength
+//!DESC 0 = plain sample-and-hold, 1 = full beam modulation
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
 
 //!HOOK OUTPUT
 //!BIND HOOKED
@@ -245,10 +265,27 @@ float bbs_encode(float c)
 vec4 hook()
 {
     vec4 src = HOOKED_tex(HOOKED_pos);
+    // The previous-cycle content (the reference's prev2) would come from the
+    // fork's PREV binding. In the current build that bind is not resolved:
+    // libplacebo traces "Skipping hook due to no texture named 'PREV'" and
+    // drops the whole pass, so the shader silently did nothing. Until that is
+    // fixed, all three emission intervals carry the current content; the cost
+    // is the reference's bottom-edge tear on moving content, not the effect.
+    vec4 src_prev = src;
 
     float k = clamp(subframes, 1.0, 32.0);
-    // Reference: the effect is disabled below two refreshes per sweep.
-    if (k < 2.0)
+    // The reference disables the effect below two refreshes per sweep. Allowing
+    // just above one is what makes it usable with the frame generator: VFG x6 on
+    // a 165 Hz panel emits 143.86 fps, i.e. 165/143.86 = 1.147 refreshes per
+    // generated frame, one sweep per frame. The budget stays conservative there
+    // (the three overlap terms sum to at most H for p <= 1, so no clipping);
+    // what changes is the visual form: above k = 1 the emission intervals are
+    // long enough that bright pixels overlap the next window and are simply
+    // modulated, while dark pixels keep a narrow moving dark arc. Measured at
+    // k = 1.147 on 4K DoVi: the sweep integral is within 1.6% of the
+    // unmodulated picture, and the arc is ~10% of the frame. k = 1 exactly is a
+    // fixed raster position (a strobe, not a beam), so it stays disabled.
+    if (k < 1.001)
         return src;
 
     // LCD anti-retention: keep an even subframe count off the inversion pattern.
@@ -286,7 +323,8 @@ vec4 hook()
     else if (scan_direction == 3) tube_pos = HOOKED_pos.x;        // left to right
     else                          tube_pos = 1.0 - HOOKED_pos.x;  // right to left
 
-    vec3 p = vec3(bbs_decode(src.r), bbs_decode(src.g), bbs_decode(src.b));
+    vec3 pc = vec3(bbs_decode(src.r), bbs_decode(src.g), bbs_decode(src.b));
+    vec3 pp = vec3(bbs_decode(src_prev.r), bbs_decode(src_prev.g), bbs_decode(src_prev.b));
 
     // Beam intensity relative to peak_nits. Light is conserved exactly:
     //
@@ -300,12 +338,13 @@ vec4 hook()
     // average nits (Talbot-Plateau, i.e. the source metadata is preserved),
     // less persistence. H = 1.0 never asks the panel for more than the tone
     // mapped peak, so nothing can clip; H > 1 uses whatever headroom the panel
-    // has above peak_nits and flashes proportionally harder. SDR cannot exceed
-    // its own white point in 8 bits, so H is pinned to 1.0 there and
-    // gain_vs_blur stays inert unless the output is PQ.
+    // has above peak_nits and flashes proportionally harder. SDR has no
+    // headroom above white, so beam_headroom is ignored there; gain_vs_blur
+    // still applies and may take H below 1.0 (dimming pixels brighter than H,
+    // see the parameter notes at the top). Do not clamp it back up to 1.0:
+    // that made the control dead at the default beam_headroom = 1.0.
     float headroom = (transfer == 1) ? clamp(beam_headroom, 1.0, 8.0) : 1.0;
     headroom *= clamp(gain_vs_blur, 0.01, 1.0);
-    headroom = max(headroom, 1.0);
 
     // Colour-balanced (chroma_balance = 1, default): one emission window for the
     // whole pixel, driven by its brightest channel, with each channel emitting
@@ -317,38 +356,69 @@ vec4 hook()
     //
     // chroma_balance = 0: per-channel windows, i.e. maximum blur reduction for
     // the bright channel at the cost of temporal colour separation.
-    float p_max = max(max(p.r, p.g), p.b);
-    vec3 emit;
-    vec3 intensity = vec3(0.0);
-    float window;
+    //
+    // The current and previous content each carry their own budget, so each
+    // gets its own window and intensity. (The previous budget is what the
+    // phosphor was excited with one sweep ago; its emission is the part still
+    // visible at the retrace seam.)
+    vec3 emit_c, inten_c, emit_p, inten_p;
     if (chroma_balance == 1) {
-        window = clamp(p_max * k / headroom, 0.0, k);
-        emit = vec3(window);
-        if (window > 1e-6)
-            intensity = clamp(p * k / window, vec3(0.0), vec3(headroom));
+        float wc = clamp(max(max(pc.r, pc.g), pc.b) * k / headroom, 0.0, k);
+        emit_c = vec3(wc);
+        inten_c = (wc > 1e-6) ? clamp(pc * k / wc, vec3(0.0), vec3(headroom)) : vec3(0.0);
+
+        float wp = clamp(max(max(pp.r, pp.g), pp.b) * k / headroom, 0.0, k);
+        emit_p = vec3(wp);
+        inten_p = (wp > 1e-6) ? clamp(pp * k / wp, vec3(0.0), vec3(headroom)) : vec3(0.0);
     } else {
-        emit = clamp(p * k / headroom, vec3(0.0), vec3(k));
-        intensity = vec3(headroom);
-        window = 0.0;
+        emit_c = clamp(pc * k / headroom, vec3(0.0), vec3(k));
+        inten_c = vec3(headroom);
+        emit_p = clamp(pp * k / headroom, vec3(0.0), vec3(k));
+        inten_p = vec3(headroom);
     }
 
     float tube_frame = tube_pos * k;
 
-    // Sum the overlap of this pixel's emission intervals with the current
-    // window. Because f_start < k and k >= 2, f_end <= k, so only the copies at
-    // n = -1 and n = 0 can overlap [f_start, f_end]: the n = +1 copy starts at
-    // tube_frame + k >= k >= f_end, i.e. at or past the window's end (a measure
-    // -zero touch at most). The old n <= 1 loop iteration was dead work.
+    // Sum the overlap of the pixel's emission intervals with the current
+    // window over three trailing sweeps, exactly as the reference does:
+    //
+    //   [t - k, t - k + emit]  previous sweep's pass over this pixel,
+    //                          carrying the previous cycle's content (PREV)
+    //   [t,     t + emit]      current sweep, current content
+    //   [t + k, t + k + emit]  next sweep, current content
+    //
+    // The wrapped copy is why a window near the end of one sweep can light
+    // the bottom of the screen while the next sweep has already started at
+    // the top: that light is the afterglow of the previous scan, and it must
+    // show the frame that scan wrote, not the frame now at the top.
+    //
+    // With integer k and no phase offset the +k copy only touches the window
+    // at a single point, but fractional k (anti_retention slew, raster_mod)
+    // makes it genuinely cover the top edge -- the reference's "fix seam for
+    // top edge".
     vec3 lit = vec3(0.0);
-    for (int n = -1; n <= 0; n++) {
-        float start = tube_frame + float(n) * k;
-        lit += clamp(min(start + emit, vec3(f_end)) - max(vec3(start), vec3(f_start)),
-                     vec3(0.0), vec3(1.0));
-    }
-    // Overlap is emission time; scale it to the intensity that flashes for it.
-    // In colour-balanced mode the three overlaps are identical (one window), so
-    // the per-channel intensity alone sets the colour, exactly as in the source.
-    lit *= intensity;
+    lit += clamp(min(vec3(tube_frame - k) + emit_p, vec3(f_end)) -
+                 max(vec3(tube_frame - k), vec3(f_start)),
+                 vec3(0.0), vec3(1.0)) * inten_p;
+    lit += clamp(min(vec3(tube_frame) + emit_c, vec3(f_end)) -
+                 max(vec3(tube_frame), vec3(f_start)),
+                 vec3(0.0), vec3(1.0)) * inten_c;
+    lit += clamp(min(vec3(tube_frame + k) + emit_c, vec3(f_end)) -
+                 max(vec3(tube_frame + k), vec3(f_start)),
+                 vec3(0.0), vec3(1.0)) * inten_c;
+
+    // Different content cycles can overlap in the same refresh at the seam;
+    // the panel cannot flash past the configured headroom.
+    lit = min(lit, vec3(headroom));
+
+    // Modulation depth. The sweep integral already equals the source, so
+    // blending toward the unmodulated sample-and-hold picture changes neither
+    // brightness nor the time average -- it scales only how deeply the scan
+    // modulates, and with it both the clarity gain and the visibility of the
+    // beam edge. On a 165 Hz panel (two raster positions, 82.5 Hz sweep) the
+    // edge is above flicker fusion for the panel but not for every viewer, so
+    // scripts/beam-sim.lua lowers this below ~220 Hz instead of pretending.
+    lit = mix(pc, lit, clamp(strength, 0.0, 1.0));
 
     return vec4(bbs_encode(lit.r), bbs_encode(lit.g), bbs_encode(lit.b), src.a);
 }

@@ -32,10 +32,15 @@ local SHADER_PATH  = "~~/shaders/crt-beam-sim.glsl"
 local SHADER_NAME  = "crt-beam-sim"
 local PARAMS       = { "subframes", "gain_vs_blur", "gamma", "scan_direction",
                        "raster_mod", "anti_retention", "slew", "transfer",
-                       "peak_nits", "beam_headroom", "chroma_balance" }
+                       "peak_nits", "beam_headroom", "chroma_balance", "strength" }
 local SUBFRAME_STEPS = { 2, 3, 4, 5, 6, 8, 10, 12 }
 local DIRECTIONS  = { "global", "top2bottom", "bottom2top", "left2right", "right2left" }
 local MAX_SUBFRAMES = 12
+-- Sub-two sweeps are only meaningful when the generator runs faster than half
+-- the refresh rate (VFG x6 at 165 Hz emits 143.86 fps -> k = 165/143.86 =
+-- 1.147). k = 1 is a fixed raster position (a strobe, not a beam), so the floor
+-- is just above one refresh; the shader uses the same bound.
+local MIN_SUBFRAMES = 1.001
 -- The sweep rate is display_hz / subframes, and it must never fall below this.
 -- A 24 Hz beam is a strobe, not a CRT: 24p film was always projected through a
 -- 48 or 72 Hz shutter for exactly this reason, and a rolling scan at 24 Hz is
@@ -56,6 +61,8 @@ local state = {
     gain_auto      = true,
     beam_headroom  = 1.0,
     chroma_balance = 1,
+    strength       = 1.0,
+    strength_auto  = true,
     gamma          = 2.2,
     scan_direction = "top2bottom",
     raster_mod     = 0.0,
@@ -77,15 +84,17 @@ end
 
 -- Beam intensity relative to the tone-mapped peak. Light conservation requires
 -- intensity * emission_time == p * subframes, so a brighter beam means a shorter
--- flash for the same average nits. SDR is pinned to 1.0 because an 8-bit output
--- cannot represent anything above its own white; PQ can flash into whatever
--- headroom the panel has.
+-- flash for the same average nits. SDR cannot go above its own white, so
+-- beam_headroom is ignored there; gain_vs_blur still scales the intensity and
+-- may take it below 1.0, which dims pixels brighter than it (the shader's
+-- peak-load trade). Mirrors the shader exactly -- no max(1.0) clamp, or a
+-- gain < 1 would be dead while beam_headroom is at its default.
 local function headroom_of(st)
     local h = clamp(st.gain_vs_blur or 1.0, 0.01, 1.0)
     if st.transfer == "pq" then
         h = h * clamp(st.beam_headroom or 1.0, 1.0, 8.0)
     end
-    return math.max(1.0, h)
+    return h
 end
 
 -- Persistence, in refreshes, for a pixel of linear brightness p:
@@ -107,48 +116,72 @@ end
 -- display 165 Hz -> subframes = 2, sweep = 82.5 Hz, one sweep per generated
 -- frame, every refresh drawn once. No integer multiplier can do that.
 -- Default sweep rate: what a good CRT ran at and what 24p film was projected
--- through (48/72 Hz shutters). The beam frequency is the knob, k is derived.
--- 60 Hz rather than 72 because a subframe is one *whole* refresh: a row is
--- either fully lit or fully dark in it. At k = 2 the beam therefore only has two
--- positions, so each row just alternates between the two halves of the screen
--- (plain BFI churn) instead of rolling. k >= 3 is the first count that can
--- resolve a sweep, so the target is set where 165 Hz lands on 3 and 240 Hz on 4.
-local TARGET_SWEEP_HZ = 60
+-- through (48/72 Hz shutters). The beam frequency is the knob, k is derived:
+-- k = round(display Hz / sweep Hz), floored at 2 for the usual range; a target
+-- above 0.8 of the refresh keeps the exact ratio in (1, 2) (see below).
+--
+-- Two subframes are allowed. An earlier version forced k >= 3 on the theory
+-- that two "cannot draw a rolling beam", but at 165 Hz that silently turned a
+-- 72 Hz request into a 55 Hz sweep, whose three beam positions the eye reads
+-- as three fixed horizontal bands. k = 2 at 165 Hz is an 82.5 Hz sweep: two
+-- beam positions above flicker fusion, measured better on the panel. The
+-- reference also runs k = 2 on 120 Hz displays (FRAMES_PER_HZ = 2.0).
+--
+-- A requested sweep above 0.8 of the refresh rate is kept as an exact ratio
+-- instead of being rounded: there the only integer k left is 1 (a fixed raster
+-- position, i.e. no beam), and k = 2 would put the sweep below half the panel
+-- rate. That is the frame-generator case (VFG x6 on 165 Hz emits 143.86 fps,
+-- so k = 165/143.86 = 1.147, one sweep per generated frame). At k < 2 the beam
+-- still advances once per refresh, but the emission window is most of the
+-- raster, so the modulation is a narrow moving arc rather than a latched band
+-- edge; the photon budget stays below 1 and brightness is conserved (measured
+-- within 1.6% on 4K DoVi). Integer rounding here would turn `beam sweep 144`
+-- on a 165 Hz panel into a 55 Hz or 82.5 Hz sweep, the banded cases above.
+-- At or below 0.8 the integer rounding is kept: that is the reference's
+-- two-refreshes-per-frame mode on 120/144/240 Hz panels (60/72/80 Hz sweeps).
+--
+-- Fractional k is chosen automatically only below 2. Above 2 it remains
+-- manual-only: the reference's 2.75 at 165 Hz / 2.4 at 144 Hz rotates the beam
+-- start and repeats the whole pattern once per denominator sweeps (2.75 ->
+-- every 4 sweeps = 15 Hz), which measured as flickering bands.
+local TARGET_SWEEP_HZ = 72
 
 -- Refreshes per rendered frame, derived from the *wanted sweep rate* and not
 -- from the source frame rate: with a generator in front the renderer is simply
 -- told to produce display/k frames per second and every one of them gets one
--- sweep. Example: 165 Hz display, 72 Hz target -> k = 2, VFG out-fps = 82.5,
--- sweep 82.5 Hz, one sweep per generated frame. No integer multiplier can
--- produce 82.5, which is why VFG runs in float-timestep mode.
+-- sweep (VFG runs in float-timestep mode, which can hit a rate like 82.5 or
+-- 143.856).
 local function subframes_for(refresh, target_sweep)
     if type(refresh) ~= "number" or refresh < 20 then return 4.0 end
     target_sweep = tonumber(target_sweep) or TARGET_SWEEP_HZ
     if target_sweep < MIN_SWEEP_HZ then target_sweep = MIN_SWEEP_HZ end
-    -- Most subframes the panel can take before the sweep becomes a strobe.
+    if target_sweep > 0.8 * refresh then
+        return clamp(refresh / target_sweep, MIN_SUBFRAMES, 2.0)
+    end
     local k_max = math.floor(refresh / MIN_SWEEP_HZ)
     local k = clamp(math.floor(refresh / target_sweep + 0.5), 2, MAX_AUTO_SUBFRAMES)
-    -- Two subframes cannot draw a rolling beam (see TARGET_SWEEP_HZ above), so
-    -- take a third whenever the sweep still stays above MIN_SWEEP_HZ. This is
-    -- what puts 144 Hz on k = 3 (48 Hz) and keeps 120 Hz at 2 (60 Hz, where 3
-    -- would be a 40 Hz strobe).
-    if k < 3 and k_max >= 3 then k = 3 end
     if k > k_max and k_max >= 2 then k = k_max end
     return k + 0.0
 end
 
--- Pacing verdict: one rendered frame per subframes refreshes exactly. A
--- non-integer ratio means some beam steps are held for one extra refresh, which
--- is visible as horizontal banding (measured: 96 fps on 165 Hz = 1.72
--- refreshes per frame, ~72% of steps duplicated).
-local function pacing_ok(refresh, fps)
+-- Pacing verdict: the beam advances once per presented refresh (gpu-next), so
+-- what has to line up is the generator rate with the sweep: VFG must emit
+-- refresh/k frames per second, one sweep per generated frame. With integer k
+-- that used to be an integer-ratio check; fractional k makes display/fps == k
+-- itself the condition, so compare against k when it is known. Without k, fall
+-- back to the integer-ratio check.
+local function pacing_ok(refresh, fps, k)
     if type(refresh) ~= "number" or type(fps) ~= "number" then return false, "unknown" end
     if fps <= 0 then return false, "no-fps" end
+    if fps < MIN_SWEEP_HZ then return false, "slow-sweep" end
     local ratio = refresh / fps
+    if type(k) == "number" and k > 0 then
+        if math.abs(ratio - k) > 0.02 * k then return false, "mismatch" end
+        return true, "locked"
+    end
     if math.abs(ratio - math.floor(ratio + 0.5)) > 0.01 then
         return false, "noninteger"
     end
-    if fps < MIN_SWEEP_HZ then return false, "slow-sweep" end
     return true, "locked"
 end
 
@@ -159,6 +192,32 @@ end
 -- peak flash load (OLED ABL), never for brightness.
 local function gain_for(_)
     return 1.0
+end
+
+-- Modulation depth, i.e. how far the beam output may swing away from the plain
+-- sample-and-hold picture. Full depth is the reference's effect, and it is only
+-- honest where the sweep is far above flicker fusion: the reference's floor is
+-- 240 Hz (FRAMES_PER_HZ 4 -> 60 Hz sweep, four raster positions, a 240 Hz
+-- animation). At 165 Hz the fastest sweep is display/2 = 82.5 Hz with two
+-- fixed raster positions, and a full-depth edge there is read as a latched
+-- band rather than as clarity. Half depth keeps a real share of the clarity
+-- gain while the band stays under that threshold; the user can override it with
+-- `beam strength <0..1>`.
+local FULL_STRENGTH_HZ = 220
+local LOW_HZ_STRENGTH  = 0.5
+-- A sub-two sweep is the second full-depth case: with k = 1.147 the raster
+-- moves 87% of the screen every refresh, so the modulation is a narrow, fast
+-- arc instead of a latched half-screen edge, and halving it only halves the
+-- clarity gain. Keep the display-rate rule (the reference's 240 Hz floor) for
+-- everything else; the sweep argument is optional so old callers still work.
+local FAST_SWEEP_FRACTION = 0.8
+local function strength_for(refresh, sweep)
+    if type(refresh) ~= "number" then return LOW_HZ_STRENGTH end
+    if refresh >= FULL_STRENGTH_HZ then return 1.0 end
+    if type(sweep) == "number" and sweep >= FAST_SWEEP_FRACTION * refresh then
+        return 1.0
+    end
+    return LOW_HZ_STRENGTH
 end
 
 local function fmt(v, digits)
@@ -187,6 +246,7 @@ local function merge_opts(existing, st)
         peak_nits      = fmt(st.peak_nits or 700, 1),
         beam_headroom  = fmt(st.beam_headroom or 1.0, 2),
         chroma_balance = tostring(math.floor((st.chroma_balance or 1) + 0.5)),
+        strength       = fmt(st.strength or 1.0, 3),
     }
     local out = {}
     local prefix = SHADER_NAME .. "/"
@@ -213,13 +273,13 @@ local function status_line(refresh, fps)
     local white = mprt(state, 1.0, state.subframes)
     local mid = mprt(state, MID_LINEAR, state.subframes)
     local sweep = (refresh and refresh > 0) and (refresh / math.max(state.subframes, 1)) or 0
-    local ok, why = pacing_ok(refresh, fps)
+    local ok, why = pacing_ok(refresh, fps, state.subframes)
     return string.format(
-        "Beam %s | %s subframes%s | gain %.2f headroom %.2fx | MPRT white %.2f /"
+        "Beam %s | %s subframes%s | gain %.2f strength %.2f headroom %.2fx | MPRT white %.2f /"
         .. " mid %.2f of %s | sweep %.1f Hz | %g fps | %s | %s",
         state.on and "ON" or "OFF", fmt_subframes(state.subframes),
         state.subframes_auto and " auto" or "",
-        state.gain_vs_blur, headroom_of(state), white, mid,
+        state.gain_vs_blur, state.strength, headroom_of(state), white, mid,
         fmt_subframes(state.subframes), sweep, fps or 0,
         ok and "pacing locked" or ("pacing " .. tostring(why)),
         state.transfer == "pq" and ("PQ " .. tostring(state.peak_nits) .. "nits") or "SDR")
@@ -298,6 +358,12 @@ local function recompute()
     if state.gain_auto then
         state.gain_vs_blur = gain_for(refresh)
     end
+    if state.strength_auto then
+        local sweep = (type(refresh) == "number" and refresh > 0)
+                      and refresh / math.max(state.subframes, MIN_SUBFRAMES)
+                      or nil
+        state.strength = strength_for(refresh, sweep)
+    end
     local transfer, peak = detect_output()
     state.transfer = transfer
     state.peak_nits = peak
@@ -334,11 +400,13 @@ local function vfg_entry()
 end
 
 -- Point VFG at exactly display/subframes fps (float timestep mode). Integer
--- multipliers cannot hit 165/2 = 82.5, so this is the only way to get one beam
--- sweep per generated frame on a 165 Hz panel.
+-- multipliers cannot hit 165/2 = 82.5 or 165/1.147 = 143.856, so this is the
+-- only way to get one beam sweep per generated frame on a 165 Hz panel.
 local function retarget_vfg(refresh, k)
     if not vfg_entry() then return false end
-    if type(refresh) ~= "number" or refresh < 20 or not k or k < 2 then return false end
+    if type(refresh) ~= "number" or refresh < 20 or not k or k < MIN_SUBFRAMES then
+        return false
+    end
     local target = refresh / k
     mp.commandv("vf-command", "vfg", "out-fps", string.format("%.17g", target))
     return true
@@ -350,11 +418,12 @@ end
 local function apply_targets()
     local refresh = refresh_hz()
     local k = state.subframes
+    local retargeted = false
     if state.on then
-        retarget_vfg(refresh, k)
+        retargeted = retarget_vfg(refresh, k)
         apply_opts()
     end
-    return refresh
+    return refresh, retargeted
 end
 
 local function ensure_subframes_rendered()
@@ -362,8 +431,9 @@ local function ensure_subframes_rendered()
     -- refresh: VFG alone draws only at its own output rate (measured 96/s with
     -- VFG x4, or 38/s when the engine's shot-change fallback kept toggling),
     -- which cannot produce a 2-subframe sweep. Interpolation with
-    -- tscale=oversample repeats the nearest frame without blending, and on an
-    -- integer display/render ratio each frame is held exactly k refreshes.
+    -- tscale=oversample repeats the nearest frame without blending; each frame
+    -- is then held floor(k) or ceil(k) refreshes (2 or 3 at k = 2.75), which is
+    -- exactly the reference's non-integer FRAMES_PER_HZ.
     if mp.get_property("interpolation", "no") ~= "yes" then
         saved.interpolation = saved.interpolation or mp.get_property("interpolation", "no")
         mp.set_property("interpolation", "yes")
@@ -433,7 +503,14 @@ local function enable()
     ensure_subframes_rendered()
 
     local refresh, fps = recompute()
-    apply_targets()
+    -- apply_targets() may retarget VFG to display/k (float timestep). That
+    -- command is asynchronous, so estimated-vf-fps still reports the previous
+    -- multiplier here and the startup OSD showed a false "pacing mismatch".
+    -- Report the rate the script just requested instead.
+    local _, retargeted = apply_targets()
+    if retargeted and refresh and state.subframes and state.subframes >= MIN_SUBFRAMES then
+        fps = refresh / state.subframes
+    end
 
     local text = status_line(refresh, fps)
     if not refresh then
@@ -475,6 +552,10 @@ end
 local function tuned(message, retarget)
     if state.on then
         if retarget then
+            -- A sweep/subframe change moves the derived strength too (full
+            -- depth above half the refresh rate, half below), so refresh the
+            -- automatic values before re-pacing.
+            recompute()
             apply_targets()
         else
             apply_opts()
@@ -489,10 +570,10 @@ local function set_sweep_hz(hz)
     local refresh = refresh_hz()
     if not refresh then return false end
     if hz < MIN_SWEEP_HZ then hz = MIN_SWEEP_HZ end
-    local k = clamp(math.floor(refresh / hz + 0.5), 2, MAX_AUTO_SUBFRAMES)
+    local k = subframes_for(refresh, hz)
     state.sweep_hz = refresh / k
     state.subframes_auto = false
-    state.subframes = k + 0.0
+    state.subframes = k
     tuned(string.format("Beam sweep: %.1f Hz (k=%s of %.1f Hz)",
         refresh / k, fmt_subframes(k), refresh), true)
     return true
@@ -615,14 +696,14 @@ mp.register_script_message("beam", function(cmd, arg1)
         local k = tonumber(arg1)
         if k then
             state.subframes_auto = false
-            state.subframes = clamp(math.floor(k + 0.5), 2, MAX_AUTO_SUBFRAMES) + 0.0
+            state.subframes = clamp(k, MIN_SUBFRAMES, MAX_AUTO_SUBFRAMES) + 0.0
             tuned("Beam subframes: " .. fmt_subframes(state.subframes), true)
         end
     elseif cmd == "subframes" then
         local k = tonumber(arg1)
         if k then
             state.subframes_auto = false
-            state.subframes = clamp(k, 2, MAX_SUBFRAMES) + 0.0
+            state.subframes = clamp(k, MIN_SUBFRAMES, MAX_SUBFRAMES) + 0.0
             tuned("Beam subframes: " .. fmt_subframes(state.subframes), true)
         else
             cycle_subframes()
@@ -644,6 +725,20 @@ mp.register_script_message("beam", function(cmd, arg1)
         else
             state.chroma_balance = (state.chroma_balance == 1) and 0 or 1
             tuned("Beam chroma balance: " .. ((state.chroma_balance == 1) and "on" or "off"))
+        end
+    elseif cmd == "strength" then
+        local v = tonumber(arg1)
+        if v then
+            state.strength = clamp(v, 0.0, 1.0)
+            state.strength_auto = false
+            tuned(string.format("Beam strength: %.2f (%.0f%% modulation)",
+                state.strength, state.strength * 100))
+        else
+            state.strength_auto = true
+            local refresh = refresh_hz()
+            local sweep = refresh and refresh / math.max(state.subframes, MIN_SUBFRAMES) or nil
+            state.strength = strength_for(refresh, sweep)
+            tuned(string.format("Beam strength: %.2f (auto)", state.strength))
         end
     elseif cmd == "headroom" or cmd == "beam_headroom" then
         local v = tonumber(arg1)
@@ -669,10 +764,25 @@ mp.register_script_message("beam", function(cmd, arg1)
             state.raster_mod = clamp(v, -1.0, 1.0)
             tuned(string.format("Beam raster shift: %.2f sweep", state.raster_mod))
         end
+    elseif cmd == "slew" then
+        -- The reference's band-fading trick (issue #4): add a small offset to
+        -- an even integer subframe count so the phase boundary rolls across the
+        -- screen instead of latching in one place. 0.001 is the retention
+        -- default; 0.01-0.05 makes the band "much fainter". Enabling a slew
+        -- turns anti-retention on, which is what the shader keys the offset on.
+        local v = tonumber(arg1)
+        if v then
+            state.slew = clamp(v, 0.0, 0.02)
+            state.anti_retention = (state.slew > 0) and 1 or 0
+            tuned(string.format("Beam slew: %.3f sweep%s", state.slew,
+                state.anti_retention == 1 and " (band rolls)" or ""), true)
+        else
+            osd("beam slew: need a value, e.g. script-message beam slew 0.02", 3)
+        end
     elseif cmd == "status" or cmd == "info" then
         show_status()
     else
-        osd("beam: toggle, on, off, k <n>, sweep <hz>, subframes <n>, gain <f>, direction <name>, raster <f>, status", 4)
+        osd("beam: toggle, on, off, k <n>, sweep <hz>, subframes <n>, gain <f>, strength <f>, direction <name>, raster <f>, slew <f>, status", 4)
     end
 end)
 
@@ -680,6 +790,7 @@ end)
 return {
     state = state,
     mprt = mprt,
+    headroom_of = headroom_of,
     subframes_for = subframes_for,
     pacing_ok = pacing_ok,
     render_fps = render_fps,
@@ -688,6 +799,7 @@ return {
     set_sweep_hz = set_sweep_hz,
     apply_targets = apply_targets,
     gain_for = gain_for,
+    strength_for = strength_for,
     merge_opts = merge_opts,
     status_line = status_line,
     enable = enable,
