@@ -336,7 +336,14 @@ The second pass added:
 
 ## License
 
-`vfx-filters.patch` modifies mpv and is distributed under the same terms as mpv
-(GPLv2 or later). `PKGBUILD` and the docs are provided as-is, no warranty.
-Dolby Vision handling relies on libplacebo 7.399 with libdovi; NGX itself is
-NVIDIA's, shipped with the driver.
+The project is licensed under the GNU General Public License version 2 or
+later. The full text, the exceptions and the license of every component
+fetched at build time are in [LICENSE.md](LICENSE.md).
+
+`vfx-filters.patch` modifies mpv, and every mpv file it touches keeps its own
+license; mpv's `Copyright`, `LICENSE.GPL` and `LICENSE.LGPL` are installed
+under `/usr/share/licenses/mpv-dovi-vfx-git/`. NVIDIA's SDK and driver are not
+redistributed: the filters declare the C-compatible types they need and load
+the installed driver libraries at runtime. `PKGBUILD` and the docs are
+provided as-is, no warranty. Dolby Vision handling relies on libplacebo with
+libdovi; NGX itself is NVIDIA's, shipped with the driver.
