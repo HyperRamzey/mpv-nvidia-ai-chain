@@ -122,19 +122,29 @@ source "$root/PKGBUILD"
 pkgname=mpv-dovi-vfx
 
 fetch_git() {
-    local url=$1 sha=$2 dir=$3
+    local url=$1 sha=$2 dir=$3 full=${4:-0}
     if [ ! -d "$dir/.git" ]; then
         mkdir -p "$dir"
         git -C "$dir" init -q
         git -C "$dir" remote add origin "$url"
     fi
     if ! git -C "$dir" cat-file -e "${sha}^{commit}" 2>/dev/null; then
-        # GitHub accepts a direct SHA fetch; the fallback covers servers that
-        # only advertise refs (then the commit is reachable from a branch).
-        git -C "$dir" fetch -q --depth=1 origin "$sha" 2>/dev/null \
-            || git -C "$dir" fetch -q --filter=blob:none origin \
-                 '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' \
-            || git -C "$dir" fetch -q origin
+        if [ "$full" = 1 ]; then
+            # Submodule sources (glad, fast_float, Vulkan-Headers) are cloned
+            # by libplacebo at the gitlinks *it* records, which are not the
+            # commits pinned in source=(). A depth-1 fetch of the pin does not
+            # contain them; these repos are small, so fetch all branches and
+            # the pin itself in case it only exists as a detached commit.
+            git -C "$dir" fetch -q origin
+            git -C "$dir" fetch -q origin "$sha" 2>/dev/null || true
+        else
+            # GitHub accepts a direct SHA fetch; the fallback covers servers
+            # that only advertise refs (the commit is reachable from a branch).
+            git -C "$dir" fetch -q --depth=1 origin "$sha" 2>/dev/null \
+                || git -C "$dir" fetch -q --filter=blob:none origin \
+                     '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' \
+                || git -C "$dir" fetch -q origin
+        fi
     fi
     git -C "$dir" cat-file -e "${sha}^{commit}" 2>/dev/null \
         || error "commit $sha is not reachable in $url"
@@ -153,9 +163,14 @@ for i in "${!source[@]}"; do
             url=${src#git+}
             commit=${url#*#commit=}
             url=${url%%#commit=*}
-            dir=$srcdir/$(basename "$url" .git)
+            name=$(basename "$url" .git)
+            dir=$srcdir/$name
             msg "  git $url @ ${commit:0:12}"
-            fetch_git "$url" "$commit" "$dir"
+            case "$name" in
+                glad|fast_float|Vulkan-Headers) full=1 ;;
+                *) full=0 ;;
+            esac
+            fetch_git "$url" "$commit" "$dir" "$full"
             ;;
         http*://*)
             file=$srcdir/$(basename "$src")

@@ -28,7 +28,7 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.42.0_200_g7f505de186
-pkgrel=7
+pkgrel=8
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
