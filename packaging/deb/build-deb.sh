@@ -18,8 +18,9 @@
 #
 # Requirements (Ubuntu 24.04, see .github/workflows/release.yml for the full
 # list): build-essential meson ninja-build pkg-config git curl, python3-jinja2,
-# python3-markupsafe, rustup >= 1.88, cargo-c, nvidia-cuda-toolkit and the -dev
-# packages of every library mpv is configured against.
+# python3-markupsafe, rustup, cargo-c built with it (noble's 0.9.19 embeds a
+# cargo that cannot parse libdovi's edition-2024 manifest), nvidia-cuda-toolkit
+# and the -dev packages of every library mpv is configured against.
 #
 # Usage: packaging/deb/build-deb.sh
 #   OUTDIR=/path   where the .deb is written          (default: <repo>/dist-deb)
@@ -53,7 +54,7 @@ error() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # Toolchain
 # ---------------------------------------------------------------------------
 for tool in git curl tar gzip meson ninja pkg-config python3 cc c++ make \
-            readelf ldd dpkg-deb dpkg cargo rustc patch; do
+            readelf ldd dpkg-deb dpkg cargo rustc cargo-cinstall patch; do
     command -v "$tool" >/dev/null 2>&1 || error "missing build tool: $tool"
 done
 

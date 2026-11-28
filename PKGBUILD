@@ -28,7 +28,7 @@
 
 pkgname=mpv-dovi-vfx-git
 pkgver=0.42.0_200_g7f505de186
-pkgrel=6
+pkgrel=7
 pkgdesc='mpv with Dolby Vision P7 FEL, NVIDIA VSR / TrueHDR / VFG filters (static libplacebo + FFmpeg)'
 arch=('x86_64')
 url='https://github.com/HyperRamzey/mpv-nvidia-ai-chain'
@@ -124,6 +124,10 @@ _lpcommit=89b04663135b7ee309ef58d1f8997550e98fd9bf
 _nvcodecheaders=f2053071ea93137255b6dcf42e9b4c9e0965a44e
 _gladcommit=0a7cf1af9e25e02821587bd4095807fc90b6426a
 _fastfloatcommit=8ec59686a1430867ba609c2777ca15143dd81003
+# libplacebo asks for VK_VERSION_1_4 in vulkan_core.h. Arch's headers have
+# it; Ubuntu 24.04 ships Vulkan 1.3 headers, so the bundled submodule (the
+# commit libplacebo records) is used everywhere for a deterministic build.
+_vkheaderscommit=74d8a6cb930c68ef617b202c3ff3c59d919e086b
 
 source=(
   "git+https://github.com/mpv-player/mpv#commit=${_mpvcommit}"
@@ -133,6 +137,7 @@ source=(
   "git+https://github.com/FFmpeg/nv-codec-headers#commit=${_nvcodecheaders}"
   "git+https://github.com/Dav1dde/glad#commit=${_gladcommit}"
   "git+https://github.com/fastfloat/fast_float#commit=${_fastfloatcommit}"
+  "git+https://github.com/KhronosGroup/Vulkan-Headers#commit=${_vkheaderscommit}"
   'find-deps.py'
   'vfx-filters.patch'
 )
@@ -141,6 +146,7 @@ sha256sums=(
   'SKIP'
   '1a4d394ae63d190a526cd052eb4415c156b5c5e2df37efab41a7de0b8fde2433'
   '1412a1c760bbd05db026b6c0d1657affd6631cd0a63cddb6f73cc6d4aa616148'
+  'SKIP'
   'SKIP'
   'SKIP'
   'SKIP'
@@ -163,12 +169,18 @@ prepare() {
 
   cd "$srcdir/libplacebo"
 
-  # libplacebo's build imports these two submodules from 3rdparty/.
-  # Point them at the already-downloaded makepkg sources instead of the network.
+  # libplacebo's build imports these submodules from 3rdparty/. Point them at
+  # the already-downloaded sources instead of the network.
+  #
+  # Vulkan-Headers is load-bearing on Ubuntu 24.04: libplacebo requires
+  # VK_VERSION_1_4 and noble ships Vulkan 1.3 headers, so the build has to use
+  # the pinned submodule there. It is pinned for Arch too so both packages are
+  # built against the same headers and vk.xml.
   git config submodule.3rdparty/glad.url "$srcdir/glad"
   git config submodule.3rdparty/fast_float.url "$srcdir/fast_float"
+  git config submodule.3rdparty/Vulkan-Headers.url "$srcdir/Vulkan-Headers"
   git -c protocol.file.allow=always submodule update --init \
-    3rdparty/glad 3rdparty/fast_float
+    3rdparty/glad 3rdparty/fast_float 3rdparty/Vulkan-Headers
 }
 
 build() {

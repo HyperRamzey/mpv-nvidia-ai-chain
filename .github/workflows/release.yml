@@ -378,6 +378,16 @@ jobs:
             libzstd-dev nvidia-cuda-toolkit
           df -h / | tail -1
 
+      - name: Restore cargo-c
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-cbuild
+            ~/.cargo/bin/cargo-cinstall
+            ~/.cargo/bin/cargo-capi
+            ~/.cargo/bin/cargo-ctest
+          key: cargo-c-0.10.28-rust-stable
+
       - name: Install Rust and cargo-c
         run: |
           set -euo pipefail
@@ -387,8 +397,15 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # Provides cargo-cinstall (cargo-c has no dependency on rustc).
-          sudo apt-get install -y --no-install-recommends cargo-c
+          source "$HOME/.cargo/env"
+          if ! command -v cargo-cinstall >/dev/null 2>&1; then
+            # Noble's cargo-c 0.9.19 embeds cargo 0.82, whose manifest parser
+            # predates edition 2024 and rejects libdovi 3.4.0 outright:
+            #   failed to parse the `edition` key ... only supports 2015/2018/2021
+            # Build a current cargo-c with the rustup toolchain instead.
+            cargo install cargo-c --version 0.10.28
+          fi
+          cargo-cinstall --version
 
       - name: Build .deb
         run: |
