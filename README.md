@@ -33,6 +33,7 @@ filter and not a Vulkan layer.
 | --- | --- |
 | `vfx-filters.patch` | NVIDIA filters and experimental Dolby Vision reconstruction, based on mpv `7f505de186` |
 | `PKGBUILD`, `mpv.install`, `find-deps.py` | Arch package that builds mpv + static libplacebo + static FFmpeg + the filters |
+| `packaging/` | Debian/Ubuntu builder (sources the PKGBUILD) and the system-wide `mpv-ai` wrapper |
 | `ai.conf` | Three resolution-based auto profiles + `[ai]` |
 | `input.conf` | NeuralScreen-style keybindings for all DLSS 5 & VFX settings (60% keyboard layout) |
 | `scripts/vfg-sync.lua` | Keeps VFG's output cap equal to the current display refresh |
@@ -40,7 +41,7 @@ filter and not a Vulkan layer.
 | `scripts/beam-sim.lua` | CRT beam controller: subframes/gain from refresh + source fps, live tuning, OSD |
 | `shaders/crt-beam-sim.glsl` | CRT beam simulator (Blur Busters rolling scan, per-pixel MPRT) |
 | [mpv-ai-extension](https://github.com/HyperRamzey/mpv-ai-extension) | Chromium/Helium MV3 extension + native messaging host (separate repo) |
-| `.github/workflows/` | `ci.yml` (fast gates) and `release.yml` (cold makepkg → GitHub release) |
+| `.github/workflows/` | `ci.yml` (fast gates) and `release.yml` (Arch + Debian packages → GitHub release) |
 | `docs/AI-CHAIN.md` | Operation manual: resolution/DoVi policy, trap list, rebuild |
 | `docs/DLSS5-NR-PLAN.md` | Design of record for the NR filter: constraints, composite, every measured number |
 | `docs/CRT-BEAM.md` | Beam simulator: the published algorithm, the one deviation, measured evidence, limits |
@@ -48,13 +49,15 @@ filter and not a Vulkan layer.
 
 ## Requirements
 
-- **Arch Linux** (the PKGBUILD is Arch-specific; the patch itself is not).
+- **Arch Linux** (PKGBUILD) or **Ubuntu 24.04** (`packaging/deb/build-deb.sh`);
+  the patch itself is distro-neutral.
 - **RTX 50-series (Blackwell)** for DLSS 5 NR — NGX feature 18. VSR / TrueHDR /
   VFG work on older NGX-capable cards; `dlssnr` does not.
-- **NVIDIA driver** tested on 615.78.08. The package hard-depends on `cuda` and
-  `nvidia-utils` because `libnvrtc.so.13` and `libcuda.so.1` are real
-  `DT_NEEDED` entries — removing the CUDA toolkit breaks `mpv`, not just the
-  filters.
+- **NVIDIA driver** tested on 615.78.08. The Arch package hard-depends on `cuda`
+  and `nvidia-utils`, and the .deb on `libnvrtc12`, because `libnvrtc.so.*` and
+  `libcuda.so.1` are real `DT_NEEDED` entries — removing the CUDA runtime
+  breaks `mpv`, not just the filters. The .deb build uses Ubuntu's CUDA 12.0
+  headers; on Blackwell the NVRTC JIT needs CUDA 12.8+ at runtime.
 - **`dlssnr-helper`** from [bmitch87/DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer)
   (0.3.1-2, Windows runtime under Proton). It is a shared-memory server; the
   Linux filter is the client. It is only needed when Neural Renderer is enabled
@@ -91,23 +94,31 @@ patch -Np1 --dry-run -i ../vfx-filters.patch
 leak in as shared libraries, if libmpv exports static-library symbols, or if the
 Dolby Vision enhancement-layer option disappears.
 
-### Prebuilt package (GitHub Actions)
+### Prebuilt packages (GitHub Actions)
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`: it verifies that
 `vfx-filters.patch` still hashes to what `PKGBUILD` pins and still applies to the
-pinned mpv commit, then does a cold `makepkg --check` in an
-`archlinux:base-devel` container, then publishes the package with the patch,
-`PKGBUILD`, `ai.conf` and `SHA256SUMS`. No GPU is needed at build time —
-`nvidia-utils` only supplies `libcuda.so` to link against.
+pinned mpv commit, then builds both packages from the same pins:
+
+- **Arch** — a cold `makepkg --check` in an `archlinux:base-devel` container.
+- **Debian/Ubuntu 24.04** — a native build through
+  `packaging/deb/build-deb.sh`, which sources the PKGBUILD's
+  `prepare()`/`build()`/`check()` and builds the missing libdovi 3.4.0 with
+  cargo-c.
+
+The release carries both packages plus the patch, `PKGBUILD`, `ai.conf`, the
+scripts, the shader and a `SHA256SUMS` covering all of it. No GPU is needed at
+build time — the CUDA driver stub is only linked against.
 
 ```sh
-git tag v0.41.0-r6 && git push origin v0.41.0-r6
+git tag v0.42.0-r6 && git push origin v0.42.0-r6
 gh run watch
 ```
 
-`ci.yml` runs the cheap gates (patch hash, patch dry-run, `py_compile`,
-`shellcheck`, JSON validity, `ai.conf` syntax) on every push, so a release is
-never the first time a broken patch is noticed.
+`ci.yml` runs the cheap gates (patch hash, patch dry-run, `py_compile`, Lua
+tests, shader headers, `ai.conf` syntax, packaging script syntax and
+shellcheck) on every push, so a release is never the first time a broken patch
+is noticed.
 
 ## Use
 
@@ -117,7 +128,7 @@ mpv-nr movie.mkv        # VSR at 1:1 only
 mpv movie.mkv           # untouched player, Dolby Vision as before
 ```
 
-Install the configs and helper scripts:
+On Arch, install the configs and helper scripts per user:
 
 ```sh
 install -Dm644 ai.conf                   ~/.config/mpv/ai.conf
@@ -127,6 +138,18 @@ install -Dm644 scripts/nr-toggle.lua     ~/.config/mpv/scripts/nr-toggle.lua
 install -Dm644 scripts/beam-sim.lua      ~/.config/mpv/scripts/beam-sim.lua
 install -Dm644 shaders/crt-beam-sim.glsl ~/.config/mpv/shaders/crt-beam-sim.glsl
 ```
+
+On Debian/Ubuntu the `.deb` is turnkey — it installs the player, the same files
+under `/etc/mpv`, and the `mpv-ai` wrapper, so no per-user copying is needed:
+
+```sh
+sudo apt install ./mpv-dovi-vfx_*_amd64.deb
+mpv-ai movie.mkv
+```
+
+mpv loads scripts from both the system and the user config directory, so remove
+any per-user copies of `vfg-sync.lua`, `nr-toggle.lua` and `beam-sim.lua` before
+using the package, or the scripts will run twice.
 
 ### 60% Keyboard Controls (No Numpad Required)
 

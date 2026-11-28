@@ -3,6 +3,9 @@ __pycache__/
 pkg/
 src/
 *.pkg.tar.zst
+*.pkg.tar
 *.tar.xz
 .ccache/
 dist/
+dist-deb/
+build/deb/

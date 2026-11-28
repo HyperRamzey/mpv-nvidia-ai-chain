@@ -1,0 +1,16 @@
+#!/bin/sh
+# mpv-ai — packaged entry point for the NVIDIA VFX chain.
+#
+# The system-wide profile lives in /etc/mpv/ai.conf (installed by the package)
+# and pulls in the Lua scripts from /etc/mpv/scripts. --profile=ai is kept
+# explicit so the chain also works when the config is loaded through --include
+# from a different config directory.
+set -eu
+
+conf="${MPV_AI_CONF:-/etc/mpv/ai.conf}"
+[ -r "$conf" ] || {
+    echo "mpv-ai: $conf is missing; reinstall mpv-dovi-vfx" >&2
+    exit 1
+}
+
+exec /usr/bin/mpv --include="$conf" --profile=ai "$@"

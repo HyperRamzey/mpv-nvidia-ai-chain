@@ -101,3 +101,20 @@ jobs:
         run: |
           set -euo pipefail
           awk 'NF && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*\[.*\][[:space:]]*$/ && $0 !~ /=/ {print; bad=1} END{exit bad}' ai.conf
+
+      # The .deb itself is built only in release.yml, but a syntax error or a
+      # renamed input file should fail here, not 40 minutes into a release.
+      - name: Packaging scripts are valid
+        run: |
+          set -euo pipefail
+          bash -n packaging/deb/build-deb.sh
+          bash -n packaging/mpv-ai
+          shellcheck -S warning packaging/deb/build-deb.sh packaging/mpv-ai
+          test -x packaging/deb/build-deb.sh
+          test -x packaging/mpv-ai
+          for f in ai.conf input.conf README.md LICENSE.md docs/CRT-BEAM.md \
+                   scripts/vfg-sync.lua scripts/nr-toggle.lua \
+                   scripts/beam-sim.lua shaders/crt-beam-sim.glsl; do
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          echo 'packaging scripts ok'

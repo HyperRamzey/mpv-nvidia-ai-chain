@@ -126,6 +126,20 @@ jobs:
           awk 'NF && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*\[.*\][[:space:]]*$/ && $0 !~ /=/ {print; bad=1} END{exit bad}' ai.conf
           echo "ai.conf: $(grep -c '^\[' ai.conf) sections"
 
+      - name: Packaging inputs are present and valid
+        run: |
+          set -euo pipefail
+          bash -n packaging/deb/build-deb.sh
+          bash -n packaging/mpv-ai
+          test -x packaging/deb/build-deb.sh
+          test -x packaging/mpv-ai
+          for f in ai.conf input.conf README.md LICENSE.md docs/CRT-BEAM.md \
+                   scripts/vfg-sync.lua scripts/nr-toggle.lua \
+                   scripts/beam-sim.lua shaders/crt-beam-sim.glsl; do
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          echo 'packaging inputs ok'
+
   # --------------------------------------------------------------------------
   # build: cold makepkg in an Arch container.
   # --------------------------------------------------------------------------
@@ -209,8 +223,9 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           ## mpv-dovi-vfx-git ${ver}
 
-          Cold build from $(printf '%s' "$GITHUB_SHA" | cut -c1-7) on Arch Linux
-          (\`archlinux:base-devel\`, CUDA 13.4).
+          Built from $(printf '%s' "$GITHUB_SHA" | cut -c1-7) in CI: the Arch
+          package in \`archlinux:base-devel\` (CUDA 13.4) and the Debian package
+          natively on Ubuntu 24.04 (CUDA 12.0 headers, system libnvrtc 12).
 
           | Component | Pin |
           | --- | --- |
@@ -236,6 +251,27 @@ jobs:
           \`scripts/vfg-sync.lua\` in the repository arrives as \`vfg-sync.lua\`
           and \`shaders/crt-beam-sim.glsl\` as \`crt-beam-sim.glsl\`.
 
+          ### Install - Debian / Ubuntu 24.04
+
+          \`\`\`sh
+          sudo apt install ./mpv-dovi-vfx_${pkgver//_/.}-${pkgrel}_amd64.deb
+          mpv-ai movie.mkv
+          \`\`\`
+
+          The .deb is turnkey: it installs the player, \`/etc/mpv/ai.conf\`,
+          \`/etc/mpv/input.conf\`, the Lua controllers, the beam shader and the
+          \`mpv-ai\` wrapper, so no per-user copying is needed. It replaces the
+          distribution \`mpv\` and \`libmpv2\` packages, which own the same files.
+          An NVIDIA driver providing \`libcuda.so.1\` is required and
+          \`libnvrtc12\` is pulled in automatically. The optional NVIDIA VFX SDK
+          libraries are still loaded from \`\$HOME/.local/lib/vsr-player\` at
+          runtime.
+
+          The Debian build uses Ubuntu's CUDA 12.0 toolkit. On Blackwell
+          (RTX 50xx) the NVRTC kernels need CUDA 12.8 or newer at runtime;
+          install NVIDIA's \`cuda-nvrtc-12-8\` if the filters report a JIT
+          failure.
+
           Noise reduction is off by default (\`dlssnr:passes=0\` is a true
           passthrough); frame generation follows the display refresh through
           \`scripts/vfg-sync.lua\`.
@@ -243,11 +279,13 @@ jobs:
           ### CRT beam simulator
 
           \`scripts/beam-sim.lua\` and \`shaders/crt-beam-sim.glsl\` render a
-          phosphor beam at the end of the filter chain. Enabling it retargets
-          VFG to \`display_hz / k\` through the float-timestep engine, so the
-          presented rate divides the panel exactly (240/3 = 80, 165/2 = 82.5)
-          instead of being forced to an integer; disabling it restores every
-          property it touched.
+          phosphor beam at the end of the filter chain. k = display_hz /
+          sweep_hz: at or below 0.8x the refresh k is an integer (240->3,
+          165->2, 120->2); above it k is fractional so VFG can emit
+          display/k exactly. At 165 Hz with x6 frame generation that is
+          143.856 fps and k = 1.147 - one sweep every ~0.87 refresh, a narrow
+          dark arc crawling backwards instead of a 30 Hz band. Disabling the
+          beam restores every property it touched.
 
           Brightness is conserved (Talbot-Plateau): the beam splits each pixel's
           light into an intensity and an emission window so the sweep average
@@ -264,6 +302,7 @@ jobs:
           | \`Ctrl+Alt+g\` | \`beam gain <f>\` | clarity vs brightness |
           | \`Ctrl+Alt+y\` | \`beam direction <n>\` | raster direction |
           | — | \`beam sweep <hz>\` | target sweep, rebuilds k |
+          | — | \`beam k <n>\` | pin k directly (fractional allowed) |
 
           \`docs/CRT-BEAM.md\` in the repository has the physics, the shader
           parameters and the refresh-rate rules.
@@ -294,10 +333,82 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
+  # build-deb: the same pins, built natively on Ubuntu 24.04 and packaged as a
+  # .deb. PKGBUILD's prepare()/build()/check() are reused by
+  # packaging/deb/build-deb.sh, so both packages carry the same libplacebo,
+  # FFmpeg, patch and VFX filters. No GPU is needed: the CUDA driver stub is
+  # linked against, never executed.
+  # --------------------------------------------------------------------------
+  build-deb:
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable multiverse
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository -y multiverse
+          sudo apt-get update -qq
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          # The explicitly-enabled options of the pinned mpv/libplacebo/FFmpeg
+          # configs need the first block; the rest keeps meson's auto-detected
+          # features identical to the Arch build instead of silently dropping
+          # outputs on a bare runner.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build pkg-config git curl ca-certificates \
+            python3-jinja2 python3-markupsafe \
+            libvulkan-dev libshaderc-dev liblcms2-dev libunwind-dev \
+            libdav1d-dev libvpx-dev libssl-dev libxml2-dev \
+            libluajit-5.1-dev libdvbv5-dev libwayland-dev wayland-protocols \
+            libxkbcommon-dev libva-dev \
+            libass-dev libdrm-dev libxinerama-dev libxss-dev libxv-dev \
+            libxpresent-dev libfreetype-dev libharfbuzz-dev libfribidi-dev \
+            libfontconfig-dev libarchive-dev libbluray-dev libdvdnav-dev \
+            libdvdread-dev libcdio-paranoia-dev libcdio-cdda-dev \
+            librubberband-dev libzimg-dev libpulse-dev libpipewire-0.3-dev \
+            libjack-dev libasound2-dev libsndio-dev libuchardet-dev \
+            libsixel-dev libcaca-dev libvdpau-dev libgbm-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libx11-dev libxext-dev \
+            libxrandr-dev libxfixes-dev libxrender-dev libxcb1-dev \
+            libxcb-shm0-dev libxcb-xv0-dev zlib1g-dev libbz2-dev liblzma-dev \
+            libzstd-dev nvidia-cuda-toolkit
+          df -h / | tail -1
+
+      - name: Install Rust and cargo-c
+        run: |
+          set -euo pipefail
+          # libdovi 3.4.0 needs rustc >= 1.88 (noble ships 1.75). stable is
+          # used rather than the exact floor: cargo resolves dependency
+          # versions at build time and the newest ones may require more.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Provides cargo-cinstall (cargo-c has no dependency on rustc).
+          sudo apt-get install -y --no-install-recommends cargo-c
+
+      - name: Build .deb
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          packaging/deb/build-deb.sh
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-package
+          path: dist-deb/
+          retention-days: 7
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
   # release: publish. Tag pushes use the tag; manual runs get a dated tag.
   # --------------------------------------------------------------------------
   release:
-    needs: [validate, build]
+    needs: [validate, build, build-deb]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -305,8 +416,20 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: package
           path: dist
+          pattern: "*"
+          merge-multiple: true
+
+      - name: Regenerate SHA256SUMS over both packages
+        run: |
+          set -euo pipefail
+          # The Arch job writes a SHA256SUMS for its own artifact; the release
+          # must cover the .deb too, so it is rebuilt here over the merge.
+          cd dist
+          rm -f SHA256SUMS
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Resolve tag
         id: tag
